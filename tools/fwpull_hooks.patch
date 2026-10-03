@@ -1,0 +1,475 @@
+diff --git a/examples/simple_repeater/MyMesh.cpp b/examples/simple_repeater/MyMesh.cpp
+index a50219eb..84f63f06 100644
+--- a/examples/simple_repeater/MyMesh.cpp
++++ b/examples/simple_repeater/MyMesh.cpp
+@@ -25,6 +25,12 @@ static void applyRxPowerSavingConfig(NodePrefs& prefs, uint8_t sf, float bw) {
+                      ok ? "accepted" : "unsupported");
+ }
+ 
++#ifdef FW_OTA
++#include <helpers/fw_ota/FwOtaCli.h>
++#include <helpers/fw_ota/FwOtaTransfer.h>
++#include <helpers/fw_ota/RadioDiag.h>
++#endif
++
+ /* ------------------------------ Config -------------------------------- */
+ 
+ #ifndef LORA_FREQ
+@@ -501,6 +507,9 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+ }
+ 
+ void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
++#ifdef FW_OTA
++  fw_ota::g_xfer.noteRx(pkt->getPayloadType(), pkt->payload, pkt->payload_len);   // (rc6, C14) LoRa-OTA yields to the traffic it hears
++#endif
+ #ifdef WITH_BRIDGE
+   if (_prefs.bridge_pkt_src == 1) {
+     bridge.sendPacket(pkt);
+@@ -1011,6 +1020,25 @@ void MyMesh::begin(FILESYSTEM *fs) {
+   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+   radio_driver.setTxPower(_prefs.tx_power_dbm);
+ 
++#ifdef FW_OTA
++  fw_ota::g_xfer.begin(this, _fs, _prefs.node_name, self_id.pub_key, _prefs.password, &_prefs.path_hash_mode);
++  {
++    struct FloodHost : fw_ota::FloodHost {             // discovery floods leave with the node's default region (v1.17.23)
++      MyMesh* m = nullptr;
++      void floodScoped(mesh::Packet* p, uint32_t d, uint8_t hs) override { m->fwFloodScoped(p, d, hs); }
++      bool regionSet() const override { return m->fwRegionSet(); }
++      // (v1.17.25) OTA packets queue below all mesh traffic; airtime estimates for the duty pacing
++      bool sendOta(mesh::Packet* p, const uint8_t* path, uint8_t path_len, uint32_t d) override { m->fwSendOta(p, path, path_len, d); return true; }
++      uint32_t airtimeMs(uint32_t len) override { return radio_driver.getEstAirtimeFor((int)len); }
++      // (v1.17.28, security v2) the session key of a pull includes the ECDH of the two identities (MeshCore's own login/DM key exchange)
++      bool sharedSecret(uint8_t* out, const uint8_t* peer_pub) override { m->getSelfId().calcSharedSecret(out, peer_pub); return true; }
++    };
++    static FloodHost host; host.m = this;
++    fw_ota::g_xfer.setFloodHost(&host);
++  }
++  fw_ota::g_radiodiag.begin(_fs, getRTCClock());    // measuring only: records when the radio stops receiving (fw radio)
++#endif
++
+   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
+   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
+                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
+@@ -1373,6 +1401,17 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *
+     command += 3;
+   }
+ 
++#ifdef FW_OTA
++  if (sender_timestamp == 0 && fw_ota::g_xfer.awaitingPassword()) {   // the line typed after "fw pull <peer>" is the admin password
++    fw_ota::g_xfer.submitPassword(command, reply);
++    return;
++  }
++  if (fw_ota::cliHandle(command, reply, sender_timestamp != 0)) {   // serial console and remote-admin session (replies fit 160 B)
++    return;
++  }
++#endif
++
++
+   // handle ACL related commands
+   if (memcmp(command, "setperm ", 8) == 0) {   // format:  setperm {pubkey-hex} {permissions-int8}
+     char* hex = &command[8];
+@@ -1449,10 +1488,29 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *
+   }
+ }
+ 
++#ifdef FW_OTA
++void MyMesh::onRawDataRecv(mesh::Packet* packet) {
++  fw_ota::g_xfer.noteRssi(_radio->getLastRSSI());
++  fw_ota::g_xfer.onPacket(packet);
++}
++// the flooded discovery ("who serves firmware?") travels as a channel message, which stock repeaters relay
++int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
++  return fw_ota::g_xfer.channelMatch(hash, channels, max_matches);
++}
++void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
++  if (type == PAYLOAD_TYPE_GRP_TXT) fw_ota::g_xfer.onDiscovery(packet, data, len);
++}
++#endif
++
+ void MyMesh::loop() {
+ #ifdef WITH_BRIDGE
+   bridge.loop();
+ #endif
++#ifdef FW_OTA
++  fw_ota::g_xfer.tick();
++  fw_ota::g_radiodiag.loop(radio_driver.isInRecvMode(), radio_driver.getPacketsRecv(), radio_driver.getPacketsSent());
++#endif
++  _cli.loop();   // deferred reboot / poweroff / start ota (the reply goes out first)
+ 
+   mesh::Mesh::loop();
+ 
+diff --git a/examples/simple_repeater/MyMesh.h b/examples/simple_repeater/MyMesh.h
+index f1cff542..04d42c47 100644
+--- a/examples/simple_repeater/MyMesh.h
++++ b/examples/simple_repeater/MyMesh.h
+@@ -36,6 +36,9 @@
+ #include <helpers/RegionMap.h>
+ #include <helpers/RoutingPolicy.h>
+ #include "RateLimiter.h"
++#ifdef FW_OTA
++  #include <helpers/fw_ota/FwOtaTransfer.h>   // (v1.17.25) OTA_TX_PRIORITY for fwSendOta
++#endif
+ 
+ #ifdef WITH_BRIDGE
+ extern AbstractBridge* bridge;
+@@ -71,7 +74,7 @@ struct NeighbourInfo {
+ };
+ 
+ #ifndef FIRMWARE_BUILD_DATE
+-  #define FIRMWARE_BUILD_DATE   "14 Aug 2026"
++  #define FIRMWARE_BUILD_DATE   __DATE__ " " __TIME__   // self-updating date + time (was a hardcoded "14 Aug 2026")
+ #endif
+ 
+ #ifndef FIRMWARE_VERSION
+@@ -183,6 +186,11 @@ protected:
+   void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
+   bool onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret, uint8_t* path, uint8_t path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
+   void onControlDataRecv(mesh::Packet* packet) override;
++#ifdef FW_OTA
++  void onRawDataRecv(mesh::Packet* packet) override;
++  int  searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) override;   // LoRa-OTA discovery channel
++  void onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) override;
++#endif
+ 
+   void sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, uint8_t path_hash_size);
+ 
+@@ -204,6 +212,18 @@ public:
+   }
+ 
+   void sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size);
++#ifdef FW_OTA
++  // LoRa-OTA discovery floods carry the node's default region, like the repeater's own floods (v1.17.23)
++  void fwFloodScoped(mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size) { sendFloodScoped(default_scope, pkt, delay_millis, path_hash_size); }
++  bool fwRegionSet() const { return !default_scope.isNull(); }
++  // (v1.17.25) like sendDirect / sendZeroHop, but queued at fw_ota::OTA_TX_PRIORITY: relaying, replies and adverts always go first
++  void fwSendOta(mesh::Packet* pkt, const uint8_t* path, uint8_t path_len, uint32_t delay_millis) {
++    pkt->header &= ~PH_ROUTE_MASK; pkt->header |= ROUTE_TYPE_DIRECT;
++    pkt->path_len = mesh::Packet::copyPath(pkt->path, path, path_len);   // path_len 0 = zero hop
++    getTables()->markSeen(pkt);
++    sendPacket(pkt, fw_ota::OTA_TX_PRIORITY, delay_millis);
++  }
++#endif
+ 
+   // CommonCLICallbacks
+   void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) override;
+diff --git a/examples/simple_repeater/main.cpp b/examples/simple_repeater/main.cpp
+index 3a9c480a..85e60774 100644
+--- a/examples/simple_repeater/main.cpp
++++ b/examples/simple_repeater/main.cpp
+@@ -3,6 +3,10 @@
+ 
+ #include "MyMesh.h"
+ 
++#ifdef FW_OTA
++  #include "helpers/fw_ota/FwOtaTransfer.h"   // fw_ota::g_xfer: `fw stage` serial upload, password prompt
++#endif
++
+ #ifdef DISPLAY_CLASS
+   #include "UITask.h"
+   static UITask ui_task(board, display);
+@@ -136,13 +140,21 @@ void setup() {
+ }
+ 
+ void loop() {
++#ifdef FW_OTA
++  const bool fw_staging = fw_ota::g_xfer.serviceStaging();   // `fw stage`: while a binary upload runs it owns the serial stream
++#else
++  const bool fw_staging = false;
++#endif
+   // Handle Serial CLI
+   int len = strlen(command);
+-  while (Serial.available() && len < sizeof(command)-1) {
++  while (!fw_staging && Serial.available() && len < sizeof(command)-1) {
+     char c = Serial.read();
+     if (c != '\n') {
+       command[len++] = c;
+       command[len] = 0;
++#ifdef FW_OTA
++      if (!fw_ota::g_xfer.awaitingPassword())   // do not echo the admin password
++#endif
+       Serial.print(c);
+     }
+     if (c == '\r') break;
+diff --git a/src/helpers/AutoDiscoverRTCClock.cpp b/src/helpers/AutoDiscoverRTCClock.cpp
+index af08fddb..53fce332 100644
+--- a/src/helpers/AutoDiscoverRTCClock.cpp
++++ b/src/helpers/AutoDiscoverRTCClock.cpp
+@@ -1,5 +1,93 @@
+ #include "AutoDiscoverRTCClock.h"
+ #include "RTClib.h"
++
++#ifdef NO_EXTERNAL_RTC
++// RAK WisMesh 1W Booster has no RTC chip - always use the software fallback clock.
++// Drops the Melopero RV3028 / RX8130 / DS3231 / PCF8563 drivers + I2C probing.
++void AutoDiscoverRTCClock::begin(TwoWire& wire) { (void)wire; }
++uint32_t AutoDiscoverRTCClock::getCurrentTime() { return _fallback->getCurrentTime(); }
++void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) { _fallback->setCurrentTime(time); }
++bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) { (void)wire; (void)addr; return false; }
++#elif defined(RTC_RV3028_ONLY)
++// RV-3028 only (RAK12002 WisBlock RTC, I2C 0x52) - keeps the DS3231 / PCF8563 / RX8130CE drivers out of small builds.
++// The chip is NOT read on every getCurrentTime(): the software clock stays the single time source, and the chip only
++//  - sets it once at boot (if the chip holds a plausible time, i.e. it did not lose power),
++//  - re-disciplines it once an hour (the MCU clock drifts by seconds per day),
++//  - is written whenever the time is set ('time', 'clock sync').
++// Without the module nothing changes: same binary, software clock.
++#include <Melopero_RV3028.h>
++#include "RTClib.h"
++
++static Melopero_RV3028 rtc_rv3028;
++static bool rv3028_success = false;
++static uint32_t rv3028_last_sync_ms = 0;
++static const uint32_t RV3028_MIN_VALID = 1735689600UL;   // 2025-01-01: an unset/power-lost chip reads year 2000
++static const uint32_t RV3028_RESYNC_MS = 3600UL * 1000UL;
++
++static uint32_t rv3028_read() {
++  return DateTime(rtc_rv3028.getYear(), rtc_rv3028.getMonth(), rtc_rv3028.getDate(),
++                  rtc_rv3028.getHour(), rtc_rv3028.getMinute(), rtc_rv3028.getSecond()).unixtime();
++}
++
++// The time handed out never steps BACKWARDS on a resync (peers treat older timestamps as replays): if the software clock has
++// run ahead of the chip by d seconds it is frozen for d seconds instead ("hold"); if it is behind it is stepped forward.
++// Only an explicit set ('time' on the local console) can move it back.
++static uint32_t rv_hold = 0, rv_last_raw = 0, rv_last_out = 0;
++
++static void rv_restart(mesh::RTCClock* fb, uint32_t out) { rv_last_raw = fb->getCurrentTime(); rv_last_out = out; rv_hold = 0; }
++
++static uint32_t rv_now(mesh::RTCClock* fb) {
++  uint32_t raw = fb->getCurrentTime();
++  uint32_t elapsed = raw - rv_last_raw;
++  rv_last_raw = raw;
++  uint32_t eat = elapsed < rv_hold ? elapsed : rv_hold;
++  rv_hold -= eat;
++  rv_last_out += elapsed - eat;
++  return rv_last_out;
++}
++
++static void rv3028_sync(mesh::RTCClock* fb) {
++  rv3028_last_sync_ms = millis();
++  uint32_t c = rv3028_read();
++  if (c < RV3028_MIN_VALID) return;                 // chip lost power / never set: keep the software clock
++  uint32_t out = rv_now(fb);
++  if (c > out) { fb->setCurrentTime(c); rv_restart(fb, c); }
++  else rv_hold = out - c;
++}
++
++bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
++  wire.beginTransmission(addr);
++  return wire.endTransmission() == 0;
++}
++
++void AutoDiscoverRTCClock::begin(TwoWire& wire) {
++  if (!i2c_probe(wire, 0x52)) return;
++  rtc_rv3028.initI2C(wire);
++  rtc_rv3028.writeToRegister(0x35, 0x00);
++  rtc_rv3028.writeToRegister(0x37, 0xB4);   // direct switching mode + trickle charge of the RAK12002 supercap
++  rtc_rv3028.set24HourMode();
++  rv3028_success = true;
++  rv_restart(_fallback, _fallback->getCurrentTime());
++  rv3028_sync(_fallback);
++}
++
++uint32_t AutoDiscoverRTCClock::getCurrentTime() {
++  if (!rv3028_success) return _fallback->getCurrentTime();
++  if (millis() - rv3028_last_sync_ms > RV3028_RESYNC_MS) rv3028_sync(_fallback);
++  return rv_now(_fallback);
++}
++
++void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) {
++  _fallback->setCurrentTime(time);
++  if (!rv3028_success) return;
++  rv_restart(_fallback, time);
++  DateTime dt(time);
++  uint8_t weekday = (dt.day() + (uint16_t)((2.6 * dt.month()) - 0.2) - (2 * (dt.year() / 100)) + dt.year() + (uint16_t)(dt.year() / 4) + (uint16_t)(dt.year() / 400)) % 7;
++  rtc_rv3028.setTime(dt.year(), dt.month(), weekday, dt.day(), dt.hour(), dt.minute(), dt.second());
++  rv3028_last_sync_ms = millis();
++}
++#else
++
+ #include <Melopero_RV3028.h>
+ #include "RTC_RX8130CE.h"
+ 
+@@ -98,3 +186,5 @@ void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) {
+     _fallback->setCurrentTime(time);
+   }
+ }
++
++#endif // NO_EXTERNAL_RTC
+diff --git a/src/helpers/CommonCLI.cpp b/src/helpers/CommonCLI.cpp
+index fc6e38d7..e85bb629 100644
+--- a/src/helpers/CommonCLI.cpp
++++ b/src/helpers/CommonCLI.cpp
+@@ -5,6 +5,10 @@
+ #include "TxtDataHelpers.h"
+ #include "radiolib/RXPowerSavingCLI.h"
+ #include <RTClib.h>
++
++#ifndef BLE_OTA_DFU_NAME
++  #define BLE_OTA_DFU_NAME "<board>_DFU"   // what the bootloader advertises in BLE OTA; set per board (RAK3401: -D BLE_OTA_DFU_NAME='"3401_DFU"')
++#endif
+ #define STR_HELPER(x) #x
+ #define STR(x) STR_HELPER(x)
+ 
+@@ -184,15 +188,28 @@ uint8_t CommonCLI::buildAdvertData(uint8_t node_type, uint8_t* app_data) {
+   }
+ }
+ 
++enum { DEF_NONE = 0, DEF_REBOOT, DEF_POWEROFF, DEF_OTA };
++
++void CommonCLI::loop() {
++  if (!_deferred_op || (int32_t)(millis() - _deferred_at_ms) < 0) return;
++  uint8_t op = _deferred_op; _deferred_op = DEF_NONE;
++  if (op == DEF_POWEROFF) _board->powerOff();                                  // doesn't return
++  else if (op == DEF_OTA) { char tmp[160]; _board->startOTAUpdate(_prefs->node_name, tmp); }   // slim nRF52 build: sets the DFU magic + resets
++  else _board->reboot();                                                       // doesn't return
++}
++
+ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* reply) {
+     if (memcmp(command, "poweroff", 8) == 0 || memcmp(command, "shutdown", 8) == 0) {
+-      _board->powerOff();  // doesn't return
++      strcpy(reply, "OK - powering off in 3 s");
++      defer(DEF_POWEROFF);
+     } else if (memcmp(command, "reboot", 6) == 0) {
+-      _board->reboot();  // doesn't return
++      strcpy(reply, "OK - rebooting in 3 s");
++      defer(DEF_REBOOT);
+     } else if (memcmp(command, "clkreboot", 9) == 0) {
+       // Reset clock
+       getRTCClock()->setCurrentTime(1715770351);  // 15 May 2024, 8:50pm
+-      _board->reboot();  // doesn't return
++      strcpy(reply, "OK - clock reset, rebooting in 3 s");
++      defer(DEF_REBOOT);
+      } else if (memcmp(command, "advert.zerohop", 14) == 0 && (command[14] == 0 || command[14] == ' ')) {
+       // send zerohop advert
+       _callbacks->sendSelfAdvertisement(1500, false);  // longer delay, give CLI response time to be sent first
+@@ -212,9 +229,24 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
+         strcpy(reply, "ERR: clock cannot go backwards");
+       }
+     } else if (memcmp(command, "start ota", 9) == 0) {
++      // Always available: with NO_BLE_OTA the board's startOTAUpdate() just sets
++      // GPREGRET=0xA8 and resets into the bootloader's BLE OTA (the recovery
++      // path). It used to be compiled out under NO_BLE_OTA, leaving that
++      // implementation unreachable ("Unknown command").
++#if defined(NRF52_PLATFORM) && defined(NO_BLE_OTA)
++      // The slim build hands over to the BOOTLOADER's BLE DFU by a reset, so the operator (serial or phone app) must get the
++      // reply BEFORE the reset, with what to look for: the bootloader advertises its DEVICE_NAME ("3401_DFU" on a RAK3401) from the
++      // chip's random-static address + 1 (dfu_transport_ble.c adds 1 to the low byte when advertising openly).
++      uint32_t a0 = NRF_FICR->DEVICEADDR[0], a1 = NRF_FICR->DEVICEADDR[1];
++      uint8_t m[6] = { (uint8_t)(a0 + 1), (uint8_t)(a0 >> 8), (uint8_t)(a0 >> 16), (uint8_t)(a0 >> 24), (uint8_t)a1, (uint8_t)((a1 >> 8) | 0xC0) };
++      snprintf(reply, 160, "OK - BLE OTA in 3 s: in the DFU app connect to '%s' (MAC %02X:%02X:%02X:%02X:%02X:%02X); the node is off the mesh until the upload ends (or a reset)",
++               BLE_OTA_DFU_NAME, m[5], m[4], m[3], m[2], m[1], m[0]);
++      defer(DEF_OTA);
++#else
+       if (!_board->startOTAUpdate(_prefs->node_name, reply)) {
+         strcpy(reply, "Error");
+       }
++#endif
+     } else if (memcmp(command, "clock", 5) == 0) {
+       uint32_t now = getRTCClock()->getCurrentTime();
+       DateTime dt = DateTime(now);
+@@ -222,7 +254,9 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
+     } else if (memcmp(command, "time ", 5) == 0) {  // set time (to epoch seconds)
+       uint32_t secs = _atoi(&command[5]);
+       uint32_t curr = getRTCClock()->getCurrentTime();
+-      if (secs > curr) {
++      // The "never backwards" rule protects against replayed remote commands. A local console (sender_timestamp == 0) may correct a
++      // clock that ended up in the FUTURE (see meshcore-dev/MeshCore#1332) - otherwise such a node could only be fixed by a power cut.
++      if (secs > curr || sender_timestamp == 0) {
+         getRTCClock()->setCurrentTime(secs);
+         uint32_t now = getRTCClock()->getCurrentTime();
+         DateTime dt = DateTime(now);
+diff --git a/src/helpers/CommonCLI.h b/src/helpers/CommonCLI.h
+index 3e6aa90b..5d6194d0 100644
+--- a/src/helpers/CommonCLI.h
++++ b/src/helpers/CommonCLI.h
+@@ -277,6 +277,12 @@ class CommonCLI {
+   void handleGetCmd(uint32_t sender_timestamp, char* command, char* reply);
+   void handleSetCmd(uint32_t sender_timestamp, char* command, char* reply);
+ 
++  // reboot / poweroff / start ota used to act inside handleCommand(), so their reply never left the node (the serial console prints
++  // it, and the mesh sends it, only AFTER the command returns). They now reply first and act ~3 s later from loop().
++  uint8_t  _deferred_op = 0;
++  uint32_t _deferred_at_ms = 0;
++  void defer(uint8_t op) { _deferred_op = op; _deferred_at_ms = millis() + 3000; }
++
+ public:
+   CommonCLI(mesh::MainBoard& board, mesh::RTCClock& rtc, SensorManager& sensors,
+             RegionMap& region_map, ClientACL& acl, NodePrefs* prefs,
+@@ -287,5 +293,6 @@ public:
+   void loadPrefs(FILESYSTEM* _fs);
+   bool savePrefs(FILESYSTEM* _fs);
+   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
++  void loop();   // runs the deferred reboot / poweroff / start ota (call from the main loop)
+   uint8_t buildAdvertData(uint8_t node_type, uint8_t* app_data);
+ };
+diff --git a/src/helpers/NRF52Board.cpp b/src/helpers/NRF52Board.cpp
+index 6453645f..becd3034 100644
+--- a/src/helpers/NRF52Board.cpp
++++ b/src/helpers/NRF52Board.cpp
+@@ -2,13 +2,15 @@
+ #include "NRF52Board.h"
+ #include <target.h>
+ 
+-#include <bluefruit.h>
+ #include <nrf_soc.h>
+ 
+ #ifdef USE_CC310_HW_CRYPTO
+ #include <Adafruit_nRFCrypto.h>
+ #endif
+ 
++#ifndef NO_BLE_OTA
++#include <bluefruit.h>
++
+ static BLEDfu bledfu;
+ 
+ static void connect_callback(uint16_t conn_handle) {
+@@ -22,10 +24,12 @@ static void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
+ 
+   MESH_DEBUG_PRINTLN("BLE client disconnected");
+ }
++#endif
+ 
+ void NRF52Board::begin() {
+   startup_reason = BD_STARTUP_NORMAL;
+ 
++
+   #ifdef USE_CC310_HW_CRYPTO
+     // CC310 TRNG is higher quality and environment-independent vs radio RSSI noise.
+     nRFCrypto.begin();
+@@ -425,6 +429,30 @@ bool NRF52Board::getBootloaderVersion(char* out, size_t max_len) {
+     return false;
+ }
+ 
++#ifdef NO_BLE_OTA
++bool NRF52Board::startOTAUpdate(const char *id, char reply[]) {
++  // Minimal path: hand off to the bootloader's own BLE OTA DFU by setting the
++  // Adafruit/OTAFIX magic in GPREGRET and resetting. Avoids linking Bluefruit.
++  (void)id;
++  // The sd_power_gpregret_*() calls only work while the SoftDevice is enabled.
++  // This slimmed build does not link Bluefruit, so the SoftDevice is normally
++  // OFF here and those calls fail silently - the magic was never written and
++  // the reset just booted the app again (found on the bench 2026-09-18).
++  // Write GPREGRET directly in that case.
++  uint8_t sd_enabled = 0;
++  sd_softdevice_is_enabled(&sd_enabled);
++  if (sd_enabled) {
++    sd_power_gpregret_clr(0, 0xffffffff);
++    sd_power_gpregret_set(0, 0xA8);   // DFU_MAGIC_OTA_RESET
++  } else {
++    NRF_POWER->GPREGRET = 0xA8;       // DFU_MAGIC_OTA_RESET
++  }
++  strcpy(reply, "OK - rebooting to bootloader OTA DFU");
++  delay(200);
++  NVIC_SystemReset();
++  return true;
++}
++#else
+ bool NRF52Board::startOTAUpdate(const char *id, char reply[]) {
+   // Config the peripheral connection with maximum bandwidth
+   // more SRAM required by SoftDevice
+@@ -473,4 +501,5 @@ bool NRF52Board::startOTAUpdate(const char *id, char reply[]) {
+ 
+   return true;
+ }
++#endif  // NO_BLE_OTA
+ #endif

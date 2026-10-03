@@ -5,6 +5,10 @@
 #include "TxtDataHelpers.h"
 #include "radiolib/RXPowerSavingCLI.h"
 #include <RTClib.h>
+
+#ifndef BLE_OTA_DFU_NAME
+  #define BLE_OTA_DFU_NAME "<board>_DFU"   // what the bootloader advertises in BLE OTA; set per board (RAK3401: -D BLE_OTA_DFU_NAME='"3401_DFU"')
+#endif
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 
@@ -184,15 +188,28 @@ uint8_t CommonCLI::buildAdvertData(uint8_t node_type, uint8_t* app_data) {
   }
 }
 
+enum { DEF_NONE = 0, DEF_REBOOT, DEF_POWEROFF, DEF_OTA };
+
+void CommonCLI::loop() {
+  if (!_deferred_op || (int32_t)(millis() - _deferred_at_ms) < 0) return;
+  uint8_t op = _deferred_op; _deferred_op = DEF_NONE;
+  if (op == DEF_POWEROFF) _board->powerOff();                                  // doesn't return
+  else if (op == DEF_OTA) { char tmp[160]; _board->startOTAUpdate(_prefs->node_name, tmp); }   // slim nRF52 build: sets the DFU magic + resets
+  else _board->reboot();                                                       // doesn't return
+}
+
 void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* reply) {
     if (memcmp(command, "poweroff", 8) == 0 || memcmp(command, "shutdown", 8) == 0) {
-      _board->powerOff();  // doesn't return
+      strcpy(reply, "OK - powering off in 3 s");
+      defer(DEF_POWEROFF);
     } else if (memcmp(command, "reboot", 6) == 0) {
-      _board->reboot();  // doesn't return
+      strcpy(reply, "OK - rebooting in 3 s");
+      defer(DEF_REBOOT);
     } else if (memcmp(command, "clkreboot", 9) == 0) {
       // Reset clock
       getRTCClock()->setCurrentTime(1715770351);  // 15 May 2024, 8:50pm
-      _board->reboot();  // doesn't return
+      strcpy(reply, "OK - clock reset, rebooting in 3 s");
+      defer(DEF_REBOOT);
      } else if (memcmp(command, "advert.zerohop", 14) == 0 && (command[14] == 0 || command[14] == ' ')) {
       // send zerohop advert
       _callbacks->sendSelfAdvertisement(1500, false);  // longer delay, give CLI response time to be sent first
@@ -212,9 +229,24 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         strcpy(reply, "ERR: clock cannot go backwards");
       }
     } else if (memcmp(command, "start ota", 9) == 0) {
+      // Always available: with NO_BLE_OTA the board's startOTAUpdate() just sets
+      // GPREGRET=0xA8 and resets into the bootloader's BLE OTA (the recovery
+      // path). It used to be compiled out under NO_BLE_OTA, leaving that
+      // implementation unreachable ("Unknown command").
+#if defined(NRF52_PLATFORM) && defined(NO_BLE_OTA)
+      // The slim build hands over to the BOOTLOADER's BLE DFU by a reset, so the operator (serial or phone app) must get the
+      // reply BEFORE the reset, with what to look for: the bootloader advertises its DEVICE_NAME ("3401_DFU" on a RAK3401) from the
+      // chip's random-static address + 1 (dfu_transport_ble.c adds 1 to the low byte when advertising openly).
+      uint32_t a0 = NRF_FICR->DEVICEADDR[0], a1 = NRF_FICR->DEVICEADDR[1];
+      uint8_t m[6] = { (uint8_t)(a0 + 1), (uint8_t)(a0 >> 8), (uint8_t)(a0 >> 16), (uint8_t)(a0 >> 24), (uint8_t)a1, (uint8_t)((a1 >> 8) | 0xC0) };
+      snprintf(reply, 160, "OK - BLE OTA in 3 s: in the DFU app connect to '%s' (MAC %02X:%02X:%02X:%02X:%02X:%02X); the node is off the mesh until the upload ends (or a reset)",
+               BLE_OTA_DFU_NAME, m[5], m[4], m[3], m[2], m[1], m[0]);
+      defer(DEF_OTA);
+#else
       if (!_board->startOTAUpdate(_prefs->node_name, reply)) {
         strcpy(reply, "Error");
       }
+#endif
     } else if (memcmp(command, "clock", 5) == 0) {
       uint32_t now = getRTCClock()->getCurrentTime();
       DateTime dt = DateTime(now);
@@ -222,7 +254,9 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else if (memcmp(command, "time ", 5) == 0) {  // set time (to epoch seconds)
       uint32_t secs = _atoi(&command[5]);
       uint32_t curr = getRTCClock()->getCurrentTime();
-      if (secs > curr) {
+      // The "never backwards" rule protects against replayed remote commands. A local console (sender_timestamp == 0) may correct a
+      // clock that ended up in the FUTURE (see meshcore-dev/MeshCore#1332) - otherwise such a node could only be fixed by a power cut.
+      if (secs > curr || sender_timestamp == 0) {
         getRTCClock()->setCurrentTime(secs);
         uint32_t now = getRTCClock()->getCurrentTime();
         DateTime dt = DateTime(now);

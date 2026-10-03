@@ -2,12 +2,14 @@
 #include "NRF52Board.h"
 #include <target.h>
 
-#include <bluefruit.h>
 #include <nrf_soc.h>
 
 #ifdef USE_CC310_HW_CRYPTO
 #include <Adafruit_nRFCrypto.h>
 #endif
+
+#ifndef NO_BLE_OTA
+#include <bluefruit.h>
 
 static BLEDfu bledfu;
 
@@ -22,9 +24,11 @@ static void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
 
   MESH_DEBUG_PRINTLN("BLE client disconnected");
 }
+#endif
 
 void NRF52Board::begin() {
   startup_reason = BD_STARTUP_NORMAL;
+
 
   #ifdef USE_CC310_HW_CRYPTO
     // CC310 TRNG is higher quality and environment-independent vs radio RSSI noise.
@@ -425,6 +429,30 @@ bool NRF52Board::getBootloaderVersion(char* out, size_t max_len) {
     return false;
 }
 
+#ifdef NO_BLE_OTA
+bool NRF52Board::startOTAUpdate(const char *id, char reply[]) {
+  // Minimal path: hand off to the bootloader's own BLE OTA DFU by setting the
+  // Adafruit/OTAFIX magic in GPREGRET and resetting. Avoids linking Bluefruit.
+  (void)id;
+  // The sd_power_gpregret_*() calls only work while the SoftDevice is enabled.
+  // This slimmed build does not link Bluefruit, so the SoftDevice is normally
+  // OFF here and those calls fail silently - the magic was never written and
+  // the reset just booted the app again (found on the bench 2026-09-18).
+  // Write GPREGRET directly in that case.
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+  if (sd_enabled) {
+    sd_power_gpregret_clr(0, 0xffffffff);
+    sd_power_gpregret_set(0, 0xA8);   // DFU_MAGIC_OTA_RESET
+  } else {
+    NRF_POWER->GPREGRET = 0xA8;       // DFU_MAGIC_OTA_RESET
+  }
+  strcpy(reply, "OK - rebooting to bootloader OTA DFU");
+  delay(200);
+  NVIC_SystemReset();
+  return true;
+}
+#else
 bool NRF52Board::startOTAUpdate(const char *id, char reply[]) {
   // Config the peripheral connection with maximum bandwidth
   // more SRAM required by SoftDevice
@@ -473,4 +501,5 @@ bool NRF52Board::startOTAUpdate(const char *id, char reply[]) {
 
   return true;
 }
+#endif  // NO_BLE_OTA
 #endif

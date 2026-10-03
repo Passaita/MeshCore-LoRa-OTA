@@ -1,3 +1,7 @@
+> **This is the LoRa-OTA fork** (RAK3401 repeaters): firmware updates delivered over the mesh for repeaters that are hard to reach.
+> Start at [docs/lora-ota/README.md](docs/lora-ota/README.md). Built on the IoTThinks `PowerSaving-v17` branch of MeshCore; not an
+> official MeshCore release. The rest of this README is upstream MeshCore's.
+
 ## About MeshCore
 
 MeshCore is a lightweight, portable C++ library that enables multi-hop packet routing for embedded projects using LoRa and other packet radios. It is designed for developers who want to create resilient, decentralized communication networks that work without the internet.

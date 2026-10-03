@@ -25,6 +25,12 @@ static void applyRxPowerSavingConfig(NodePrefs& prefs, uint8_t sf, float bw) {
                      ok ? "accepted" : "unsupported");
 }
 
+#ifdef FW_OTA
+#include <helpers/fw_ota/FwOtaCli.h>
+#include <helpers/fw_ota/FwOtaTransfer.h>
+#include <helpers/fw_ota/RadioDiag.h>
+#endif
+
 /* ------------------------------ Config -------------------------------- */
 
 #ifndef LORA_FREQ
@@ -501,6 +507,9 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
 }
 
 void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
+#ifdef FW_OTA
+  fw_ota::g_xfer.noteRx(pkt->getPayloadType(), pkt->payload, pkt->payload_len);   // (rc6, C14) LoRa-OTA yields to the traffic it hears
+#endif
 #ifdef WITH_BRIDGE
   if (_prefs.bridge_pkt_src == 1) {
     bridge.sendPacket(pkt);
@@ -1011,6 +1020,25 @@ void MyMesh::begin(FILESYSTEM *fs) {
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
 
+#ifdef FW_OTA
+  fw_ota::g_xfer.begin(this, _fs, _prefs.node_name, self_id.pub_key, _prefs.password, &_prefs.path_hash_mode);
+  {
+    struct FloodHost : fw_ota::FloodHost {             // discovery floods leave with the node's default region (v1.17.23)
+      MyMesh* m = nullptr;
+      void floodScoped(mesh::Packet* p, uint32_t d, uint8_t hs) override { m->fwFloodScoped(p, d, hs); }
+      bool regionSet() const override { return m->fwRegionSet(); }
+      // (v1.17.25) OTA packets queue below all mesh traffic; airtime estimates for the duty pacing
+      bool sendOta(mesh::Packet* p, const uint8_t* path, uint8_t path_len, uint32_t d) override { m->fwSendOta(p, path, path_len, d); return true; }
+      uint32_t airtimeMs(uint32_t len) override { return radio_driver.getEstAirtimeFor((int)len); }
+      // (v1.17.28, security v2) the session key of a pull includes the ECDH of the two identities (MeshCore's own login/DM key exchange)
+      bool sharedSecret(uint8_t* out, const uint8_t* peer_pub) override { m->getSelfId().calcSharedSecret(out, peer_pub); return true; }
+    };
+    static FloodHost host; host.m = this;
+    fw_ota::g_xfer.setFloodHost(&host);
+  }
+  fw_ota::g_radiodiag.begin(_fs, getRTCClock());    // measuring only: records when the radio stops receiving (fw radio)
+#endif
+
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
@@ -1373,6 +1401,17 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *
     command += 3;
   }
 
+#ifdef FW_OTA
+  if (sender_timestamp == 0 && fw_ota::g_xfer.awaitingPassword()) {   // the line typed after "fw pull <peer>" is the admin password
+    fw_ota::g_xfer.submitPassword(command, reply);
+    return;
+  }
+  if (fw_ota::cliHandle(command, reply, sender_timestamp != 0)) {   // serial console and remote-admin session (replies fit 160 B)
+    return;
+  }
+#endif
+
+
   // handle ACL related commands
   if (memcmp(command, "setperm ", 8) == 0) {   // format:  setperm {pubkey-hex} {permissions-int8}
     char* hex = &command[8];
@@ -1449,10 +1488,29 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *
   }
 }
 
+#ifdef FW_OTA
+void MyMesh::onRawDataRecv(mesh::Packet* packet) {
+  fw_ota::g_xfer.noteRssi(_radio->getLastRSSI());
+  fw_ota::g_xfer.onPacket(packet);
+}
+// the flooded discovery ("who serves firmware?") travels as a channel message, which stock repeaters relay
+int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
+  return fw_ota::g_xfer.channelMatch(hash, channels, max_matches);
+}
+void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
+  if (type == PAYLOAD_TYPE_GRP_TXT) fw_ota::g_xfer.onDiscovery(packet, data, len);
+}
+#endif
+
 void MyMesh::loop() {
 #ifdef WITH_BRIDGE
   bridge.loop();
 #endif
+#ifdef FW_OTA
+  fw_ota::g_xfer.tick();
+  fw_ota::g_radiodiag.loop(radio_driver.isInRecvMode(), radio_driver.getPacketsRecv(), radio_driver.getPacketsSent());
+#endif
+  _cli.loop();   // deferred reboot / poweroff / start ota (the reply goes out first)
 
   mesh::Mesh::loop();
 

@@ -36,6 +36,9 @@
 #include <helpers/RegionMap.h>
 #include <helpers/RoutingPolicy.h>
 #include "RateLimiter.h"
+#ifdef FW_OTA
+  #include <helpers/fw_ota/FwOtaTransfer.h>   // (v1.17.25) OTA_TX_PRIORITY for fwSendOta
+#endif
 
 #ifdef WITH_BRIDGE
 extern AbstractBridge* bridge;
@@ -71,7 +74,7 @@ struct NeighbourInfo {
 };
 
 #ifndef FIRMWARE_BUILD_DATE
-  #define FIRMWARE_BUILD_DATE   "14 Aug 2026"
+  #define FIRMWARE_BUILD_DATE   __DATE__ " " __TIME__   // self-updating date + time (was a hardcoded "14 Aug 2026")
 #endif
 
 #ifndef FIRMWARE_VERSION
@@ -183,6 +186,11 @@ protected:
   void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
   bool onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret, uint8_t* path, uint8_t path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
   void onControlDataRecv(mesh::Packet* packet) override;
+#ifdef FW_OTA
+  void onRawDataRecv(mesh::Packet* packet) override;
+  int  searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) override;   // LoRa-OTA discovery channel
+  void onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) override;
+#endif
 
   void sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, uint8_t path_hash_size);
 
@@ -204,6 +212,18 @@ public:
   }
 
   void sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size);
+#ifdef FW_OTA
+  // LoRa-OTA discovery floods carry the node's default region, like the repeater's own floods (v1.17.23)
+  void fwFloodScoped(mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size) { sendFloodScoped(default_scope, pkt, delay_millis, path_hash_size); }
+  bool fwRegionSet() const { return !default_scope.isNull(); }
+  // (v1.17.25) like sendDirect / sendZeroHop, but queued at fw_ota::OTA_TX_PRIORITY: relaying, replies and adverts always go first
+  void fwSendOta(mesh::Packet* pkt, const uint8_t* path, uint8_t path_len, uint32_t delay_millis) {
+    pkt->header &= ~PH_ROUTE_MASK; pkt->header |= ROUTE_TYPE_DIRECT;
+    pkt->path_len = mesh::Packet::copyPath(pkt->path, path, path_len);   // path_len 0 = zero hop
+    getTables()->markSeen(pkt);
+    sendPacket(pkt, fw_ota::OTA_TX_PRIORITY, delay_millis);
+  }
+#endif
 
   // CommonCLICallbacks
   void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) override;

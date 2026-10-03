@@ -277,6 +277,12 @@ class CommonCLI {
   void handleGetCmd(uint32_t sender_timestamp, char* command, char* reply);
   void handleSetCmd(uint32_t sender_timestamp, char* command, char* reply);
 
+  // reboot / poweroff / start ota used to act inside handleCommand(), so their reply never left the node (the serial console prints
+  // it, and the mesh sends it, only AFTER the command returns). They now reply first and act ~3 s later from loop().
+  uint8_t  _deferred_op = 0;
+  uint32_t _deferred_at_ms = 0;
+  void defer(uint8_t op) { _deferred_op = op; _deferred_at_ms = millis() + 3000; }
+
 public:
   CommonCLI(mesh::MainBoard& board, mesh::RTCClock& rtc, SensorManager& sensors,
             RegionMap& region_map, ClientACL& acl, NodePrefs* prefs,
@@ -287,5 +293,6 @@ public:
   void loadPrefs(FILESYSTEM* _fs);
   bool savePrefs(FILESYSTEM* _fs);
   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
+  void loop();   // runs the deferred reboot / poweroff / start ota (call from the main loop)
   uint8_t buildAdvertData(uint8_t node_type, uint8_t* app_data);
 };

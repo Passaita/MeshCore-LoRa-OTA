@@ -3,6 +3,10 @@
 
 #include "MyMesh.h"
 
+#ifdef FW_OTA
+  #include "helpers/fw_ota/FwOtaTransfer.h"   // fw_ota::g_xfer: `fw stage` serial upload, password prompt
+#endif
+
 #ifdef DISPLAY_CLASS
   #include "UITask.h"
   static UITask ui_task(board, display);
@@ -136,13 +140,21 @@ void setup() {
 }
 
 void loop() {
+#ifdef FW_OTA
+  const bool fw_staging = fw_ota::g_xfer.serviceStaging();   // `fw stage`: while a binary upload runs it owns the serial stream
+#else
+  const bool fw_staging = false;
+#endif
   // Handle Serial CLI
   int len = strlen(command);
-  while (Serial.available() && len < sizeof(command)-1) {
+  while (!fw_staging && Serial.available() && len < sizeof(command)-1) {
     char c = Serial.read();
     if (c != '\n') {
       command[len++] = c;
       command[len] = 0;
+#ifdef FW_OTA
+      if (!fw_ota::g_xfer.awaitingPassword())   // do not echo the admin password
+#endif
       Serial.print(c);
     }
     if (c == '\r') break;
