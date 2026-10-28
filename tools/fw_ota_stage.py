@@ -134,7 +134,7 @@ def main():
         msg = (f"{args.bin_path} carries no fw_ota firmware tag for board {args.board!r} in its first "
                f"{TAG_SCAN} bytes - this looks like stock/other firmware. The bootloader would refuse it.")
         if not args.allow_untagged:
-            sys.exit("REFUSED: " + msg + "\nRebuild the app with the tag (RAK_3401_repeater_poc env) or pass --allow-untagged.")
+            sys.exit("REFUSED: " + msg + "\nRebuild the app with the tag (RAK_3401_lora_ota env) or pass --allow-untagged.")
         print("WARNING: " + msg)
 
     fw_version = args.fw_version if args.fw_version is not None else int(time.time())

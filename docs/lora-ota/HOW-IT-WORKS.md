@@ -25,7 +25,7 @@ A `.lota` image = a header (board tag, kind app/bootloader, version number, leng
 against the **authenticated** manifest before it marks anything pending.
 
 ## 3. Discovery
-* `fw list` sends a LIST_REQ zero-hop to the direct neighbours (twice) and one discovery flood on the circle's private group channel
+* `fw peers` (the scan; `fw list` before rc18) sends a LIST_REQ zero-hop to the direct neighbours (twice) and one discovery flood on the circle's private group channel
   (secret derived from the circle key). Answers (LIST_RSP) carry the server's id and full public key, the image kind, version, sizes,
   name and the route the answer took, MAC'd with the circle's list key.
 * Each server answers a given scan once. A direct neighbour answers only directly (no flood). A pull's targeted discovery
@@ -41,8 +41,25 @@ against the **authenticated** manifest before it marks anything pending.
 4. **Verify and install:** CRC per chunk, CRC-32 and SHA-256 over the whole image, then `fw pending` + restart (unless
    `fw autoapply off`, or the node already runs that image).
 
+## 4b. The swarm (rc12-rc19)
+* **Pull a version, not a host.** `fw list` groups the scan by image; `fw pull #n` ranks the holders by expected rate (free duty share,
+  relay airtime, link, battery) and keeps up to 4. A holder silent for about 6 of its windows (never less than 2 min) is replaced by the
+  next one; chunks are kept because they are keyed to the image, not the session.
+* **Shared stream.** Chunks are encrypted with an image key derived from the circle key, so every circle node that hears a stream of
+  an image it wants can store it ("listener") and ask only for its gaps afterwards, from the best nearby holder (local first).
+* **Fleet fill.** A pull's stream fills EMPTY slots of hearers. A `fleet` pull also replaces OLDER slot images; those nodes pass the image
+  on to their own neighbours by trickle gossip (1-30 min apart, 48 h window). A fill never installs: `fw apply` per node. A fleet pull
+  can be cancelled; the cancel is repeated for 30 min.
+* **Announce.** A node that has just got a version tells the circle once, so waiting pulls learn the new holder at once.
+* **Battery.** A LOW holder ranks last; a CRITICAL node stops serving and requesting until it recovers.
+
+## 4c. Time from the swarm (rc21)
+A node without an RTC asks a zero-hop "time?" on the circle's channel after boot and every 6 h. Only neighbours with a valid RTC
+answer (in random 0.5 s slots; the first answer silences the others). A clock that is behind is stepped, one that is ahead is HELD until
+real time catches up (MeshCore drops messages from a clock that stepped back), corrections are limited to 1 h, and time is never relayed.
+
 ## 5. Pacing - leaving the channel to the mesh
-* **Duty:** chunk spacing = airtime x (relays + 1) / channel share, where the channel share is `fw duty x 30 %` (rc6: 1.0 = 30 %,
+* **Duty:** chunk spacing = airtime x (relays + 1) / channel share, where the channel share is `fw duty x 30 %` (1.0 = 30 %,
   default 0.3 = 9 %). The relays' repeats are counted, so a longer route goes slower rather than filling the channel.
 * **Quiet gap:** after each batch the server waits max(5 s, 2.5 s x (relays + 1)), so replies and other traffic get through every hop.
 * **Yield (rc6):** both ends send a LoRa-OTA packet only after 2 s without any other packet heard (at most 20 s of waiting).

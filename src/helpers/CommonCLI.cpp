@@ -239,8 +239,13 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       // chip's random-static address + 1 (dfu_transport_ble.c adds 1 to the low byte when advertising openly).
       uint32_t a0 = NRF_FICR->DEVICEADDR[0], a1 = NRF_FICR->DEVICEADDR[1];
       uint8_t m[6] = { (uint8_t)(a0 + 1), (uint8_t)(a0 >> 8), (uint8_t)(a0 >> 16), (uint8_t)(a0 >> 24), (uint8_t)a1, (uint8_t)((a1 >> 8) | 0xC0) };
-      snprintf(reply, 160, "OK - BLE OTA in 3 s: in the DFU app connect to '%s' (MAC %02X:%02X:%02X:%02X:%02X:%02X); the node is off the mesh until the upload ends (or a reset)",
-               BLE_OTA_DFU_NAME, m[5], m[4], m[3], m[2], m[1], m[0]);
+      // (v1.17.28-rc19, C46, owner: warn only) a weak battery without USB power may brown out on DFU entry (board 3: 3.29-3.36 V)
+      const uint16_t mv = _board->getBattMilliVolts();
+      char tail[72] = "the node is off the mesh until the upload ends (or a reset)";
+      if (mv && mv < 3450 && !(NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk))
+        snprintf(tail, sizeof(tail), "battery %u.%02u V, no USB: it may restart instead - USB power helps", mv / 1000, (mv % 1000) / 10);
+      snprintf(reply, 160, "OK - BLE OTA in 3 s: in the DFU app connect to '%s' (MAC %02X:%02X:%02X:%02X:%02X:%02X); %s",
+               BLE_OTA_DFU_NAME, m[5], m[4], m[3], m[2], m[1], m[0], tail);
       defer(DEF_OTA);
 #else
       if (!_board->startOTAUpdate(_prefs->node_name, reply)) {
@@ -431,38 +436,41 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
         int sats = l->satellitesCount();
         bool active = !strcmp(_sensors->getSettingByKey("gps") ?: "0", "1"); // Use "0" if GPS setting is not found
 
-        if (_prefs->powersaving_enabled && l->isPowerSavingEnabled()) { // GPS Power Saving
-          if (enabled) {
-            unsigned long mins = (l->getNextSleep() - millis()) / 60000UL;
-            sprintf(reply, "on (powersaving, sleep in %luh %lum), %s, %s, %d sats", 
-              mins / 60UL, 
-              mins % 60UL,
-              active ? "active" : "deactivated", 
-              fix ? "fix" : "no fix", 
-              sats);
-          } else {
-            unsigned long mins = (l->getNextWake() - millis()) / 60000UL;
-            sprintf(reply, "off (powersaving, wake in %luh %lum)",
-              mins / 60UL,
-              mins % 60UL);
-          }
+        if (l->isPowerSavingEnabled()) { // GPS Power Saving
+          if(active) {
+            if (enabled) {
+              unsigned long mins = (l->getNextSleep() - millis()) / 60000UL;
+              sprintf(reply, "on, powered (powersaving, sleep in %luh %lum), %s, %d sats", 
+                mins / 60UL, 
+                mins % 60UL,
+                fix ? "fix" : "no fix", 
+                sats);
+            } else {
+              unsigned long mins = (l->getNextWake() - millis()) / 60000UL;
+              sprintf(reply, "on, unpowered (powersaving, wake in %luh %lum)",
+                mins / 60UL,
+                mins % 60UL);
+            }
 
-          // "last sync" from GPS
-          DateTime dt = DateTime(l->getLastValidTimeSync());
-          if (dt.unixtime() == 0) {
-            sprintf(reply + strlen(reply), ", last sync: none");
+            // "last sync" from GPS
+            DateTime dt = DateTime(l->getLastValidTimeSync());
+            if (dt.unixtime() == 0) {
+              sprintf(reply + strlen(reply), ", last sync: none");
+            } else {
+              sprintf(reply + strlen(reply), ", last sync: %02d:%02d - %d/%d/%d UTC", dt.hour(), dt.minute(),
+                      dt.day(), dt.month(), dt.year());
+            }
           } else {
-            sprintf(reply + strlen(reply), ", last sync: %02d:%02d - %d/%d/%d UTC", dt.hour(), dt.minute(),
-                    dt.day(), dt.month(), dt.year());
+            sprintf(reply, "off, %s", enabled ? "powered" : "unpowered");
           }
         } else { // Normal mode
-          if (enabled) {
+          if(active) {
             sprintf(reply, "on, %s, %s, %d sats",
-              active?"active":"deactivated",
+              enabled?"powered":"unpowered",
               fix?"fix":"no fix",
               sats);
           } else {
-            strcpy(reply, "off");
+            sprintf(reply, "off, %s", enabled ? "powered" : "unpowered");
           }
         }
       } else {
@@ -472,12 +480,10 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
     } else if (memcmp(command, "powersaving on", 14) == 0) {
 #if defined(NRF52_PLATFORM)
       _prefs->powersaving_enabled = 1;
-      _sensors->powersaving_enabled = 1;
       savePrefs();
       strcpy(reply, "on - Immediate effect");
 #elif defined(ESP32) && !defined(WITH_BRIDGE)
       _prefs->powersaving_enabled = 1;
-      _sensors->powersaving_enabled = 1;
       savePrefs();
       strcpy(reply, "on - After 2 minutes");
 #elif defined(WITH_BRIDGE)
@@ -487,7 +493,6 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
 #endif
     } else if (memcmp(command, "powersaving off", 15) == 0) {
       _prefs->powersaving_enabled = 0;
-      _sensors->powersaving_enabled = 0;
       savePrefs();
       strcpy(reply, "off");
     } else if (memcmp(command, "powersaving", 11) == 0) {

@@ -8,7 +8,10 @@ void AutoDiscoverRTCClock::begin(TwoWire& wire) { (void)wire; }
 uint32_t AutoDiscoverRTCClock::getCurrentTime() { return _fallback->getCurrentTime(); }
 void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) { _fallback->setCurrentTime(time); }
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) { (void)wire; (void)addr; return false; }
+bool AutoDiscoverRTCClock::chipValid() const { return false; }
+void AutoDiscoverRTCClock::discipline(uint32_t ref) { if (ref > _fallback->getCurrentTime()) _fallback->setCurrentTime(ref); }
 #elif defined(RTC_RV3028_ONLY)
+#pragma GCC optimize ("Os")   // (rc21, size) clock bookkeeping, called a few times a second: size over speed (the framework builds -Ofast)
 // RV-3028 only (RAK12002 WisBlock RTC, I2C 0x52) - keeps the DS3231 / PCF8563 / RX8130CE drivers out of small builds.
 // The chip is NOT read on every getCurrentTime(): the software clock stays the single time source, and the chip only
 //  - sets it once at boot (if the chip holds a plausible time, i.e. it did not lose power),
@@ -17,6 +20,7 @@ bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) { (void)wire; 
 // Without the module nothing changes: same binary, software clock.
 #include <Melopero_RV3028.h>
 #include "RTClib.h"
+#include <helpers/fw_ota/ClockHold.h>
 
 static Melopero_RV3028 rtc_rv3028;
 static bool rv3028_success = false;
@@ -31,28 +35,21 @@ static uint32_t rv3028_read() {
 
 // The time handed out never steps BACKWARDS on a resync (peers treat older timestamps as replays): if the software clock has
 // run ahead of the chip by d seconds it is frozen for d seconds instead ("hold"); if it is behind it is stepped forward.
-// Only an explicit set ('time' on the local console) can move it back.
-static uint32_t rv_hold = 0, rv_last_raw = 0, rv_last_out = 0;
+// Only an explicit set ('time' on the local console) can move it back. (rc21, C57) The hold logic is shared (fw_ota/ClockHold.h) and
+// runs without a chip too: a node without an RTC takes the time of a swarm member that has one the same way (discipline()).
+static fw_ota::ClockHold rv_h;
+static bool rv_chip_ok = false;                       // the chip held a plausible time at the last read, or was just written
 
-static void rv_restart(mesh::RTCClock* fb, uint32_t out) { rv_last_raw = fb->getCurrentTime(); rv_last_out = out; rv_hold = 0; }
-
-static uint32_t rv_now(mesh::RTCClock* fb) {
-  uint32_t raw = fb->getCurrentTime();
-  uint32_t elapsed = raw - rv_last_raw;
-  rv_last_raw = raw;
-  uint32_t eat = elapsed < rv_hold ? elapsed : rv_hold;
-  rv_hold -= eat;
-  rv_last_out += elapsed - eat;
-  return rv_last_out;
+static void rv_step(mesh::RTCClock* fb, uint32_t ref) {
+  if (rv_h.toward(fb->getCurrentTime(), ref)) { fb->setCurrentTime(ref); rv_h.restart(fb->getCurrentTime(), ref); }
 }
 
 static void rv3028_sync(mesh::RTCClock* fb) {
   rv3028_last_sync_ms = millis();
   uint32_t c = rv3028_read();
-  if (c < RV3028_MIN_VALID) return;                 // chip lost power / never set: keep the software clock
-  uint32_t out = rv_now(fb);
-  if (c > out) { fb->setCurrentTime(c); rv_restart(fb, c); }
-  else rv_hold = out - c;
+  rv_chip_ok = c >= RV3028_MIN_VALID;
+  if (!rv_chip_ok) return;                          // chip lost power / never set: keep the software clock
+  rv_step(fb, c);
 }
 
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
@@ -61,26 +58,33 @@ bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) {
 }
 
 void AutoDiscoverRTCClock::begin(TwoWire& wire) {
+  rv_h.restart(_fallback->getCurrentTime(), _fallback->getCurrentTime());
   if (!i2c_probe(wire, 0x52)) return;
   rtc_rv3028.initI2C(wire);
   rtc_rv3028.writeToRegister(0x35, 0x00);
   rtc_rv3028.writeToRegister(0x37, 0xB4);   // direct switching mode + trickle charge of the RAK12002 supercap
   rtc_rv3028.set24HourMode();
   rv3028_success = true;
-  rv_restart(_fallback, _fallback->getCurrentTime());
   rv3028_sync(_fallback);
 }
 
 uint32_t AutoDiscoverRTCClock::getCurrentTime() {
-  if (!rv3028_success) return _fallback->getCurrentTime();
-  if (millis() - rv3028_last_sync_ms > RV3028_RESYNC_MS) rv3028_sync(_fallback);
-  return rv_now(_fallback);
+  if (rv3028_success && millis() - rv3028_last_sync_ms > RV3028_RESYNC_MS) rv3028_sync(_fallback);
+  return rv_h.now(_fallback->getCurrentTime());
+}
+
+bool AutoDiscoverRTCClock::chipValid() const { return rv3028_success && rv_chip_ok; }
+
+void AutoDiscoverRTCClock::discipline(uint32_t ref) {
+  if (chipValid()) return;                          // the chip is this node's reference
+  rv_step(_fallback, ref);
 }
 
 void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) {
   _fallback->setCurrentTime(time);
+  rv_h.restart(_fallback->getCurrentTime(), time);
   if (!rv3028_success) return;
-  rv_restart(_fallback, time);
+  rv_chip_ok = time >= RV3028_MIN_VALID;            // 'clkreboot' writes 2024: the chip counts as unset until the next real set
   DateTime dt(time);
   uint8_t weekday = (dt.day() + (uint16_t)((2.6 * dt.month()) - 0.2) - (2 * (dt.year() / 100)) + dt.year() + (uint16_t)(dt.year() / 4) + (uint16_t)(dt.year() / 400)) % 7;
   rtc_rv3028.setTime(dt.year(), dt.month(), weekday, dt.day(), dt.hour(), dt.minute(), dt.second());
@@ -187,4 +191,6 @@ void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) {
   }
 }
 
+bool AutoDiscoverRTCClock::chipValid() const { return false; }   // (rc21, C57) only the RV-3028 build answers time requests
+void AutoDiscoverRTCClock::discipline(uint32_t ref) { if (ref > getCurrentTime()) setCurrentTime(ref); }
 #endif // NO_EXTERNAL_RTC

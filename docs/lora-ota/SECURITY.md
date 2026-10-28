@@ -1,7 +1,7 @@
 # LoRa-OTA - security design, limitations and review guide
 
-This is **security v2** (v1.17.28). Reviewers: section 6 lists where to look first. Please report findings privately to the
-maintainers while the repository is private.
+This is **security v2** (v1.17.28). Reviewers: section 6 lists where to look first. Please report security findings privately
+(GitHub: Security -> Report a vulnerability) rather than in a public issue.
 
 ## 1. What is protected, and against whom
 

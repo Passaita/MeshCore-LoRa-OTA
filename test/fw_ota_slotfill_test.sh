@@ -53,6 +53,7 @@ struct FS { std::string files[1]; bool has = false;
   File open(const char*, int = 0) { has = true; File f; f.s = &files[0]; return f; } } g_fs;
 class FwOtaTransfer { public:
   FS* _fs = &g_fs; SlotWriter _writer; char _last_err[48] = {0};
+  bool _ann_pending = false; uint32_t _ann_at_ms = 0; static uint32_t millis() { return 1000; }   // (swarm v1) announce after a BLE fill
   void slotFromLota(); bool bleFilled(const SlotHeader& h) const;
 };
 """
@@ -65,7 +66,7 @@ int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0); int checks = 0; const uint32_t H = 0x1000 - 160;
   // 1) the real slot image -> VALID slot, marked BLE-filled, message
   { load(IMG); FwOtaTransfer t; t.slotFromLota(); assert(slotValid()); checks++;
-    SlotHeader h; memcpy(&h, &FL[0], sizeof h); assert(t.bleFilled(h) && strstr(t._last_err, "in the slot, served")); checks++;
+    SlotHeader h; memcpy(&h, &FL[0], sizeof h); assert(t.bleFilled(h) && strstr(t._last_err, "in the slot, served") && !t._ann_pending); checks++;   // (rc15) no announce flood after a fill: the boot advert + demand advert cover it
     uint32_t fv; memcpy(&fv, &IMG[H + 16], 4); assert(h.fw_version == fv && h.compression == COMP_LZMA && h.lzma_props[0] == 0x5D); checks++;
     FwOtaTransfer t2; t2.slotFromLota(); assert(slotValid()); checks++;                      // a second boot: no LOTA header any more, slot stays
     printf("  good upload: %s (fw-%u, %u B payload)\n", t._last_err, h.fw_version, h.payload_len); }

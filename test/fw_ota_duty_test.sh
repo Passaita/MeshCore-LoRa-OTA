@@ -21,6 +21,8 @@ static const uint8_t DUTY_MIN_PCT = 10, XFER_WINDOW = 8;
 struct AnsRec { uint32_t sess; uint32_t ms; uint8_t direct; uint8_t flooded; };
 static const uint32_t SCAN_MS = 25000, SCAN_REQ_MIN_MS = 6000, SCAN_REQ_SPREAD_MS = 4000, ANS_MEMORY_MS = 60000; static const uint8_t SCAN_REQ_RESENDS = 1;
 static const uint32_t OFFER_RETRY_MS = 4000, WAIT_BACKOFF_MAX_MS = 60000, WAIT_BACKOFF_LONG_MS = 300000; static const uint16_t WAIT_LONG_AFTER = 10;
+static const uint32_t DUTY_ACTIVE_MS = 60000;
+static const uint32_t SERVE_ACTIVE_MS = 600000, REAGREE_FIRST_MS = 900000, REAGREE_MAX_MS = 7200000;
 static const uint32_t CHUNK_GAP_MS = 90, DUTY_WIN_MS = 10000, WIN_RETRY_MS = 6000, BATCH_GAP_MS = 5000, BATCH_GAP_HOP_MS = 2500, YIELD_QUIET_MS = 2000, YIELD_MAX_MS = 20000; static const uint8_t DUTY_FULL_PCT = 30; static const uint8_t RELAY_BATCH = 5;
 """
 TAIL = r"""
@@ -142,7 +144,43 @@ int main(){
   { assert(otaQuiet(1000, 0, 0)); assert(!otaQuiet(5000, 4000, 0)); assert(otaQuiet(6000, 4000, 0)); checks++;
     assert(!otaQuiet(20000, 19500, 5000) && otaQuiet(25001, 25000, 5000)); checks++;    // waiting 20 s: send anyway
     assert(!otaQuiet(3, 0xFFFFFFF0u, 0) && otaQuiet(0x7D1, 0xFFFFFFFFu, 0)); checks++; }   // millis() wrap
-  printf("duty parse + negotiation + pacing + simulated pulls + wait back-off + scan/answer budget + discovery answers + pause + rc6: %d passed\n", checks); return 0;
+  // (rc10, C26) a share below the ask is re-asked after 15 min, doubling to 2 h while it does not grow; growth starts over at 15 min
+  { assert(reagreeNextMs(0, 0, 10) == 900000); checks++;
+    assert(reagreeNextMs(900000, 10, 10) == 1800000 && reagreeNextMs(1800000, 10, 10) == 3600000 && reagreeNextMs(3600000, 10, 10) == 7200000); checks++;
+    assert(reagreeNextMs(7200000, 10, 10) == 7200000 && reagreeNextMs(7200000, 30, 20) == 7200000); checks++;   // capped; a smaller share = no growth
+    assert(reagreeNextMs(3600000, 10, 20) == 900000); checks++;                                                     // it grew (still below the ask)
+    // the owner's case: server 1.0 busy with a 1.0 puller -> the 2nd gets the floor; once the first left, its re-offer gets what it asked
+    assert(dutyAgree(30, 100, 100) == DUTY_MIN_PCT && dutyAgree(30, 100, 0) == 30); checks++; }
+  // (rc10, C22) a puller is "active" for 10 min after its last request; ages for the idle line
+  { assert(!serveActive(1000, 0) && serveActive(600999, 1000) && !serveActive(601000, 1000) && serveActive(5, 0xFFFFFFF0u)); checks++;
+    char t[16]; agoText(45, t, sizeof t); assert(!strcmp(t, "45 s")); agoText(600, t, sizeof t); assert(!strcmp(t, "10 min"));
+    agoText(7500, t, sizeof t); assert(!strcmp(t, "2h05m")); agoText(3 * 86400 + 5, t, sizeof t); assert(!strcmp(t, "3 d")); checks++; }
+  // (rc11, C29, owner) fair share at the server: water-filling over the pulls that follow PACE; older pulls keep what they were given
+  { auto fair = [](std::vector<int> ask, std::vector<int> fixd, int ceil) {
+      uint8_t n = (uint8_t)ask.size(), a[8], fp[8], o[8]; bool f[8];
+      for (uint8_t i = 0; i < n; i++) { a[i] = (uint8_t)ask[i]; f[i] = fixd[i] >= 0; fp[i] = f[i] ? (uint8_t)fixd[i] : 0; }
+      dutyFair(n, a, f, fp, (uint8_t)ceil, o); return std::vector<int>(o, o + n); };
+    assert((fair({100}, {-1}, 100) == std::vector<int>{100})); checks++;                       // one pull at 1.0 on a 1.0 server
+    assert((fair({100, 100}, {-1, -1}, 100) == std::vector<int>{50, 50})); checks++;           // owner's case: a second asks 1.0 -> 0.5 + 0.5
+    assert((fair({30, 100}, {-1, -1}, 100) == std::vector<int>{30, 70})); checks++;            // a slower ask leaves the rest to the other
+    assert((fair({100, 100, 100}, {-1, -1, -1}, 100) == std::vector<int>{33, 33, 33})); checks++;
+    assert((fair({30, 30, 100}, {-1, -1, -1}, 100) == std::vector<int>{30, 30, 40})); checks++;
+    assert((fair({100, 100}, {100, -1}, 100) == std::vector<int>{100, 10})); checks++;         // an older pull at 1.0 is not trimmed: the floor
+    assert((fair({30, 100}, {30, -1}, 100) == std::vector<int>{30, 70})); checks++;            // an older pull at 0.3 + a new one: 0.7
+    assert((fair({100, 100}, {-1, -1}, 30) == std::vector<int>{15, 15})); checks++;            // the server's own duty is the ceiling
+    assert((fair({100, 100, 100, 100}, {-1, -1, -1, -1}, 30) == std::vector<int>{10, 10, 10, 10})); checks++;   // never below the floor
+    assert((fair({0, 100}, {-1, -1}, 50) == std::vector<int>{25, 25})); checks++;              // no wish = the server's duty
+    for (int c : {30, 50, 100}) for (int k = 1; k <= 4; k++) {                                 // never more than the server's duty (above the floor)
+      std::vector<int> as(k, 100), fx(k, -1); auto o = fair(as, fx, c); int sum = 0; for (int v : o) sum += v;
+      assert(sum <= c || sum <= k * DUTY_MIN_PCT); checks++; }
+    // the hold: 3x the pull's own request interval, 1 .. 15 min - board 2 (0.30 through a relay, a request every ~3 min) keeps its share
+    assert(shareHoldMs(0) == 60000 && shareHoldMs(10000) == 60000 && shareHoldMs(180000) == 540000 && shareHoldMs(3600000) == 900000); checks++;
+    // the pace of a window: lowered from the NEXT window (the puller timed this one for its old share), raised at once
+    assert(paceFor(true, 50, 100, 100) == 100 && paceFor(true, 50, 50, 100) == 50 && paceFor(true, 100, 50, 50) == 100 && paceFor(false, 50, 0, 100) == 100); checks++;
+    // the owner's sequence on one 1.0 server: A alone -> B arrives (A told at once, B waits for A's next window) -> A done -> B alone
+    { std::vector<int> s1 = fair({100}, {-1}, 100), s2 = fair({100, 100}, {-1, -1}, 100), s3 = fair({100}, {-1}, 100);
+      assert(s1[0] == 100 && s2[0] == 50 && s2[1] == 50 && s3[0] == 100); checks++; } }
+  printf("duty parse + negotiation + pacing + simulated pulls + wait back-off + scan/answer budget + discovery answers + pause + rc6 + rc10 + rc11 fair share: %d passed\n", checks); return 0;
 }
 """
 src = open("src/helpers/fw_ota/FwOtaTransfer.cpp").read()
@@ -153,7 +191,7 @@ def fn(sig):
         elif src[k] == "}":
             d -= 1
             if d == 0: return src[i:k + 1]
-funcs = [fn(s) for s in ("static uint8_t dutyParse(", "static uint8_t dutyAgree(", "static bool dutyPaced(", "static uint32_t dutySpacingMs(", "static uint8_t dutyWinMax(", "static uint32_t batchGapMs(", "static uint8_t chanPct(", "static bool otaQuiet(", "static uint32_t dutyWinExtraMs(", "static uint32_t waitBackoffMs(", "static bool answerAllowed(", "static uint32_t scanResendAt(", "static uint8_t discAnswer(", "static int pauseHours(")]
+funcs = [fn(s) for s in ("static uint8_t dutyParse(", "static uint8_t dutyAgree(", "static bool dutyPaced(", "static uint32_t dutySpacingMs(", "static uint8_t dutyWinMax(", "static uint32_t batchGapMs(", "static uint8_t chanPct(", "static bool otaQuiet(", "static uint32_t dutyWinExtraMs(", "static uint32_t waitBackoffMs(", "static bool answerAllowed(", "static uint32_t scanResendAt(", "static uint8_t discAnswer(", "static int pauseHours(", "static uint32_t reagreeNextMs(", "static bool serveActive(", "static void agoText(", "static void dutyFair(", "static uint32_t shareHoldMs(", "static uint8_t paceFor(")]
 open(sys.argv[1], "w").write(HEAD + "#include <vector>\n" + "\n".join(funcs) + "\n" + TAIL)
 PY
 g++ -std=c++11 -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -o "$W/duty_test" "$W/duty_test.cpp"

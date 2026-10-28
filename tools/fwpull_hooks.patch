@@ -1,5 +1,5 @@
 diff --git a/examples/simple_repeater/MyMesh.cpp b/examples/simple_repeater/MyMesh.cpp
-index a50219eb..84f63f06 100644
+index a50219eb..151890df 100644
 --- a/examples/simple_repeater/MyMesh.cpp
 +++ b/examples/simple_repeater/MyMesh.cpp
 @@ -25,6 +25,12 @@ static void applyRxPowerSavingConfig(NodePrefs& prefs, uint8_t sf, float bw) {
@@ -20,7 +20,7 @@ index a50219eb..84f63f06 100644
  
  void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
 +#ifdef FW_OTA
-+  fw_ota::g_xfer.noteRx(pkt->getPayloadType(), pkt->payload, pkt->payload_len);   // (rc6, C14) LoRa-OTA yields to the traffic it hears
++  fw_ota::g_xfer.noteRx(pkt->getPayloadType(), pkt->payload, pkt->payload_len, pkt->_snr);   // (rc6, C14) LoRa-OTA yields to the traffic it hears; (rc18) SNR: best link repairs first
 +#endif
  #ifdef WITH_BRIDGE
    if (_prefs.bridge_pkt_src == 1) {
@@ -30,7 +30,7 @@ index a50219eb..84f63f06 100644
    radio_driver.setTxPower(_prefs.tx_power_dbm);
  
 +#ifdef FW_OTA
-+  fw_ota::g_xfer.begin(this, _fs, _prefs.node_name, self_id.pub_key, _prefs.password, &_prefs.path_hash_mode);
++  fw_ota::g_xfer.begin(this, _fs, _prefs.node_name, self_id.pub_key, &_prefs.path_hash_mode);
 +  {
 +    struct FloodHost : fw_ota::FloodHost {             // discovery floods leave with the node's default region (v1.17.23)
 +      MyMesh* m = nullptr;
@@ -51,15 +51,11 @@ index a50219eb..84f63f06 100644
    radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
    MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                       radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
-@@ -1373,6 +1401,17 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *
+@@ -1373,6 +1401,13 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *
      command += 3;
    }
  
 +#ifdef FW_OTA
-+  if (sender_timestamp == 0 && fw_ota::g_xfer.awaitingPassword()) {   // the line typed after "fw pull <peer>" is the admin password
-+    fw_ota::g_xfer.submitPassword(command, reply);
-+    return;
-+  }
 +  if (fw_ota::cliHandle(command, reply, sender_timestamp != 0)) {   // serial console and remote-admin session (replies fit 160 B)
 +    return;
 +  }
@@ -69,7 +65,7 @@ index a50219eb..84f63f06 100644
    // handle ACL related commands
    if (memcmp(command, "setperm ", 8) == 0) {   // format:  setperm {pubkey-hex} {permissions-int8}
      char* hex = &command[8];
-@@ -1449,10 +1488,29 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *
+@@ -1449,10 +1484,29 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *
    }
  }
  
@@ -83,7 +79,7 @@ index a50219eb..84f63f06 100644
 +  return fw_ota::g_xfer.channelMatch(hash, channels, max_matches);
 +}
 +void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
-+  if (type == PAYLOAD_TYPE_GRP_TXT) fw_ota::g_xfer.onDiscovery(packet, data, len);
++  if (type == PAYLOAD_TYPE_GRP_TXT) { fw_ota::g_xfer.noteRssi(_radio->getLastRSSI()); fw_ota::g_xfer.onDiscovery(packet, data, len); }   // (rc10, C24)
 +}
 +#endif
 +
@@ -154,21 +150,32 @@ index f1cff542..04d42c47 100644
    // CommonCLICallbacks
    void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) override;
 diff --git a/examples/simple_repeater/main.cpp b/examples/simple_repeater/main.cpp
-index 3a9c480a..85e60774 100644
+index 3a9c480a..366ac78b 100644
 --- a/examples/simple_repeater/main.cpp
 +++ b/examples/simple_repeater/main.cpp
-@@ -3,6 +3,10 @@
+@@ -3,6 +3,11 @@
  
  #include "MyMesh.h"
  
 +#ifdef FW_OTA
-+  #include "helpers/fw_ota/FwOtaTransfer.h"   // fw_ota::g_xfer: `fw stage` serial upload, password prompt
++  #include "helpers/fw_ota/FwOtaTransfer.h"   // fw_ota::g_xfer: `fw stage` serial upload
++  #include "helpers/fw_ota/Watchdog.h"        // fw_ota::g_wdt (rc8, C23): hardware watchdog
 +#endif
 +
  #ifdef DISPLAY_CLASS
    #include "UITask.h"
    static UITask ui_task(board, display);
-@@ -136,13 +140,21 @@ void setup() {
+@@ -41,6 +46,9 @@ void setup() {
+ 
+   board.begin();
+ 
++#ifdef FW_OTA
++  fw_ota::g_wdt.start();   // (rc8, C23) before anything that could hang; fed from loop() only
++#endif
+ #ifdef HAS_EXTERNAL_WATCHDOG
+   external_watchdog.begin();
+ #endif
+@@ -136,9 +144,14 @@ void setup() {
  }
  
  void loop() {
@@ -184,13 +191,20 @@ index 3a9c480a..85e60774 100644
      char c = Serial.read();
      if (c != '\n') {
        command[len++] = c;
-       command[len] = 0;
-+#ifdef FW_OTA
-+      if (!fw_ota::g_xfer.awaitingPassword())   // do not echo the admin password
+@@ -210,6 +223,13 @@ void loop() {
+ 
+ #ifdef HAS_EXTERNAL_WATCHDOG
+   external_watchdog.loop();
 +#endif
-       Serial.print(c);
-     }
-     if (c == '\r') break;
++#ifdef FW_OTA
++  fw_ota::g_wdt.feed();    // (rc8, C23) once per loop pass, also right before the idle sleep: only a hung loop trips it
++#ifdef FW_OTA
++  { static uint32_t batt_ms = 0;                        // (swarm v1) the battery for the holder's power state (every minute)
++    if (!batt_ms || millis() - batt_ms > 60000) { batt_ms = millis() | 1; fw_ota::g_xfer.noteBattery(board.getBattMilliVolts()); } }
++#endif
+ #endif
+   if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
+ #if defined(NRF52_PLATFORM)
 diff --git a/src/helpers/AutoDiscoverRTCClock.cpp b/src/helpers/AutoDiscoverRTCClock.cpp
 index af08fddb..53fce332 100644
 --- a/src/helpers/AutoDiscoverRTCClock.cpp

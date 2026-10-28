@@ -52,26 +52,29 @@ struct MeshStub {
   Clock* getRTCClock() { return &clk; } Rng* getRNG() { return &rng; }
   Packet* obtainNewPacket() { assert(used < 2048); Packet* p = &pool[used++]; memset((void*)p, 0, sizeof(*p)); return p; }
   const char* getLogDateTime() { return ""; }
+  std::vector<Packet*> zero_hop; void sendZeroHop(Packet* p, uint32_t) { zero_hop.push_back(p); }   // (rc15) zero-hop searches
   Packet* createGroupDatagram(uint8_t type, const GroupChannel& channel, const uint8_t* data, size_t data_len);
 };
 }
 using mesh::Packet;
 static const uint8_t XFER_MAGIC = 0xF7, MSG_OFFER_REQ = 1, MSG_OFFER_NAK = 3, MSG_CHUNK_REQ = 4, MSG_CHUNK = 5, MSG_ABORT = 7, MSG_LIST_REQ = 8, MSG_LIST_RSP = 9, MSG_BAD_AUTH = 10, MSG_OFFER_REQ2 = 11;
 static const uint32_t XFER_MAC_LEN = 8; static const uint8_t MAX_HOPS = 6, MAX_ROUTE_BYTES = 12, KIND_APP = 0, KIND_BOOTLOADER = 1;
+static const uint8_t KIND_SWARM = 0x80, SWARM_BLK = 11;   // (swarm v1) the block after a LIST_RSP's route
 static inline uint8_t rtSize(uint8_t e){return (e>>6)+1;} static inline uint8_t rtCount(uint8_t e){return e&63;}
 static inline uint8_t rtBytes(uint8_t e){return rtCount(e)*rtSize(e);}
 static inline bool rtValid(uint8_t e){return rtSize(e)<=3&&rtCount(e)<=MAX_HOPS&&rtBytes(e)<=MAX_ROUTE_BYTES;}
 static inline void rtReverse(uint8_t* dst, const uint8_t* src, uint8_t enc){ uint8_t s=rtSize(enc),c=rtCount(enc); for(uint8_t i=0;i<c;i++) memcpy(dst+i*s, src+(c-1-i)*s, s); }
 struct { uint8_t board[8]; } g_fwpull_tag = {{'R','A','K','3','4','0','1',0}};
-struct XferManifest { char name[32]; uint32_t payload_len; uint32_t fw_version; uint8_t kind; };
-struct FloodHost { virtual bool sharedSecret(uint8_t* out, const uint8_t* peer) = 0; };
+struct XferManifest { char name[32]; uint32_t payload_len; uint32_t fw_version; uint8_t kind; uint8_t sha256[32]; };
+struct FloodHost { virtual bool sharedSecret(uint8_t* out, const uint8_t* peer) = 0; virtual bool sendOta(Packet*, const uint8_t*, uint8_t, uint32_t) { return false; } };
 """
 CLASS = r"""
 class FwOtaTransfer { public:
   mesh::MeshStub* _mesh; mesh::GroupChannel _disc_ch; uint32_t _disc_sess = 0; uint16_t _disc_seq = 0;
-  const uint8_t* _pub = nullptr; const char* _name_src = nullptr; const char* _admin_pw = "admin-pw-example";
+  const uint8_t* _pub = nullptr; const char* _name_src = nullptr;
   bool _serving = true, _bl_serving = false; XferManifest _serve_man = {}, _bl_man = {};
-  bool _pull_key_set = false; uint8_t _pull_key[16] = {0}; int16_t _rx_rssi = 0;
+  int16_t _rx_rssi = 0; uint8_t _duty_pct = 30;
+  uint8_t activePulls() const { return 1; } uint8_t powerState() const { return 1; }   // (swarm v1) in the answer's swarm block
   uint8_t _circle[32] = {0}; bool _circle_set = false; uint8_t _list_key[16] = {0}, _offer_key[16] = {0}, _sess_mac[16] = {0}, _sess_enc[16] = {0};
   bool _sess_set = false; FloodHost* _flood_host = nullptr;
   std::vector<Packet*> floods; int direct = 0;
@@ -83,15 +86,20 @@ class FwOtaTransfer { public:
   void sendListRsp(const uint8_t*, const XferManifest&, uint32_t, const uint8_t* = nullptr, uint8_t = 0, const uint8_t* = nullptr) { direct++; }
   void onListRsp(const uint8_t* b, uint32_t len, int8_t, const uint8_t* ret = nullptr, uint8_t ret_enc = 0, bool heal = false) {
     Got g; g.b.assign(b, b + len); if (ret) g.ret.assign(ret, ret + rtBytes(ret_enc)); g.ret_enc = ret_enc; g.heal = heal; got.push_back(g); }
-  void deriveKey(const char* pw, uint8_t out[16]) const;
   void circleKeys(); void macFillKey(uint8_t* pkt, uint32_t len, const uint8_t* key) const;
   bool sessionKeys(const uint8_t* peer_pub, uint32_t sess, const uint8_t* np, const uint8_t* ns, uint8_t* kmac, uint8_t* kenc);
   const uint8_t* keyForSend(uint8_t type, uint8_t* tmp) const;
   void macFill(uint8_t* pkt, uint32_t len) const;
   bool macOk(const uint8_t* key, const uint8_t* pkt, uint32_t len) const;
   uint32_t buildListRsp(uint8_t* r, const uint8_t* sess_seq, const XferManifest& m, const uint8_t* fwd, uint8_t enc) const;
-  void floodListRsp(const uint8_t* r, uint32_t n, uint32_t delay_ms, bool heal);
-  void sendDiscovery(const char* target);
+  void floodListRsp(const uint8_t* r, uint32_t n, uint32_t delay_ms, bool heal, bool ann = false);
+  void sendDiscovery(const char* target, bool zero_hop = false);
+  struct { uint32_t searches_zero = 0, searches_flood = 0, answers_sent = 0; } stats;   // (rc15)
+  void answerHeard(const uint8_t*, uint32_t) {}                                           // (rc15) suppression: tested in the simulator
+  void answerLater(const uint8_t* r, uint32_t n, uint32_t d) { floodListRsp(r, n, d, false); }
+  static const uint32_t ANS_HOP_MS = 1500;
+  void onClaim(const uint8_t*, uint32_t) {}                                                // (study C/D) election claims: simulator
+  void onTime(const uint8_t*, uint32_t, uint8_t) {}                                        // (rc21, C57) swarm time: simulator (H15)
   void onDiscovery(Packet* pkt, const uint8_t* data, size_t len);
 };
 """
@@ -120,11 +128,11 @@ int main() {
   setvbuf(stdout, NULL, _IONBF, 0);
   int checks = 0; bool rem[16] = {false};
   static mesh::MeshStub air;
-  static const uint8_t PUB_S[32] = {0x1A,0x2B,0x3C,0x4D,1,2,3}, PUB_P[32] = {0x5E,0x6F,0x70,0x00,9,8,7};
+  static const uint8_t PUB_S[32] = {0x1F,0x2E,0x3D,0x4C,1,2,3}, PUB_P[32] = {0x5A,0x6B,0x7C,0x00,9,8,7};
   // 1) flooded answers and heal notices: every valid route encoding, app and bootloader offers, relays on the way back
   for (int kind = 0; kind < 2; kind++) for (int heal = 0; heal < 2; heal++) for (int hs = 1; hs <= 3; hs++) for (int hops = 0; hops <= MAX_HOPS; hops++) {
     uint8_t enc = (uint8_t)(((hs - 1) << 6) | hops); if (!rtValid(enc)) continue;
-    FwOtaTransfer srv, pul; initNode(srv, &air, PUB_S, "NODE-A"); initNode(pul, &air, PUB_P, "NODE-B");
+    FwOtaTransfer srv, pul; initNode(srv, &air, PUB_S, "PERSIST-TEST-BOARD1"); initNode(pul, &air, PUB_P, "RAK3401-BOARD2");
     uint8_t sess_seq[6] = {0x44,0x33,0x22,0x11,0x07,0x00}, fwd[MAX_ROUTE_BYTES]; for (int i = 0; i < rtBytes(enc); i++) fwd[i] = (uint8_t)(0xB0 + i);
     uint8_t r[128]; uint32_t n = srv.buildListRsp(r, sess_seq, kind ? srv._bl_man : srv._serve_man, fwd, enc);
     srv.floodListRsp(r, n, 0, heal); assert(srv.floods.size() == 1); checks++;
@@ -138,7 +146,7 @@ int main() {
   // 2) discovery requests of every target length -> the server answers with a flood -> the answer is back at the puller, same session
   for (int tl = 1; tl <= 30; tl++) {
     FwOtaTransfer srv, pul; char name[40]; for (int i = 0; i < tl; i++) name[i] = (char)('a' + i % 26); name[tl] = 0;
-    initNode(srv, &air, PUB_S, name); initNode(pul, &air, PUB_P, "NODE-B");
+    initNode(srv, &air, PUB_S, name); initNode(pul, &air, PUB_P, "RAK3401-BOARD2");
     pul._disc_sess = 0x1234ABCD + tl; pul.sendDiscovery(name);
     if (21 + tl >= 48) { assert(pul.floods.empty()); checks++; continue; }   // "LOTA1 SSSSSSSSQQQQ <target> F" too long for the request buffer: not sent
     assert(pul.floods.size() == 1); checks++;
@@ -151,12 +159,26 @@ int main() {
     uint32_t s; memcpy(&s, pul.got[0].b.data() + 2, 4); assert(s == pul._disc_sess); checks++;
     uint8_t renc = pul.got[0].b[45]; assert(renc == q->path_len && !memcmp(pul.got[0].b.data() + 46, q->path, rtBytes(renc))); checks++;   // the way there it carries
   }
-  { FwOtaTransfer srv, pul; initNode(srv, &air, PUB_S, "NODE-A"); initNode(pul, &air, PUB_P, "B2");   // "@ID8" and another node's id
-    pul._disc_sess = 0x55; pul.sendDiscovery("@1A2B3C4D"); assert(deliver(srv, pul.floods[0]) && srv.floods.size() == 1); checks++;
-    pul.sendDiscovery("@1A2B3C4E"); assert(deliver(srv, pul.floods[1]) && srv.floods.size() == 1); checks++; }
+  { FwOtaTransfer srv, pul; initNode(srv, &air, PUB_S, "PERSIST-TEST-BOARD1"); initNode(pul, &air, PUB_P, "B2");   // "@ID8" and another node's id
+    pul._disc_sess = 0x55; pul.sendDiscovery("@1F2E3D4C"); assert(deliver(srv, pul.floods[0]) && srv.floods.size() == 1); checks++;
+    pul.sendDiscovery("@1F2E3D4D"); assert(deliver(srv, pul.floods[1]) && srv.floods.size() == 1); checks++; }
+  { // (swarm v1) an IMAGE search ("=<16 hex of its SHA-256>") through the real encryption: the holder answers with its swarm block; another
+    // image is not answered; an announcement (session 0, marker LOTA1A) arrives like an answer
+    FwOtaTransfer srv, pul; initNode(srv, &air, PUB_S, "PERSIST-TEST-BOARD1"); initNode(pul, &air, PUB_P, "B2");
+    for (int k = 0; k < 32; k++) srv._serve_man.sha256[k] = (uint8_t)(0xA1 + k);
+    char t[20] = "="; for (int k = 0; k < 8; k++) snprintf(t + 1 + 2 * k, 3, "%02X", srv._serve_man.sha256[k]);
+    pul._disc_sess = 0x66; pul.sendDiscovery(t); Packet* q = pul.floods[0]; relayPath(q, 2, 1, 0x50);
+    assert(deliver(srv, q) && srv.floods.size() == 1); checks++;
+    Packet* a = srv.floods[0]; relayPath(a, 2, 1, 0x77); assert(deliver(pul, a) && pul.got.size() == 1); checks++;
+    const std::vector<uint8_t>& g = pul.got[0].b; const uint32_t blk = 46 + rtBytes(g[45]);
+    assert((g[36] & KIND_SWARM) && g.size() == blk + SWARM_BLK + XFER_MAC_LEN && !memcmp(g.data() + blk, srv._serve_man.sha256, 8) && g[blk + 8] == 30 && g[blk + 9] == 1 && g[blk + 10] == 1); checks++;
+    t[16] = t[16] == '0' ? '1' : '0'; pul.sendDiscovery(t); assert(deliver(srv, pul.floods[1]) && srv.floods.size() == 1); checks++;   // not this image: silent
+    uint8_t zs[6] = {0}, r[128]; uint32_t n = srv.buildListRsp(r, zs, srv._serve_man, nullptr, 0); srv.floodListRsp(r, n, 0, false, true);
+    Packet* an = srv.floods.back(); relayPath(an, 3, 2, 0x31); assert(deliver(pul, an) && pul.got.size() == 2); checks++;
+    uint32_t s0; memcpy(&s0, pul.got[1].b.data() + 2, 4); assert(s0 == 0 && !pul.got[1].heal); checks++; }
   // 3) one flipped byte anywhere in the encrypted payload: nothing (or at least nothing wrong) reaches onListRsp
   { int rejected = 0, total = 0;
-    FwOtaTransfer srv; initNode(srv, &air, PUB_S, "NODE-A");
+    FwOtaTransfer srv; initNode(srv, &air, PUB_S, "PERSIST-TEST-BOARD1");
     uint8_t ss[6] = {1,2,3,4,5,6}, fwd[6] = {1,2,3,4,5,6}; uint8_t r[128]; uint32_t n = srv.buildListRsp(r, ss, srv._serve_man, fwd, 0x82);
     srv.floodListRsp(r, n, 0, false); Packet* p0 = srv.floods[0];
     for (int pos = 1; pos < p0->payload_len; pos++) for (int bit = 0; bit < 8; bit++) {
@@ -202,11 +224,11 @@ int main() {
 cg = fn(mesh, "Packet* Mesh::createGroupDatagram(").replace("Packet* Mesh::createGroupDatagram(", "Packet* MeshStub::createGroupDatagram(", 1)
 statics = "\n".join([fn(src, "static uint32_t listRspLen("), line(r"^static bool isListMsg\(.*$"),
                      fn(src, "static void hmac("), fn(src, "static void pbkdf2Start("), fn(src, "static uint32_t pbkdf2Steps("), fn(src, "static void pbkdf2("), fn(src, "static void ctrXor("),
-                     line(r'^static const char\s+FLOOD_RSP\[\].*$'), line(r'^static const char\s+FLOOD_HEAL\[\].*$'),
+                     line(r'^static const char\s+FLOOD_RSP\[\].*$'), line(r'^static const char\s+FLOOD_HEAL\[\].*$'), line(r'^static const char\s+FLOOD_ANN\[\].*$'), line(r'^static const char\s+FLOOD_CLAIM\[\].*$'), line(r'^static const char\s+FLOOD_TREQ\[\].*$'), line(r'^static const char\s+FLOOD_TANS\[\].*$'), fn(src, "static bool hexN("),
                      line(r'^static const uint32_t LIST_RSP_MAX = .*$'),
                      line(r'^static const uint32_t DISC_RSP_MIN_MS .*$'), line(r'^static const uint32_t DISC_RSP_SPREAD_MS .*$'),
                      fn(src, "static uint8_t discAnswer(")])
-members = "\n".join(fn(src, s) for s in ("void FwOtaTransfer::deriveKey(", "const uint8_t* FwOtaTransfer::keyForSend(", "void FwOtaTransfer::macFill(",
+members = "\n".join(fn(src, s) for s in ("const uint8_t* FwOtaTransfer::keyForSend(", "void FwOtaTransfer::macFill(",
                                           "void FwOtaTransfer::macFillKey(", "void FwOtaTransfer::circleKeys()", "bool FwOtaTransfer::sessionKeys(",
                                           "bool FwOtaTransfer::macOk(", "uint32_t FwOtaTransfer::buildListRsp(", "void FwOtaTransfer::floodListRsp(",
                                           "void FwOtaTransfer::sendDiscovery(", "void FwOtaTransfer::onDiscovery("))

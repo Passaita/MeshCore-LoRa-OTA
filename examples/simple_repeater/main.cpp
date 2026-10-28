@@ -4,7 +4,8 @@
 #include "MyMesh.h"
 
 #ifdef FW_OTA
-  #include "helpers/fw_ota/FwOtaTransfer.h"   // fw_ota::g_xfer: `fw stage` serial upload, password prompt
+  #include "helpers/fw_ota/FwOtaTransfer.h"   // fw_ota::g_xfer: `fw stage` serial upload
+  #include "helpers/fw_ota/Watchdog.h"        // fw_ota::g_wdt (rc8, C23): hardware watchdog
 #endif
 
 #ifdef DISPLAY_CLASS
@@ -45,6 +46,9 @@ void setup() {
 
   board.begin();
 
+#ifdef FW_OTA
+  fw_ota::g_wdt.start();   // (rc8, C23) before anything that could hang; fed from loop() only
+#endif
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.begin();
 #endif
@@ -109,12 +113,9 @@ void setup() {
 #if ENV_INCLUDE_GPS == 1
   // Apply PowerSaving profile for GPS
   if (sensors.getLocationProvider() != NULL) {
-    // Let CLI "gps on" call setSettingValue to enable the PowerSaving mode
-    // sensors.powersaving_enabled = true;
-    // sensors.getLocationProvider()->enablePowerSaving(true);
-
     // GPS on and off duration in seconds
-    sensors.getLocationProvider()->setPowerSavingProfile(600, 86400); // Max 10 minutes, 1 day
+    sensors.getLocationProvider()->setPowerSavingProfile(the_mesh.getNodePrefs()->powersaving_enabled, 600,
+                                                         86400); // Max 10 minutes, 1 day
   }
 #endif
 
@@ -152,9 +153,6 @@ void loop() {
     if (c != '\n') {
       command[len++] = c;
       command[len] = 0;
-#ifdef FW_OTA
-      if (!fw_ota::g_xfer.awaitingPassword())   // do not echo the admin password
-#endif
       Serial.print(c);
     }
     if (c == '\r') break;
@@ -222,6 +220,13 @@ void loop() {
 
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.loop();
+#endif
+#ifdef FW_OTA
+  fw_ota::g_wdt.feed();    // (rc8, C23) once per loop pass, also right before the idle sleep: only a hung loop trips it
+#ifdef FW_OTA
+  { static uint32_t batt_ms = 0;                        // (swarm v1) the battery for the holder's power state (every minute)
+    if (!batt_ms || millis() - batt_ms > 60000) { batt_ms = millis() | 1; fw_ota::g_xfer.noteBattery(board.getBattMilliVolts()); } }
+#endif
 #endif
   if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)

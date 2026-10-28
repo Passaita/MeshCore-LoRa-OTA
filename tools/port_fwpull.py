@@ -48,7 +48,7 @@ def main():
         else: shutil.copy2(src, dst)
         print('copied', rel)
     env = os.path.join(t, 'platformio.local.ini')
-    if os.path.exists(env): print('platformio.local.ini exists - merge tools/fwpull_env.ini into it by hand (envs RAK_3401_repeater_poc / _stocktag)')
+    if os.path.exists(env): print('platformio.local.ini exists - merge tools/fwpull_env.ini into it by hand (envs RAK_3401_lora_ota / _dev)')
     else:
         up = upstream_id(t)
         open(env, 'w').write(open(os.path.join(HERE, 'fwpull_env.ini')).read().replace('@UPSTREAM@', up))

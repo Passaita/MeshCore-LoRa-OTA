@@ -508,7 +508,7 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
 
 void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
 #ifdef FW_OTA
-  fw_ota::g_xfer.noteRx(pkt->getPayloadType(), pkt->payload, pkt->payload_len);   // (rc6, C14) LoRa-OTA yields to the traffic it hears
+  fw_ota::g_xfer.noteRx(pkt->getPayloadType(), pkt->payload, pkt->payload_len, pkt->_snr);   // (rc6, C14) LoRa-OTA yields to the traffic it hears; (rc18) SNR: best link repairs first
 #endif
 #ifdef WITH_BRIDGE
   if (_prefs.bridge_pkt_src == 1) {
@@ -973,13 +973,26 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.rx_boosted_gain = 1; // enabled by default;
 #endif
 #endif
-  _prefs.radio_fem_rxgain = 1;
+  _prefs.radio_fem_rxgain = 0; // PowerSaving and better signal
   _prefs.radio_fem_txgain = 0;
 
   pending_discover_tag = 0;
   pending_discover_until = 0;
 
   memset(default_scope.key, 0, sizeof(default_scope.key));
+
+  // PowerSaving defaults
+  _prefs.powersaving_enabled = 1;
+
+  // RXPS defaults - Balanced profile
+  _prefs.rxps.enabled = 1;
+  _prefs.rxps.level = 6;
+  _prefs.rxps.preamble = 16;
+#ifdef FW_OTA
+  // (rc21, C63, owner 2026-10-14) receiver (AGC) reset every 60 s on fresh installs: recovers a drifted / desensed front end
+  // (built-in MeshCore, off by default). Stored prefs win: an update never changes a running node's setting.
+  _prefs.agc_reset_interval = 60 / 4;
+#endif
 }
 
 void MyMesh::begin(FILESYSTEM *fs) {
@@ -1021,7 +1034,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   radio_driver.setTxPower(_prefs.tx_power_dbm);
 
 #ifdef FW_OTA
-  fw_ota::g_xfer.begin(this, _fs, _prefs.node_name, self_id.pub_key, _prefs.password, &_prefs.path_hash_mode);
+  fw_ota::g_xfer.begin(this, _fs, _prefs.node_name, self_id.pub_key, &_prefs.path_hash_mode);
   {
     struct FloodHost : fw_ota::FloodHost {             // discovery floods leave with the node's default region (v1.17.23)
       MyMesh* m = nullptr;
@@ -1032,6 +1045,9 @@ void MyMesh::begin(FILESYSTEM *fs) {
       uint32_t airtimeMs(uint32_t len) override { return radio_driver.getEstAirtimeFor((int)len); }
       // (v1.17.28, security v2) the session key of a pull includes the ECDH of the two identities (MeshCore's own login/DM key exchange)
       bool sharedSecret(uint8_t* out, const uint8_t* peer_pub) override { m->getSelfId().calcSharedSecret(out, peer_pub); return true; }
+      // (rc21, C57) a node without an RTC takes the time of a swarm member that has one (never steps back: hold)
+      uint8_t clockSource() override { return rtc_clock.chipValid() ? 1 : 0; }
+      void clockDiscipline(uint32_t ref) override { rtc_clock.discipline(ref); }
     };
     static FloodHost host; host.m = this;
     fw_ota::g_xfer.setFloodHost(&host);
@@ -1402,10 +1418,6 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *
   }
 
 #ifdef FW_OTA
-  if (sender_timestamp == 0 && fw_ota::g_xfer.awaitingPassword()) {   // the line typed after "fw pull <peer>" is the admin password
-    fw_ota::g_xfer.submitPassword(command, reply);
-    return;
-  }
   if (fw_ota::cliHandle(command, reply, sender_timestamp != 0)) {   // serial console and remote-admin session (replies fit 160 B)
     return;
   }
@@ -1498,7 +1510,7 @@ int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channel
   return fw_ota::g_xfer.channelMatch(hash, channels, max_matches);
 }
 void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
-  if (type == PAYLOAD_TYPE_GRP_TXT) fw_ota::g_xfer.onDiscovery(packet, data, len);
+  if (type == PAYLOAD_TYPE_GRP_TXT) { fw_ota::g_xfer.noteRssi(_radio->getLastRSSI()); fw_ota::g_xfer.onDiscovery(packet, data, len); }   // (rc10, C24)
 }
 #endif
 
