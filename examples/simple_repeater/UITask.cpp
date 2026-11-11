@@ -29,6 +29,7 @@ static const uint8_t meshcore_logo [] PROGMEM = {
     0xe3, 0xe3, 0x8f, 0xff, 0x1f, 0xfc, 0x3c, 0x0e, 0x1f, 0xf8, 0xff, 0xf8, 0x70, 0x3c, 0x7f, 0xf8, 
 };
 
+// PowerSaving variant
 // Added board for battery display
 void UITask::begin(NodePrefs* node_prefs, const char* build_date, const char* firmware_version, mesh::MainBoard* board) {
   _prevBtnState = HIGH;
@@ -49,8 +50,10 @@ void UITask::begin(NodePrefs* node_prefs, const char* build_date, const char* fi
     *dash = 0;
   }
 
+  // PowerSaving variant
   // v1.2.3 (1 Jan 2025)
-  snprintf(_version_info, sizeof(_version_info), "%s (%s)", version, build_date);
+  // snprintf(_version_info, sizeof(_version_info), "%s (%s)", version, build_date);
+  snprintf(_version_info, sizeof(_version_info), "%s", version);
   free(version);
 }
 

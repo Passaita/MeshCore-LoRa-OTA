@@ -23,6 +23,9 @@
   #include <SPIFFS.h>
 #endif
 #include <helpers/IdentityStore.h>   // brings in the FILESYSTEM / File types
+#if defined(ESP32) && !defined(FILE_O_WRITE)
+#define FILE_O_WRITE "w"   // (Heltec port) ESP32 FS: "w" truncates; the nRF52 FILE_O_WRITE appends, so every write site removes the file first anyway
+#endif
 
 #include "FwOtaSlots.h"
 #include "ChunkMap.h"
@@ -59,6 +62,8 @@ enum XferMsg : uint8_t {
   MSG_SUMM      = 17,  // (study E) zero-hop trickle summary: {tag, have, n} (image key MAC)
   MSG_TIME_REQ  = 18,  // (rc21, C57) zero-hop, node without an RTC: {nonce4} (list key MAC) on the discovery channel as LOTA1Q
   MSG_TIME_RSP  = 19,  // (rc21, C57) zero-hop, node with a valid RTC: {nonce4, time4, id4} (list key MAC) as LOTA1T
+  MSG_CAMP      = 20,  // (rc25, C95) the push campaign: invite / query / answer / reminder / cancel (flooded as LOTA1P), result (to the
+                      //   origin, direct or LOTA1P). Camp key MAC (circle members only). Older firmware ignores the type and the marker
 };
 // (rc17, owner 2026-10-08, SWARM-DESIGN 9.2/9.3) fleet fill: mode 1 (every pull) = nodes with an EMPTY slot fill from the stream they hear;
 // mode 2 ('fw pull ... fleet') = nodes also REPLACE an older slot image. Never an older/equal image, never installed (fw apply per node).
@@ -98,6 +103,12 @@ struct SwarmTune {
   bool     e_spread = true;              // E: a holder's summary is the image's announce (zero-hop): older neighbours fill hop by hop
   bool     src_spread = true;            // E: the stream's server gossips as a holder from the first FLEET offer (not only after a completion)
   bool     move_eval = true;             // (rc20, C48) a move is checked against the measured rate (false = rc19)
+  bool     keep_overheard = true;        // (rc22, C71) answers to other nodes' scans are kept for 'fw list' (false = rc21; mutant)
+  bool     bl_adopt = true;              // (rc22, C71) a bootloader pull by id adopts its image (false = rc21)
+  uint32_t camp_life_ms = 604800000;     // (rc25, C95) a push campaign lasts 7 days (owner 2026-11-04)
+  uint32_t remind_ms = 86400000;         // (rc25) about one flooded reminder per day for the whole circle
+  uint32_t island_step_ms = 180000;      // (rc25) island wait = (8 - hops from the origin) x this + 0-30 s: the farthest pulls first (90 s
+                                         //   in the design: a routed pull took 1-3 min to be heard - its relay pulled too, P1)
 };
 #ifdef FW_OTA_STUDY
 extern SwarmTune g_tune;                 // the simulator varies the parameters
@@ -139,7 +150,7 @@ struct PeerInfo {
   uint8_t  route[MAX_ROUTE_BYTES]; // relays towards the peer, learnt from the path the discovery flood took (empty = direct neighbour)
   uint8_t  route_len;       // encoded (rtSize/rtCount); 0 = direct
   // (v1.17.23) the way BACK from the peer, learnt from the path its flooded answer took - links are not always symmetric (2026-09-27:
-  // a relay reached board 1, board 1 did not reach that relay). Absent = the reverse of route.
+  // a field node reached board 1, board 1 did not reach it). Absent = the reverse of route.
   uint8_t  ret[MAX_ROUTE_BYTES];
   uint8_t  ret_len;
   bool     has_ret;
@@ -149,8 +160,13 @@ struct PeerInfo {
   uint8_t  digest[8];
   uint8_t  sduty, spulls, spower;
   bool     swarm;
+  // (rc22, C71) heard as an answer to ANOTHER node's scan (RAM only): listed with its age, dropped after OVERHEARD_MAX_MS; our own scan
+  // clears and replaces the table
+  bool     overheard;
+  uint32_t heard_ms;
 };
 static const uint8_t MAX_PEERS = 8;
+static const uint32_t OVERHEARD_MAX_MS = 24UL * 3600UL * 1000UL;   // (rc22, C71, owner 2026-10-21) 24 h
 static const uint8_t SWARM_BLK = 8 + 1 + 1 + 1;   // digest, duty, pulls served, power state - after the route of a LIST_RSP (kind bit 7 set)
 static const uint8_t KIND_SWARM = 0x80;           // LIST_RSP kind byte: the swarm block follows the route
 static const uint8_t SWARM_HOLDERS = 4;           // a pull by image remembers up to 4 holders (failover)
@@ -197,6 +213,7 @@ struct FloodHost {
   virtual bool sharedSecret(uint8_t* out32, const uint8_t* peer_pub32) { return false; }
   // (rc21, C57) time from a swarm member: 1 = this node has an RTC chip with a valid time (it answers time requests), 0 = none (it asks)
   virtual uint8_t clockSource() { return 0; }
+  virtual bool clockChipFound() { return false; }   // (C76) an RTC chip answers on I2C - also one that holds no valid time yet (unset / power lost)
   virtual void clockDiscipline(uint32_t ref) { }   // a trusted better time: behind -> step forward, ahead -> hold (never steps back)
 };
 
@@ -212,6 +229,7 @@ public:
     uint32_t adverts, advert_floods, answers_sent, answers_suppressed, moves, searches_zero, searches_flood;
     uint32_t fleet_anns, fills, gap_reqs, gap_supp, repairs, repairs_supp, escalations;   // (rc17)
     uint32_t claims, claim_floods, claims_supp, elected, summs, rests;                       // (study)
+    uint32_t camp_invites, camp_queries, camp_answers, camp_reminders, camp_results, island_pulls, camp_joins;   // (rc25, C95)
   } stats;
   void tick();
   void onPacket(mesh::Packet* pkt);            // from MyMesh::onRawDataRecv
@@ -233,6 +251,9 @@ public:
   bool cmdPeers(const char* arg, char* reply);
   bool cmdPeersHosts(const char* arg, char* reply);    // (swarm v1) the per-host view ('fw peers hosts [n]', the view of rc1-rc11)
   bool cmdMinBatt(const char* arg, char* reply);       // (swarm v1) 'fw minbatt [mV|off]': below = LOW (last-resort holder), 150 mV below = CRITICAL
+  bool cmdPush(char* reply);                           // (rc25, C95) 'fw push': the swarm fills this node's slot image (fill only), 7-day campaign
+  bool cmdPushStatus(char* reply);                     // (rc25) 'fw push-status'
+  bool cmdPushCancel(char* reply);                     // (rc25) 'fw push-cancel' (the origin): nobody joins any more, filled slots stay
   void noteBattery(uint16_t mv) { _batt_mv = mv; }     // (swarm v1) the board's battery, handed over by the main loop every minute   // show the peers found by the last `fw list` (3 per page)
   bool cmdPullPeer(const char* args, char* reply, bool bl = false);
                                                  // "<id|#n>" (v1.17.28: no password - the circle authenticates both ends)
@@ -244,6 +265,12 @@ public:
   bool cmdTime(const char* arg, char* reply);      // (rc21, C57) 'fw time [ask]': time to the second, its source, the last peer correction
   bool cmdBlInfo(char* reply);                    // the running bootloader: revision, size, CRC, whether it is offered
   bool cmdStatus(char* reply);
+  void pruneOverheard(uint32_t now);              // (rc22, C71) drop overheard peers older than 24 h
+  uint32_t overheardAgeS(uint32_t now) const;      // (rc22, C71) age of the oldest overheard entry (0 = none)
+  bool scanCmd(char* reply, bool autoscan);       // (rc22, C70) the scan behind 'fw peers' and a first 'fw list'
+  bool statusLine(char* reply);                    // (rc22) the pull-status line without the serving part
+  uint32_t pullVer() const { return _man.fw_version ? _man.fw_version : (_resuming && _saved_man.fw_version) ? _saved_man.fw_version : (_img_set ? _img_ver : 0); }   // the image the pull is for, 0 = not known yet (_saved_man may be an older pull's)
+  void appendServing(char* reply) const;          // (rc22, C73) " | serving fw-N to 1: a/b (p%)" when it fits whole
   bool cmdAbort(char* reply);
   bool cmdDuty(const char* arg, char* reply);     // "fw duty [0.1-1.0]": show / set the node's LoRa-OTA duty (persistent, default 0.5)
   bool cmdPullBle(char* reply);                   // (v1.17.28) "fw pull-ble": restart into the bootloader's BLE DFU that fills the SLOT (rev 5+)
@@ -252,12 +279,15 @@ public:
   // gap requests are handled here, wherever on the path they are heard); snr4 = the packet's SNR x4 (127 = unknown)
   void noteRx(uint8_t payload_type, const uint8_t* payload, uint16_t len, int8_t snr4 = 127);
   bool cmdSlot(char* reply);                      // (rc17, C39) "fw slot": what the slot holds, in the form of "fw bl"
-  void setNextPullOpts(bool fleet, uint8_t pause_h) { _next_fleet = fleet; _next_pause_h = pause_h; }   // (rc17) 'fw pull ... fleet pause Nh'
+  void setNextPullOpts(bool fleet, uint16_t pause_m) { _next_fleet = fleet; _next_pause_m = pause_m; }   // (rc17) 'fw pull ... fleet pause Nh' (rc22, C75: minutes)
   bool cmdServeStatus(char* reply);               // (rc4, C11) "fw serve" = what is offered
   bool cmdPause(const char* arg, char* reply);    // (v1.17.28, C8) "fw pull-pause [Nh]"
-  bool cmdResume(char* reply);                    // (v1.17.28, C8) "fw pull-resume"
+  bool cmdPullWifi(char* reply);                  // (Heltec port) 'fw pull-wifi' = 'fw pull-ble': seed the slot (Wi-Fi seeder here, Bluetooth on the RAK)
+  bool needsAwake() const;                        // (Heltec port) ESP32 light sleep stalls our timers: MyMesh::hasPendingWork() asks this
+  bool cmdResume(const char* arg, char* reply);                     // (v1.17.28, C8) "fw pull-resume"
   bool cmdPassphrase(const char* arg, char* reply);   // (v1.17.28, security v2) "fw passphrase <phrase>|off": the owner's circle
   void setNextPullDuty(uint8_t pct) { _next_pull_duty = pct; }
+  static int parsePause(const char* s);           // (rc22, C75) "Nh" / "Nm" / "NhMm" -> minutes (1 .. 10080), 0 = empty, -1 = invalid
   static uint8_t parseDuty(const char* s);        // "0.1" .. "1.0" -> percent 10 .. 100, 0 = invalid   // "fw pull ... duty x": overrides the node's duty for the pull it starts (0 = none)
 
   // Local staging over the serial link: `fw stage <clen> <rlen> <raw_crc32_hex>
@@ -269,6 +299,7 @@ public:
   bool     cmdStage(const char* args, char* reply);
   bool     serviceStaging();   // call every loop(): feeds serial bytes to an active `fw stage`; true while one is active
   bool     stagingActive() const { return _staging; }
+  bool     blServing() const { return _bl_serving; }   // (C90) fw erase reply: is the own bootloader still offered?
   bool     slotInUse() const { return _staging || _phase == PH_OFFERING || _phase == PH_DOWNLOADING || _phase == PH_VERIFYING; }   // (rc7) fw erase refused
   uint32_t stageRemaining() const { return _stage_remaining; }
   void     stageFeed(const uint8_t* data, uint32_t len);   // caller must cap len <= stageRemaining()
@@ -288,6 +319,7 @@ private:
   uint8_t           _circle[32];
   bool              _circle_set;
   uint8_t           _list_key[16], _offer_key[16];  // derived from C
+  uint8_t           _camp_key[16];                  // (rc25, C95) campaign packets
   uint8_t           _sess_mac[16], _sess_enc[16];   // puller: the session keys (after the OFFER_ACK)
   bool              _sess_set;
   uint8_t           _nonce[8];                      // puller: this session's nonce (in every OFFER_REQ2 of the session)
@@ -421,7 +453,7 @@ private:
   bool              _fair_server;                  // (rc11) puller: the server shares fairly and sends PACE (flag in its OFFER_ACK)
   // ---- (rc17) fleet fill (SWARM-DESIGN 9.2/9.3) ----
   bool              _next_fleet;                   // CLI: 'fw pull ... fleet' for the pull it is about to start
-  uint8_t           _next_pause_h;                     // CLI: 'fw pull ... pause Nh' (C37): set up + paused before the first offer
+  uint16_t          _next_pause_m;                     // (rc22, C75: minutes) CLI: 'fw pull ... pause Nh' (C37): set up + paused before the first offer
   uint8_t           _fleet_mode;                           // puller: the mode its announces carry
   uint32_t          _fann_next_ms;                     // puller: the next fleet announce (0 = none due)
   uint16_t          _fann_seq;
@@ -452,6 +484,8 @@ private:
   void              pauseFill(const char* why);
   void              dropPausedFill();                   //   the operator starts something else: a paused fill gives way (chunks dropped)
   bool              reqHeard(uint32_t now) const;       //   a plain pull's listener: its requester was heard within the last hour
+  bool              _fill_h = false;                // (rc23, C91) the fill began from a holder's announce: no requester heard yet
+  uint32_t          _strm_top_ms = 0;               // (rc23, C91) when the stream's top last rose
   uint16_t          _strm_top;                      // (rc19, C44) the highest chunk of the stream heard: gaps are asked only behind it
   void              onFleetAnn(const uint8_t* b, uint32_t len);
   void              startFill();
@@ -491,6 +525,35 @@ private:
   void              sendSumm();
   void              sendHolderAnn();
   void              spreadStart(const uint8_t* digest);
+  // ---- (rc25, C95) the push campaign: {image, board, origin, end}. Saved once per change (CAMP_FILE); the rest is RAM ----
+  struct Camp {
+    uint8_t set, mine, cancelled, island, back_ok;   // known | we started it | cancelled | our island pull runs (no apply) | back path
+    XferManifest m; uint8_t origin[4];
+    uint32_t end_s;                                  // the campaign's end on THIS node's clock (packets carry the minutes left)
+    uint8_t hops, back_enc; uint8_t back[MAX_ROUTE_BYTES];   // hops from the origin; the reversed path to it (0 = none known: flood)
+  } _camp;
+  uint32_t _camp_tick_ms, _camp_island_ms, _camp_heard_ms, _camp_rem_ms, _camp_rem_heard_ms, _camp_q_ms, _camp_ans_ms, _camp_stuck_ms;
+  uint32_t _camp_q_nonce, _camp_ans_nonce; uint8_t _camp_ans_heard, _camp_tries, _camp_done, _camp_joined_sent, _camp_refused;
+  uint32_t _camp_inv_ms, _camp_res_ms; uint8_t _camp_res_st, _camp_res_n, _camp_end_done, _camp_qd;   // _camp_qd: query sent this boot
+  uint32_t _camp_disc_ms; uint8_t _camp_defer;        // (rc25) another member's island search heard; how often we waited for one
+  uint32_t _camp_cxl_at, _camp_cxl_ms; uint8_t _camp_cxl_n;   // (rc25) the origin's cancel repeats; the last cancel sent
+  void     campStopLocal();
+  struct CampPeer { uint8_t id[4]; uint8_t st, pct; };   // the origin's view of the members (results)
+  static const uint8_t CAMP_PEERS = 24;
+  CampPeer _cpeers[CAMP_PEERS]; uint8_t _ncpeers;
+  bool     campOn() const;                           // a known, not cancelled, not ended campaign
+  bool     campNewerHere(const XferManifest& m) const;
+  bool     campImg(const uint8_t* sha) const { return _camp.set && memcmp(_camp.m.sha256, sha, 32) == 0; }
+  uint32_t campBuild(uint8_t* b, uint8_t kind, uint32_t aux) const;
+  void     campFlood(uint8_t kind, uint32_t aux, uint32_t delay_ms);
+  void     campResult(uint8_t st);
+  void     campStart(const XferManifest& m);
+  void     campSave();
+  void     campLoad();
+  void     campIslandArm(uint32_t now);
+  void     onCamp(const uint8_t* b, uint32_t len, uint8_t hops, const uint8_t* path, uint8_t enc);
+  void     campTick(uint32_t now);
+  uint32_t campLeftS() const;
   bool              holderSwitch(const XferManifest& m, const uint8_t* holder, const uint8_t* origin);
   void              onSumm(const uint8_t* b, uint32_t len);
   // discovery
@@ -516,8 +579,8 @@ private:
   void              routeDropDirect(int keep);             // (rc4, S3)
   bool              _paused;                       // (v1.17.28, C8) `fw pull-pause`: the pull sends nothing
   uint32_t          _pause_until_ms;                   //     timed pause end (0 = until `fw pull-resume`)
-  uint8_t           _pause_h;
-  void              setPaused(bool on, uint8_t hours);
+  uint16_t          _pause_m;                          // (rc22, C75) minutes
+  void              setPaused(bool on, uint16_t mins);   // (rc22, C75) minutes, 0 = until 'fw pull-resume'
   void              resumePull(const char* why);
   uint32_t          _scan_sess;
   uint16_t          _scan_seq;
@@ -654,7 +717,7 @@ private:
   void saveState();
   bool loadState();
   void clearState();
-  void saveClock();      // just before the apply reboot: keep the clock, so the node comes back with a time newer than its last advert
+  void saveClock(bool keep_file = false);   // just before the apply reboot (C69: on IoTThinks v18+ nRF52 only keep_file writes): keep the clock, so the node comes back with a time newer than its last advert
   void restoreClock();   // (rc21, C58) after an apply, first tick: an RTC chip kept the time - nothing; else forward-only, a SHORT estimate
                          //   of the apply (behind, never ahead: a swarm member's time then corrects it, C57)
   bool              _region_hint;                  // (rc21, C60) the 'no default region' hint was shown since boot

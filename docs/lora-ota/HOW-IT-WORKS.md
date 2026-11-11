@@ -21,7 +21,8 @@ so the node can serve it, and an apply interrupted by a power cut is simply redo
 
 ## 2. The image
 A `.lota` image = a header (board tag, kind app/bootloader, version number, lengths, CRC-32, SHA-256) + the LZMA-compressed payload
-(~240 KB for the app). The bootloader accepts only images whose board tag matches; the app checks the SHA-256 of the complete payload
+(~233 KB for the RAK3401 app, ~413 KB for the Heltec V4). Board tags: `RAK3401`, `HELTECV4`; a node lists, stores and installs only
+images with its own tag (a mixed circle relays both). The bootloader accepts only images whose board tag matches; the app checks the SHA-256 of the complete payload
 against the **authenticated** manifest before it marks anything pending.
 
 ## 3. Discovery
@@ -53,6 +54,18 @@ against the **authenticated** manifest before it marks anything pending.
 * **Announce.** A node that has just got a version tells the circle once, so waiting pulls learn the new holder at once.
 * **Battery.** A LOW holder ranks last; a CRITICAL node stops serving and requesting until it recovers.
 
+## 4b2. Push campaigns (rc25)
+* `fw push` on a node whose slot image is offered starts a 7-day **campaign** for that image: one new packet type (MSG_CAMP, flooded on
+  the circle's discovery channel, MAC'd with a campaign key derived from the circle key). Kinds: invite, query, answer, reminder,
+  cancel, and a member's result back to the origin.
+* **Who joins:** circle nodes of the same board that run something older than the image. A node that is newer refuses (reported to
+  the origin). Members fill their **slot** through the normal swarm pull; nothing is installed.
+* **Late joiners:** the invite is sent twice; every node asks once after boot ("newcomer query") if it knows no campaign; about one
+  reminder a day for the whole circle (a node skips its reminder when it heard another member's); holders' announces. A member that
+  hears no holder (behind stock relays) pulls by itself after a wait that grows with its distance, so the farthest go first.
+* `fw pull ... fleet` starts the same campaign once its requester holds the image. Older LoRa-OTA firmware ignores the packet type and
+  still fills from holders' announces.
+
 ## 4c. Time from the swarm (rc21)
 A node without an RTC asks a zero-hop "time?" on the circle's channel after boot and every 6 h. Only neighbours with a valid RTC
 answer (in random 0.5 s slots; the first answer silences the others). A clock that is behind is stepped, one that is ahead is HELD until
@@ -74,7 +87,17 @@ real time catches up (MeshCore drops messages from a clock that stepped back), c
 * **Waiting:** a silent server is asked again with back-off (to 5 min), re-discovered at 1, 6, 16, 36, 76 min, then hourly; a week
   of silence ends the pull. `fw pull-pause` stops all sending.
 
-## 7. Bootloader side (summary)
+## 7a. Heltec V4 (ESP32-S3) install
+* 16 MB flash, our own partition table: two 3 MiB app partitions, a 2 MiB **slot** (`lotaslot`, the same header + LZMA format as the
+  RAK slot), a 2 MiB Wi-Fi **seeder** app, the stock MeshCore file system at its usual offset.
+* No custom bootloader: the **app** decompresses the verified slot image into the other app partition while the old app keeps running,
+  checks it (CRC-32, ESP32 image header, board tag, the image's own hash) and switches the boot partition.
+* The new app starts on **probation** (ESP-IDF rollback): it confirms itself after 2 min of running and a received packet within 3 h,
+  otherwise the next start returns to the previous app. Power cuts at each of 590 flash operations of the install are covered by a
+  host test.
+* With power saving on, LoRa-OTA keeps the ESP32 awake only while it has work of its own (a pull, a send window, an answer).
+
+## 7. Bootloader side (RAK3401, summary)
 * Applies a pending slot image: checks the header (board tag, kind, sizes, CRC), decompresses LZMA over the app region, verifies,
   records the result in the control page, boots. Power cuts at any flash step are covered by the host test (every flash operation
   interrupted in turn).

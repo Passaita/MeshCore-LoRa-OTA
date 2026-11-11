@@ -30,7 +30,10 @@ static const uint8_t HEAL_REPS = 3; static const uint32_t HEAL_NOPROG_MS = 36000
 
 struct { uint8_t board[8]; } g_fwpull_tag = {{'R','A','K','3','4','0','1',0}};
 struct PeerInfo { uint8_t id[4]; char name[17]; uint32_t fw_version, payload_len; int16_t rssi; int8_t snr4; uint8_t kind; uint8_t route[MAX_ROUTE_BYTES]; uint8_t route_len;
-                  uint8_t ret[MAX_ROUTE_BYTES]; uint8_t ret_len; bool has_ret; bool used; uint8_t digest[8]; uint8_t sduty, spulls, spower; bool swarm; };
+                  uint8_t ret[MAX_ROUTE_BYTES]; uint8_t ret_len; bool has_ret; bool used; uint8_t digest[8]; uint8_t sduty, spulls, spower; bool swarm;
+                  bool overheard; uint32_t heard_ms; };   // (rc22, C71)
+static const uint32_t OVERHEARD_MAX_MS = 24UL * 3600UL * 1000UL;
+static struct { bool keep_overheard = true; } g_tune;   // (rc22, C71)
 struct ImgInfo { uint8_t kind; uint32_t ver; uint8_t digest[8]; uint8_t n; uint8_t minhops; int8_t best; bool swarm; };
 struct XferManifest { char name[32]; uint8_t kind; };
 struct Rng { int nextInt(int a, int b) { return a; } } g_rng; struct MeshStub { Rng* getRNG() { return &g_rng; } } g_mesh;
@@ -41,6 +44,7 @@ class FwOtaTransfer { public:
   uint8_t _sw_why = 0, _sw_id[4] = {}; uint32_t _sw_ms = 0;                                                         // (rc20, C48) fw route: the last holder change
   uint8_t _route[MAX_ROUTE_BYTES] = {}; uint8_t _route_len = 0; int saves = 0; PeerInfo _peers[MAX_PEERS] = {};
   uint8_t _ret[MAX_ROUTE_BYTES] = {}; uint8_t _ret_len = 0; bool _ret_set = false, _ret_typed = false;
+  bool _resuming = false; char _failed[48] = {0}; void fail(const char* w) { strncpy(_failed, w, sizeof(_failed) - 1); _phase = 5; }   // (Heltec port) onListRsp: a pull by id at another board's node
   bool _route_manual = false; int _phase = 0; uint32_t _last_req_ms = 0, _retry_timeout_ms = 0;
   bool _scan_active = false, _scanned = true; uint32_t _scan_end_ms = 0, _scan_sess = 0, _disc_sess = 0, _session = 0; int16_t _rx_rssi = 0; char _last_err[48] = {0};
   XferManifest _man = {}; uint8_t _pull_id[4] = {0}; bool _pull_by_id = false;
@@ -65,6 +69,8 @@ class FwOtaTransfer { public:
   uint32_t buildListRsp(uint8_t* r, const uint8_t*, const XferManifest&, const uint8_t*, uint8_t) const { r[0]=XFER_MAGIC; return 16; }
   void floodListRsp(const uint8_t*, uint32_t, uint32_t, bool heal) { if (heal) floods++; }
   bool pullTargetId(uint8_t id[4]) const { if (_pull_by_id) memcpy(id, _pull_id, 4); return _pull_by_id; }
+  void pruneOverheard(uint32_t now); uint32_t overheardAgeS(uint32_t now) const;                                   // (rc22, C71)
+  bool scanCmd(char* r, bool) { strcpy(r, "no scan yet - scanning now"); return true; }                             // (rc22, C70)
 };
 static const uint32_t LIST_RSP_MAX = 80;
 """
@@ -107,7 +113,7 @@ int main(){
   assert(p.matchPeers(q3,3,false,&f,list,sizeof list)==1 && f==0); checks++;
   assert(p.matchPeers(q3,3,true,&f,list,sizeof list)==1 && f==2); checks++;         // the bootloader offer is a different kind
   assert(p.matchPeers(qn,2,false,&f,list,sizeof list)==0); checks++;
-  // 8) typed routes (the parser used mesh::Utils::fromHex, which failed every hop but the last: "fw route 3C,92" -> usage error, 2026-09-26)
+  // 8) typed routes (the parser used mesh::Utils::fromHex, which failed every hop but the last: "fw route B5,A2" -> usage error, 2026-09-26)
   { FwOtaTransfer r; r.routeReset(); char rep[160];
     struct { const char* in; int hops, hs; } ok[] = { {"3C,92",2,1}, {"3C4D,92A3",2,2}, {"3C4D5E,92A3B4",2,3}, {"3c",1,1}, {"AA,BB,CC,DD,EE,FF",6,1}, {"A1B2,C3D4,E5F6",3,2} };
     for (auto& t : ok) { r.cmdRoute(t.in, rep); assert(strstr(rep, "TYPED") && r._route_manual && rtCount(r._route_len) == t.hops && rtSize(r._route_len) == t.hs); checks++; }
@@ -217,9 +223,9 @@ int main(){
       for (int k=1;k<=offers;k++) { if (seen[k]!=1) { printf("offers=%d hosts=%d order=%d: #%d seen %d times\n",offers,hosts,order,k,seen[k]); assert(0); } } checks++;
     }
     FwOtaTransfer t; char rep[160]; t.cmdPeersHosts("", rep); assert(strstr(rep,"no peers")); checks++;
-    t._peers[0].used=true; memcpy(t._peers[0].id,"\x7D\x8E\x9F\x01",4); strcpy(t._peers[0].name,"Hilltop-Node1"); t._peers[0].rssi=-37; t._peers[0].snr4=51; t._peers[0].fw_version=210;
+    t._peers[0].used=true; memcpy(t._peers[0].id,"\x7D\x8E\x9F\x01",4); strcpy(t._peers[0].name,"Bench-Node-GD"); t._peers[0].rssi=-37; t._peers[0].snr4=51; t._peers[0].fw_version=210;
     t._peers[1]=t._peers[0]; t._peers[1].kind=KIND_BOOTLOADER; t._peers[1].fw_version=3; t.cmdPeersHosts("", rep); printf("  fw peers: %s\n", rep);
-    assert(!strcmp(rep,"7D8E9F01 Hilltop-Node1 -37dBm snr12.75 #1 fw-210 #2 bl-rev-3")); checks++;
+    assert(!strcmp(rep,"7D8E9F01 Bench-Node-GD -37dBm snr12.75 #1 fw-210 #2 bl-rev-3")); checks++;
     t.cmdPeersHosts("2", rep); assert(strstr(rep,"#1 fw-210 #2 bl-rev-3")); checks++;                   // #2 is in the first host's block: the block is shown whole
     t.cmdPeersHosts("3", rep); assert(strstr(rep,"no peer #3")); checks++;
     printf("  (%d fw peers pages checked)\n", pages); }
@@ -295,7 +301,8 @@ pre = "#include <vector>\n" + fn("static bool hexN(") + "\n" + fn("static bool p
 sigs = ["bool FwOtaTransfer::cmdRoute(", "bool FwOtaTransfer::cmdPeers(", "bool FwOtaTransfer::cmdPeersHosts(", "int FwOtaTransfer::imageList(",
         "uint32_t FwOtaTransfer::holderScore(", "int FwOtaTransfer::bestHolder(", "void FwOtaTransfer::setRet(", "uint32_t FwOtaTransfer::addReturnRoute(",
         "void FwOtaTransfer::onListRsp(", "void FwOtaTransfer::noteReq(", "bool FwOtaTransfer::floodBudget(", "void FwOtaTransfer::routeReset()", "void FwOtaTransfer::routeDropDirect(", "int FwOtaTransfer::routeAdd(", "void FwOtaTransfer::routeUse(", "float FwOtaTransfer::routeScore(",
-        "void FwOtaTransfer::routeResult(", "bool FwOtaTransfer::routeFailover()", "int FwOtaTransfer::matchPeers("]
+        "void FwOtaTransfer::routeResult(", "bool FwOtaTransfer::routeFailover()", "int FwOtaTransfer::matchPeers(",
+        "void FwOtaTransfer::pruneOverheard(", "uint32_t FwOtaTransfer::overheardAgeS("]
 open(sys.argv[1], "w").write(HEAD.replace("class FwOtaTransfer {", pre + "\nclass FwOtaTransfer {", 1) + "\n".join(fn(s) for s in sigs) + "\n" + TAIL)
 PY
 g++ -std=c++11 -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -o "$W/route_test" "$W/route_test.cpp"

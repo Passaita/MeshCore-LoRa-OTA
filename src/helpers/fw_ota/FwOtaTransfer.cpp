@@ -5,10 +5,26 @@
 #include <string.h>
 #include <SHA256.h>
 #include <AES.h>        // (v1.17.28) AES-128-CTR of the chunk data
+#if defined(ESP32)
+#include <esp_system.h> // (Heltec port) esp_restart()
+#include "FwOtaInstallEsp32.h"   //   the install step (no LoRa-OTA bootloader) + the new app's probation
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#include <esp_mac.h>
+#else
 #include <nrf_mbr.h>    // sd_mbr_command(COPY_BL)
 #include <nrf_sdm.h>    // sd_softdevice_disable()
 #include <nrf_soc.h>    // sd_power_gpregret_*() (v1.17.28: `fw pull-ble` restart)
+#endif
 #include "Watchdog.h"   // (rc8, C23)
+#if defined(NRF52_PLATFORM) && !defined(FW_OTA_STUDY)
+#include <helpers/ArduinoHelpers.h>   // (rc23, C69) IoTThinks v18+: CLOCK_MAGIC_NUM = the clock is kept in persistent RAM across a reset
+#endif
+#if defined(NRF52_PLATFORM) && defined(CLOCK_MAGIC_NUM)
+#define FWOTA_TIME_IN_RAM 1     //   (0x20006000, below our bootloader's RAM): a LoRa-OTA apply needs no /fwota.clock flash write
+#else
+#define FWOTA_TIME_IN_RAM 0
+#endif
 
 namespace fw_ota {
 
@@ -32,11 +48,15 @@ static const uint32_t WAIT_BACKOFF_LONG_MS = 5UL * 60 * 1000;    // (v1.17.28) .
 static const uint16_t WAIT_LONG_AFTER   = 10;                     //     (the way back broken) costs ~12 offers an hour instead of ~60, each repeated by every relay
 static const uint8_t  MAX_VERIFY_RETRIES = 2;
 static const char*    NOAPPLY_FILE     = "/fwota.noapply";        // present = do NOT auto-apply a completed pull
+static const char*    APPLY_FILE       = "/fwota.apply";          // (rc22, C65) present = the operator chose 'fw autoapply on'
 static const char*    WDT_FILE         = "/fwota.wdt";            // (rc8) number of watchdog resets (written only when one happened)
 static const char*    WDD_FILE         = "/fwota.wdd";            // (rc10, C27) a planned restart is pending: the old firmware's timeout runs out
 static const char*    CLOCK_FILE       = "/fwota.clock";          // epoch saved right before an apply reboot (the software clock resets on reboot)
 static const uint32_t SCAN_MS          = 25000;                   // fw list listens this long ...
 static const uint32_t SCAN_START_MS    = 2500;                    // (v1.17.28) ... starting 2.5 s after the command (its reply leaves first) ...
+static const uint32_t PULL_START_MS    = 3000;                    // (T9, 2026-11-03) a new pull's first request waits (like a scan) - the CLI reply
+                                                                  // (sent 600 ms after the command) must not meet the server's answer on air. 3 s, not
+                                                                  // 2.5 s: in the deterministic simulator exactly 2.5 s hit one bad timing in H3/H19 (C91)
 static const uint32_t SCAN_REQ_MIN_MS   = 6000;                    // ... and asks its direct neighbours ONE more time after a random 6 - 10 s
 static const uint32_t SCAN_REQ_SPREAD_MS = 4000;                   //     (it asked every 1 - 3 s before: 8 requests, each answered twice by
 static const uint8_t  SCAN_REQ_RESENDS = 1;                        //     every server in range - a burst that drowned a weak relay path)
@@ -84,9 +104,19 @@ static const uint32_t DISC_FLOOD_AFTER_MS = 8000;                 // (rc15) a se
 static const char*    CIRCLE_FILE      = "/fwota.circle";         // (v1.17.28) the circle key C (32 B, PBKDF2 of the owner's passphrase; never the phrase)
 static const uint32_t PBKDF2_ITER      = 50000;                   // ~2-4 s once on the nRF52840 (`fw passphrase`)
 static const uint8_t  PASS_MIN         = 8;
-static const char*    PAUSE_FILE       = "/fwota.pause";          // (v1.17.28, C8) present = the pull is paused; 1 byte: hours (0 = until fw pull-resume)
+static const char*    PAUSE_FILE       = "/fwota.pause";          // (v1.17.28, C8) present = the pull is paused; 1 byte: hours (0 = until fw pull-resume);
+                                                                     // (rc22, C75) + 2 bytes minutes (LE): older firmware reads the hours, rounded up
 static const char*    BLEFILL_FILE     = "/fwota.blefill";        // (v1.17.28) payload CRC-32 of the slot image uploaded over BLE (`fw pull-ble`)
 static const uint32_t LOTA_HDR         = 160;                     // .lota header (lora-ota-serve doc/LOTA-FORMAT.md)
+#if defined(ESP32)
+#define UPLOAD_NAME "Wi-Fi"                                         // (Heltec port) the seeder's upload (`fw pull-wifi`)
+#define FILLED_TEXT "seeded (Wi-Fi/USB), not installed"           //   a seeded slot: the app cannot tell a Wi-Fi upload from a USB write
+static const char*    SEED_FILE        = "/fwota.seed";            //   for the seeder: magic + the app partition to return to
+static const uint32_t SEED_MAGIC       = 0x44454553;                //   "SEED"
+#else
+#define UPLOAD_NAME "BLE"
+#define FILLED_TEXT "BLE-filled, not installed"
+#endif
 static const uint8_t  GPREGRET_SLOT_DFU = 0xA9;                   // bootloader rev 5: BLE DFU into the slot
 static const uint16_t BLE_WARN_MV      = 3450;                    // (rc19, C46) below this on battery a Bluetooth update may brown out (B4)
 static const char*    DUTY_FILE        = "/fwota.duty";           // (v1.17.25) the node's LoRa-OTA duty in percent (absent = DUTY_DEFAULT_PCT)
@@ -127,6 +157,23 @@ static const int32_t  CLK_HOLD_MIN_S   = 3;                       // ahead by th
 static const int32_t  CLK_BOUND_S      = 3600;                    // never hold more than 1 h; after the first sync, never step more than 1 h
 static const uint32_t CLOCK_APPLY_S    = 15;                      // (rc21, C58) the shortest apply measured (2026-09-19: 15.5 s)
 static const char     FLOOD_CLAIM[]    = "LOTA1V";                // (study C/D) discovery-channel flood: an election claim (MSG_CLAIM inside)
+// (rc25, C95) the push campaign (see campTick)
+static const char     FLOOD_CAMP[]     = "LOTA1P";
+static const char*    CAMP_FILE        = "/fwota.camp";
+static const uint32_t CAMP_MAGIC       = 0xCA250001;
+static const uint32_t CAMP_BODY        = 93, CAMP_LEN = CAMP_BODY + XFER_MAC_LEN;
+enum : uint8_t { CK_INVITE = 1, CK_QUERY = 2, CK_ANSWER = 3, CK_REMIND = 4, CK_CANCEL = 5, CK_RESULT = 6 };
+enum : uint8_t { CR_JOINED = 1, CR_COMPLETE = 2, CR_STUCK = 3, CR_REFUSED = 4 };
+static const uint32_t CAMP_RETRY_MS[]  = { 1800000, 3600000, 7200000, 14400000, 21600000 };   // island retries: 30 min, 1, 2, 4, 6 h
+static const uint32_t CAMP_RES_GAP_MS[] = { 0, 2400000, 900000, 300000 };   // a result is sent 4 times: now, +5, +20, +60 min (lossy links)
+static const uint32_t CAMP_HEARD_MS    = 2400000;   // the image heard near us (stream, announce, gap round) this recently: no island pull
+static const uint32_t CAMP_DISC_MS     = 1200000;   // another member's search for the origin / image heard this recently: wait (P3)
+static const uint32_t CAMP_Q_MS        = 60000, CAMP_Q_SPREAD_MS = 120000;   // the newcomer query 1-3 min after the boot
+static const uint32_t CAMP_ANS_MIN_MS  = 2000, CAMP_ANS_SPREAD_MS = 5000, CAMP_ANS_HOP_MS = 8000;   // near members first (8 s per hop from the
+                                                    //   asker: their answer flood reaches the farther ones before those answer); 2 heard
+                                                    //   silence the rest (P6: a 20 s random spread let 4 of 8 answer)
+static const uint32_t CAMP_CXL_MS[]    = { 0, 3000000, 600000 };   // the origin's cancel: now, +10 min, +60 min; then on any stale packet
+
 
 static const uint32_t PREV_FLEET = 0xFFFFFFFEu;   // (rc18) OFFER_REQ2 'session it replaces' of a fresh fleet pull
 #ifdef FW_OTA_STUDY
@@ -235,13 +282,28 @@ static uint8_t discAnswer(const char* target, uint8_t hops, bool flood, bool app
   return (uint8_t)(kinds | 4 | 8);
 }
 
-// (v1.17.28, C8) "fw pull-pause [Nh]": -1 = not understood, 0 = until 'fw pull-resume', N = hours (1 - 168)
-static int pauseHours(const char* a) {
+// (v1.17.28, C8) "fw pull-pause [Nh]": -1 = not understood, 0 = until 'fw pull-resume', N = minutes. (rc22, C75, owner 2026-10-31)
+// Nh, Nm or NhMm (e.g. 2h15m: a start at sunrise to the minute), 1 min .. 168 h
+static int pauseMinutes(const char* a) {
   while (*a == ' ') a++;
   if (!*a) return 0;
-  char* e = nullptr; long h = strtol(a, &e, 10);
-  if (e == a || (*e != 'h' && *e != 'H') || e[1] != 0 || h < 1 || h > 168) return -1;
-  return (int)h;
+  long m = 0; bool hrs = false, mins = false;
+  while (*a) {
+    if (*a < '0' || *a > '9') return -1;                 // no sign, no unit-only
+    char* e = nullptr; long v = strtol(a, &e, 10);
+    if (v > 10080) return -1;
+    if ((*e == 'h' || *e == 'H') && !hrs && !mins) { hrs = true; m += v * 60; }
+    else if ((*e == 'm' || *e == 'M') && !mins) { mins = true; m += v; }
+    else return -1;
+    a = e + 1;
+  }
+  return (m < 1 || m > 168 * 60) ? -1 : (int)m;
+}
+// (rc22, C75) "4 h", "2 h 15 min", "45 min"
+static void pauseText(char* b, size_t n, uint16_t m) {
+  if (m % 60 == 0) snprintf(b, n, "%u h", (unsigned)(m / 60));
+  else if (m < 60) snprintf(b, n, "%u min", (unsigned)m);
+  else snprintf(b, n, "%u h %u min", (unsigned)(m / 60), (unsigned)(m % 60));
 }
 
 // (v1.17.28) scanner: when to ask the direct neighbours again (0 = no more), `resends` = requests already repeated
@@ -264,8 +326,13 @@ static bool hexN(uint8_t* dst, int n, const char* src) {
 
 // BlImage.h reader over memory-mapped flash: ctx = base address
 static void rdFlash(void* ctx, uint32_t off, void* dst, uint32_t n) { flashRead(dst, (uint32_t)ctx + off, n); }
+#if !defined(ESP32)
 static uint32_t uicrBl()  { return NRF_UICR->NRFFW[0]; }
 static uint32_t uicrMbr() { return NRF_UICR->NRFFW[1]; }
+#else
+static uint32_t uicrBl()  { return 0; }                    // (Heltec port) no nRF52 UICR: the bootloader paths are never taken on ESP32
+static uint32_t uicrMbr() { return 0; }
+#endif
 static const uint32_t BL_TAIL_OFF = SLOT_PAYLOAD_MAX - BL_MAX_SIZE;   // a pulled bootloader is stored in the last 40 KiB of the slot payload area
 
 // -------- CRC-16/CCITT for per-chunk integrity --------
@@ -343,7 +410,7 @@ bool FwOtaTransfer::macOk(const uint8_t* key, const uint8_t* pkt, uint32_t len) 
 }
 // C -> the discovery channel (MeshCore group channel: secret + hash), the list key and the offer key
 void FwOtaTransfer::circleKeys() {
-  memset(&_disc_ch, 0, sizeof(_disc_ch)); memset(_list_key, 0, 16); memset(_offer_key, 0, 16);
+  memset(&_disc_ch, 0, sizeof(_disc_ch)); memset(_list_key, 0, 16); memset(_offer_key, 0, 16); memset(_camp_key, 0, 16);
   if (!_circle_set) return;
   uint8_t t[32];
   hmac(_circle, 32, (const uint8_t*)"lota2-disc", 10, nullptr, 0, t);
@@ -351,6 +418,7 @@ void FwOtaTransfer::circleKeys() {
   mesh::Utils::sha256(_disc_ch.hash, sizeof(_disc_ch.hash), _disc_ch.secret, sizeof(_disc_ch.secret));
   hmac(_circle, 32, (const uint8_t*)"lota2-list", 10, nullptr, 0, t);  memcpy(_list_key, t, 16);
   hmac(_circle, 32, (const uint8_t*)"lota2-offer", 11, nullptr, 0, t); memcpy(_offer_key, t, 16);
+  hmac(_circle, 32, (const uint8_t*)"lota2-camp", 10, nullptr, 0, t);  memcpy(_camp_key, t, 16);   // (rc25, C95)
 }
 // session keys = HMAC(C, "lota2-sess" | ECDH(me, peer) | session | puller nonce | server nonce) -> MAC key | encryption key
 bool FwOtaTransfer::sessionKeys(const uint8_t* peer_pub, uint32_t sess, const uint8_t* np, const uint8_t* ns, uint8_t* kmac, uint8_t* kenc) {
@@ -462,8 +530,13 @@ void FwOtaTransfer::clearState() { if (_fs) _fs->remove(STATE_FILE); }
 // The software clock restarts at the build date on every reboot, so after an automatic apply the node's adverts would carry
 // an OLDER timestamp than its last one and every phone / companion that knows the node drops them as replays until an admin
 // runs `clock sync`. Keep the time across the apply instead: forward-only, so an RTC module or a later sync is never overridden.
-void FwOtaTransfer::saveClock() {
+void FwOtaTransfer::saveClock(bool keep_file) {
   if (!_fs || !_mesh) return;
+#if FWOTA_TIME_IN_RAM
+  if (!keep_file) return;   // (rc23, C69) the base keeps the time in RAM; only a Bluetooth DFU (SoftDevice RAM) / a bootloader copy still write the file
+#else
+  (void)keep_file;
+#endif
   uint32_t t = _mesh->getRTCClock()->getCurrentTime();
   _fs->remove(CLOCK_FILE);
   File f = _fs->open(CLOCK_FILE, FILE_O_WRITE);
@@ -629,17 +702,40 @@ bool FwOtaTransfer::imageStillServed() {
 // (the bootloader applied it, or it was flashed identically). A freshly pulled/staged image that is still waiting for its apply,
 // one the bootloader refused (no tag, bad decode ...) or one whose apply keeps being interrupted is therefore NOT served.
 bool FwOtaTransfer::installedImage(const SlotHeader& h) const {
-  return h.raw_len > 0 && h.raw_len <= APP_MAX_SIZE && crc32_flash(APP_REGION_START, h.raw_len) == h.raw_crc32;
+  return h.raw_len > 0 && h.raw_len <= APP_MAX_SIZE && crc32_flash(appRunAddr(), h.raw_len) == h.raw_crc32;   // (Heltec) running partition
 }
 
 // ------------------------------------------------------------------------
 void FwOtaTransfer::begin(mesh::Mesh* mesh, FILESYSTEM* fs, const char* node_name, const uint8_t* pub_key, const uint8_t* path_hash_mode) {
+#if defined(ESP32)
+  bootApplyEsp32();     // (Heltec port) the RAK bootloader's job: a PENDING install happens here, before the mesh runs (restarts on success)
+#if defined(FW_OTA_TEST_CRASH_AT_START) || defined(FW_OTA_TEST_NEVER_CONFIRM)
+  Serial.println("fw_ota: FW-OTA-BENCH-TEST-BUILD");   // (bench test build only) release_heltec.sh refuses an image with this text
+#endif
+#ifdef FW_OTA_TEST_CRASH_AT_START
+  if (onProbation()) abort();   // (bench test build only) a new app that crashes at start: the ESP-IDF bootloader must return to the old one
+#endif
+  if (fs && fs->exists(SEED_FILE)) {   // back from the seeder: the same app as before ('fw pull-wifi') - no probation, it did not change
+    File f = fs->open(SEED_FILE); uint8_t b[8] = {0}; if (f) { f.read(b, 8); f.close(); }
+    uint32_t m, ret; memcpy(&m, b, 4); memcpy(&ret, b + 4, 4);
+    if (m == SEED_MAGIC && ret == appRunAddr()) confirmApp();
+    fs->remove(SEED_FILE);
+  }
+#endif
   _mesh = mesh; _fs = fs;
   _name_src = node_name; _pub = pub_key; _hash_mode = path_hash_mode;
   _move_to = -1; _fleet_mode = FLEET_FILL_EMPTY; _rt_cur = -1; _rt_recent[0] = _rt_recent[1] = -1;   // (rc19) the non-zero starting values
   _disc_fail_mark = 0xFFFF; _win_target = XFER_WIN_INIT; _crc_bad_idx = -1;                           //   (the rest is zero)
   memset(_peers, 0, sizeof(_peers));
+  // (rc22, C65, owner 2026-10-29) auto-apply is OFF on a new node: a completed pull waits for 'fw apply'. A node that already belongs
+  // to a circle (it ran LoRa-OTA before) keeps auto-apply on unless it was switched off - an update never changes a running node's choice.
+  // The default is written once (one small file on a node's first boot with no circle and no choice yet), so joining a circle later
+  // does not flip it.
   _noapply = _fs && _fs->exists(NOAPPLY_FILE);
+  if (_fs && !_noapply && !_fs->exists(APPLY_FILE) && !_fs->exists(CIRCLE_FILE)) {
+    _noapply = true;
+    File f = _fs->open(NOAPPLY_FILE, FILE_O_WRITE); if (f) { f.write((const uint8_t*)"1", 1); f.close(); }
+  }
   _wdt_resets = 0;                                         // (rc8, C23) how often the watchdog had to restart this node
   if (_fs && _fs->exists(WDT_FILE)) { File f = _fs->open(WDT_FILE); if (f) { f.read((uint8_t*)&_wdt_resets, 2); f.close(); } }
   const bool planned = _fs && _fs->exists(WDD_FILE);       // (rc10, C27) we let another firmware's watchdog run out on purpose
@@ -690,14 +786,20 @@ void FwOtaTransfer::begin(mesh::Mesh* mesh, FILESYSTEM* fs, const char* node_nam
       strcpy(_last_err, "fleet fill resumed after reboot");
     }
     if (_fs && _fs->exists(PAUSE_FILE)) {                  // (v1.17.28, C8) it was paused: stays paused; a timed pause restarts its timer
-      File f = _fs->open(PAUSE_FILE); uint8_t h = 0; if (f) { f.read(&h, 1); f.close(); }   //   (no RTC: the clock restarts on a reboot)
-      _paused = true; _pause_until_ms = h ? millis() + (uint32_t)h * 3600000UL : 0; _pause_h = h;
+      File f = _fs->open(PAUSE_FILE); uint8_t b[3] = {0}; int n = 0; if (f) { n = f.read(b, 3); f.close(); }   //   (no RTC: the clock restarts on a reboot)
+      const uint16_t m = n >= 3 ? (uint16_t)(b[1] | b[2] << 8) : (uint16_t)(b[0] * 60);   // (rc22, C75) an rc22 file: hours only
+      _paused = true; _pause_until_ms = m ? millis() + (uint32_t)m * 60000UL : 0; _pause_m = m;
       if (_phase == PH_VERIFYING) setPaused(false, 0);     //   every chunk is in: nothing to pause
     }
   } else {
     clearState();
     if (_fs) _fs->remove(PAUSE_FILE);
   }
+  campLoad();                                              // (rc25, C95) the push campaign; no campaign: one newcomer query 1-3 min after the boot
+  _camp_tick_ms = 0; _camp_island_ms = 0; _camp_heard_ms = 0; _camp_rem_ms = 0; _camp_rem_heard_ms = 0; _camp_ans_ms = 0; _camp_stuck_ms = 0;
+  _camp_tries = 0; _camp_done = 0; _camp_refused = 0; _camp_res_n = 0; _camp_end_done = 0; _camp_inv_ms = 0; _ncpeers = 0; _camp_qd = 0;
+  _camp_disc_ms = 0; _camp_defer = 0; _camp_cxl_n = 0; _camp_cxl_at = 0; _camp_cxl_ms = 0;
+  _camp_q_ms = _circle_set && !_camp.set && _mesh ? (millis() + CAMP_Q_MS + (uint32_t)_mesh->getRNG()->nextInt(0, CAMP_Q_SPREAD_MS)) | 1 : 0;
   if (_fs && _fs->exists(RESOLVE_FILE)) {                  // a "fw pull AABB[CC]" was still looking for its server
     File f = _fs->open(RESOLVE_FILE); uint32_t m = 0; uint8_t bl = 0;
     bool ok = f && f.read((uint8_t*)&m, 4) == 4 && m == RESOLVE_MAGIC && f.read(_res_id, 3) == 3 && f.read(&_res_len, 1) == 1
@@ -712,6 +814,9 @@ void FwOtaTransfer::begin(mesh::Mesh* mesh, FILESYSTEM* fs, const char* node_nam
 // checks a receiver applies (vectors, identity descriptor, layout, board) - so a node never advertises something its neighbours would refuse.
 void FwOtaTransfer::armBlServe() {
   _bl_probed = true; _bl_serving = false; _own_bl_rev = 0; _bl_last_idx = 0; _bl_offer_reqs = 0;
+#if defined(ESP32)
+  return;                                                   // (Heltec port) no LoRa-OTA bootloader on ESP32: nothing to offer
+#endif
   uint32_t len = blImageLength(rdFlash, (void*)BL_ADDR);
   BlDesc d;
   if (len && blFindDesc(rdFlash, (void*)BL_ADDR, len, &d) == BL_OK) _own_bl_rev = d.bl_rev;
@@ -731,10 +836,13 @@ void FwOtaTransfer::armBlServe() {
 // the bootloader pages and records its progress in the MBR params page, so after a power cut it FINISHES the copy at the next boot, before any
 // bootloader or application code runs - the slot must simply not be touched until then (nothing does: we reset straight away).
 void FwOtaTransfer::blApplyNow() {
+#if defined(ESP32)
+  fail("no LoRa-OTA bootloader on this board"); return;     // (Heltec port) never reached: bootloader pulls are refused up front
+#else
   uint32_t len = _man.payload_len;
   if (crc32_flash(dstAddr(0), len) != _man.payload_crc32) { fail("bootloader changed before the copy: not applied"); return; }
   clearState();                                          // from here the copy is the MBR's business; a reboot must not start another pull/verify/apply
-  saveClock();
+  saveClock(true);
   Serial.println("fw_ota: bootloader verified - copying it (MBR), the node restarts"); Serial.flush();
   uint8_t sd = 0; sd_softdevice_is_enabled(&sd);
   if (sd) sd_softdevice_disable();
@@ -746,43 +854,59 @@ void FwOtaTransfer::blApplyNow() {
   uint32_t r = sd_mbr_command(&c);
   Serial.print("fw_ota: MBR copy returned "); Serial.println(r); Serial.flush(); delay(200);
   NVIC_SystemReset();
+#endif
 }
 
 // ======================= CLI ============================================
 // (v1.17.28-rc4, C11) `fw serve` without an argument: what this node offers now, and why not more
 bool FwOtaTransfer::cmdServeStatus(char* reply) {
-  if (!_circle_set) { strcpy(reply, "not serving: no passphrase ('fw passphrase <phrase>')"); return true; }
-  if (_serve_disabled) { strcpy(reply, "not serving: 'fw serve off' ('fw serve on' offers the slot image and the bootloader)"); return true; }
+  if (!_circle_set) { strcpy(reply, "not serving: no passphrase"); return true; }
+  if (_serve_disabled) { strcpy(reply, "not serving (fw serve off)"); return true; }
   char app[48], bl[32];
   if (_serving && imageStillServed()) snprintf(app, sizeof(app), "app %s", _serve_man.name);
   else if (slotInUse()) strcpy(app, "no app (the slot is being pulled into)");
   else {
     SlotHeader h; const bool v = readSlotHeader(h) && slotValid();
+#if defined(ESP32)
+    CtrlBlock cb;                                         // (Heltec port) refused / rolled back: never served - not "checking" forever
+    if (v && readCtrl(cb) && failedForSlot(cb, h) && !installedImage(h))
+      strcpy(app, cb.last_result == 13 ? "no app (it rolled back here)" : "no app (the install refused it)");
+    else
+#endif
     // (rc16, 5.3) right after a boot / a new slot image the install check has not run yet: say so (was "not installed here")
     if (v && (!_probe_valid || probeKey(h) != _probe_key)) strcpy(app, "app (checking the slot)");
     else strcpy(app, !v ? "no app (slot empty)" : "no app (the bootloader refused it here)");   // (rc17) the only valid image not served
   }
   if (_bl_serving) snprintf(bl, sizeof(bl), "bootloader rev %lu", (unsigned long)_bl_man.fw_version);
   else strcpy(bl, _bl_probed ? "no bootloader" : "bootloader (not checked yet)");   // (rc16) checked when no pull runs
-  snprintf(reply, 160, "serving: %s + %s ('fw serve off' stops both)", app, bl);
+  snprintf(reply, 160, "serving: %s + %s", app, bl);
+  if (_serving && (_resolving || _phase != PH_IDLE)) {   // (rc22, C73) while it pulls itself, 'fw pull-status' shows its own pull first
+    char tmp[160]; tmp[0] = 0; appendServing(tmp);
+    if (strncmp(tmp, " | serving fw-", 14) == 0 && strstr(tmp, " to ")) {   // name who is pulling from it, when it fits
+      const size_t l = strlen(reply); const char* to = strstr(tmp, " to ");
+      if (l + 9 + strlen(to) < 160) snprintf(reply + l, 160 - l, " | now%s", to);
+    }
+  }
   return true;
 }
 
 // `fw serve on` (rc4, C9: serve what is available): the bootloader always, the slot image when it is valid and installed here (or BLE-filled)
 bool FwOtaTransfer::cmdServe(char* reply, bool force, bool user) {
-  if (!_circle_set) { strcpy(reply, "not serving: set 'fw passphrase <phrase>' first (LoRa-OTA serves only the owner's circle)"); return true; }
+  if (!_circle_set) { strcpy(reply, "ERR - no passphrase"); return true; }
   if (user) {                                           // the owner switches serving on: the bootloader offer is (re)armed whatever the slot holds
     _serve_disabled = false; _bl_probed = false;
     if (_fs) _fs->remove(NOSERVE_FILE);
   }
   SlotHeader h;
-  if (!readSlotHeader(h) || !slotValid()) { stopServing(); strcpy(reply, "OK - serving the bootloader only (slot empty); a pull or 'fw pull-ble' fills the slot"); return true; }
+  if (!readSlotHeader(h) || !slotValid()) { stopServing(); strcpy(reply, "OK - serving the bootloader only (slot empty)"); return true; }
   // (rc17, owner 2026-10-08) a VALID slot image is served whether it is installed here or not (its SHA-256 below is what pullers check,
   // chunk by chunk and as a whole) - a fleet-filled node serves before its 'fw apply'. Not served: an image the bootloader refused here.
   CtrlBlock cb;
-  if (!force && readCtrl(cb) && cb.apply_state == APPLY_FAILED && !installedImage(h) && !bleFilled(h)) {
+  // (Heltec port, C83 for the RAK too) the install here refused THIS image, or the new app rolled back (it never confirmed itself): it is
+  // not served, seeded / Bluetooth-filled or not. A FAILED record about another image does not block a new one (failedForSlot).
+  if (!force && readCtrl(cb) && failedForSlot(cb, h) && !installedImage(h)) {
     stopServing();
-    strcpy(reply, "OK - serving the bootloader only: the bootloader refused the slot image here ('fw erase', then a new pull)");
+    strcpy(reply, "OK - serving the bootloader only (slot refused)");
     return true;
   }
 
@@ -813,9 +937,8 @@ bool FwOtaTransfer::cmdServe(char* reply, bool force, bool user) {
   _serving = true;
   _serve_last_idx = 0; _serve_reqs = 0; _serve_offer_reqs = 0; _serve_offer_nomatch = 0;
   _mac_fail = 0;
-  snprintf(reply, 160, "OK - serving '%s' (%lu B, %lu chunks) + the bootloader",
-           _serve_man.name,
-           (unsigned long)_serve_man.payload_len, (unsigned long)_serve_man.n_chunks);
+  snprintf(reply, 160, "OK - serving '%s' (%lu chunks) + bootloader",
+           _serve_man.name, (unsigned long)_serve_man.n_chunks);
   return true;
 }
 
@@ -823,15 +946,15 @@ bool FwOtaTransfer::cmdServeOff(char* reply) {
   stopServing(); _bl_serving = false;
   _serve_disabled = true;
   if (_fs) { _fs->remove(NOSERVE_FILE); File f = _fs->open(NOSERVE_FILE, FILE_O_WRITE); if (f) { f.write((const uint8_t*)"1", 1); f.close(); } }
-  strcpy(reply, "OK - serving nothing (app and bootloader), also after a reboot ('fw serve on' re-enables)");
+  strcpy(reply, "OK - serving nothing (saved)");
   return true;
 }
 
 #ifdef FW_OTA_DEV
 // dev form: '*' or a served name
 bool FwOtaTransfer::cmdPull(const char* name, char* reply) {
-  if (!_circle_set) { strcpy(reply, "ERR - set 'fw passphrase <phrase>' first (the same on every node of your circle)"); return true; }
-  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING) { strcpy(reply, "ERR - pull already in progress ('fw pull-abort' to cancel)"); return true; }
+  if (!_circle_set) { strcpy(reply, "ERR - no passphrase"); return true; }
+  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING) { statusLine(reply); return true; }
   startPullAt(name, reply, false);
   return true;
 }
@@ -839,8 +962,8 @@ bool FwOtaTransfer::cmdPull(const char* name, char* reply) {
 
 void FwOtaTransfer::startPullAt(const char* name, char* reply, bool bl) {
   dropPausedFill();
-  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING) { strcpy(reply, "ERR - pull already in progress ('fw pull-abort' to cancel)"); return; }
-  if (_staging) { strcpy(reply, "ERR - stage in progress"); return; }
+  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING) { statusLine(reply); return; }
+  if (_staging) { strcpy(reply, "ERR - stage running"); return; }
   _apply_armed = false;
   _resuming = false; _verify_retries = 0; _cm.reset(0); _erased = false;
   if (!bl) stopServing();   // we are about to rewrite the slot (a bootloader goes to its tail and leaves the app copy alone: decided when the manifest arrives)
@@ -861,31 +984,58 @@ void FwOtaTransfer::startPullAt(const char* name, char* reply, bool bl) {
   _prev_session = 0; _typed_failed = false; _last_ans_ms = 0;
   _fill = false; _fill_mode = 0; _fc.set = false; _gap_phase = false; _fann_next_ms = 0; _fann_heard_ms = 0; _esc_pick_ms = 0;   // (rc17)
   _el_phase = 0; _el_rounds = 0; _el_puller = false; _e_wait = false;                                                            // (study)
-  _strm_top = 0; _cxl_n = 0;                                                                                                       // (rc19)
+  _strm_top = 0; _strm_top_ms = 0; _fill_h = false; _cxl_n = 0;                                                                                                       // (rc19)
   _fleet_mode = _next_fleet ? FLEET_REPLACE : FLEET_FILL_EMPTY; _next_fleet = false;
-  const uint8_t ph = _next_pause_h; _next_pause_h = 0;
+  const uint16_t pm = _next_pause_m; _next_pause_m = 0;
   _phase = PH_OFFERING;
   _last_err[0] = 0; _res_msg[0] = 0;
   routeReset();
+  _last_req_ms = millis(); _retry_timeout_ms = PULL_START_MS;   // (T9) the first offer request after the command's reply (phone app: the reply was lost)
   saveState();   // the request itself survives a reboot / power cut: it is retried until a server answers
-  if (ph) {                                              // (rc17, C37) set up and paused BEFORE its first offer: nothing is sent until then
-    setPaused(true, ph);
-    snprintf(reply, 160, "OK - pull%s set up and paused: the first offer goes out in %u h (or 'fw pull-resume')",
-             _fleet_mode == FLEET_REPLACE ? " (fleet)" : "", (unsigned)ph);
+  if (pm) {                                              // (rc17, C37) set up and paused BEFORE its first offer: nothing is sent until then
+    setPaused(true, pm);
+    char t[20]; pauseText(t, sizeof(t), pm);
+    snprintf(reply, 160, "OK - pull%s paused, starts in %s",
+             _fleet_mode == FLEET_REPLACE ? " (fleet)" : "", t);
     return;
   }
   // (rc19, C45) the reply tells what happens when it is verified: with 'fw autoapply off' it waits for 'fw apply' (rc18 said "applies itself")
-  const char* fin = _noapply ? "auto-apply is off: 'fw apply' after it completes" : "applies itself when verified";
-  if (bl) strcpy(reply, "OK - fetching the bootloader; it runs unattended, and once verified the node copies it and restarts ('fw pull-status')");
-  else if (_fleet_mode == FLEET_REPLACE) snprintf(reply, 160, "OK - pulling (fleet: nodes that hear the stream replace older slot images, never install); %s", fin);
-  else snprintf(reply, 160, "OK - pulling; it runs unattended, %s ('fw pull-status')", fin);
+  const char* fin = _noapply ? "auto-apply is off: 'fw apply' after it completes" : "installs unattended when verified";
+  if (bl) strcpy(reply, "OK - pulling the bootloader");
+  else if (_fleet_mode == FLEET_REPLACE) snprintf(reply, 160, "OK - pulling (fleet); %s", fin);
+  else snprintf(reply, 160, "OK - pulling; %s", fin);
+}
+
+// (rc22, C73) the pulls this node serves, as one short part: " | serving fw-304 to 1: 812/1660 (49%)", " | serving fw-304 to 2 pulls
+// ('fw pull-status' when idle)" or " | serving fw-304" (offered, nobody pulling). Appended only when it fits whole.
+void FwOtaTransfer::appendServing(char* reply) const {
+  if (!_serving) return;
+  const uint32_t now = millis(); uint8_t na = 0; uint16_t top = 0;
+  for (uint8_t i = 0; i < DUTY_SESS_N; i++) {
+    const DutySess& d = _dsess[i];
+    if (d.top_bl || !d.keyed || d.listen || !serveActive(now, d.last_ms)) continue;
+    if (sessActive(d, now) || d.top >= _serve_man.n_chunks) { na++; top = d.top; }
+  }
+  char part[64];
+  if (na == 1 && top) snprintf(part, sizeof(part), " | serving fw-%lu to 1: %u/%lu (%lu%%)", (unsigned long)_serve_man.fw_version, (unsigned)top,
+                               (unsigned long)_serve_man.n_chunks, (unsigned long)(_serve_man.n_chunks ? 100UL * top / _serve_man.n_chunks : 0));
+  else if (na) snprintf(part, sizeof(part), " | serving fw-%lu to %u pull%s ('fw serve')", (unsigned long)_serve_man.fw_version, (unsigned)na, na == 1 ? "" : "s");
+  else snprintf(part, sizeof(part), " | serving fw-%lu", (unsigned long)_serve_man.fw_version);
+  const size_t l = strlen(reply);
+  if (l + strlen(part) < 160) strcpy(reply + l, part);
 }
 
 bool FwOtaTransfer::cmdStatus(char* reply) {
+  statusLine(reply);
+  if (_resolving || _phase != PH_IDLE) appendServing(reply);   // (rc22, C73) its own pull came first: serving was hidden (a field node, 10-22)
+  return true;
+}
+
+bool FwOtaTransfer::statusLine(char* reply) {
   if (_resolving) {
     char hex[8]; snprintf(hex, sizeof(hex), "%02X%02X", _res_id[0], _res_id[1]); if (_res_len == 3) snprintf(hex + 4, 4, "%02X", _res_id[2]);
-    if (_res_scanning || !_res_scans) snprintf(reply, 160, "looking for %s%s: scanning (scan %u)...", hex, _res_bl ? " (bootloader)" : "", (unsigned)(_res_scans ? _res_scans : 1));
-    else snprintf(reply, 160, "looking for %s%s: not in reach yet after %u scan(s) - next in %lus ('fw pull-abort' stops)", hex, _res_bl ? " (bootloader)" : "",
+    if (_res_scanning || !_res_scans) snprintf(reply, 160, "looking for %s%s: scan %u", hex, _res_bl ? " (bootloader)" : "", (unsigned)(_res_scans ? _res_scans : 1));
+    else snprintf(reply, 160, "looking for %s%s: not found (%u scans), next in %lus", hex, _res_bl ? " (bootloader)" : "",
                   (unsigned)_res_scans, (unsigned long)((_res_next_ms - millis()) / 1000));
     return true;
   }
@@ -896,27 +1046,27 @@ bool FwOtaTransfer::cmdStatus(char* reply) {
   if (_paused && (_phase == PH_OFFERING || _phase == PH_DOWNLOADING)) {   // (v1.17.28, C8)
     char left[24] = "until fw pull-resume";
     if (_pause_until_ms) { uint32_t m = (_pause_until_ms - millis()) / 60000; snprintf(left, sizeof(left), "resumes in %luh%02lum", (unsigned long)(m / 60), (unsigned long)(m % 60)); }
-    snprintf(reply, 160, "PAUSED '%s' : %lu/%lu chunks kept, %s (nothing is sent)", _man.name, (unsigned long)_cm.have, (unsigned long)_man.n_chunks, left);
+    snprintf(reply, 160, "PAUSED fw-%lu '%s' %lu/%lu, %s", (unsigned long)pullVer(), _man.name, (unsigned long)_cm.have, (unsigned long)_man.n_chunks, left);
     return true;
   }
   if (_fill_paused && _phase == PH_DOWNLOADING) {         // (rc19, C42)
-    snprintf(reply, 160, "PAUSED filling 'fw-%lu' (no install): %lu/%lu chunks (%lu%%) - %s; 'fw pull-resume' finishes it", (unsigned long)_man.fw_version,
+    snprintf(reply, 160, "PAUSED filling fw-%lu (no install) %lu/%lu chunks (%lu%%) %s; fw pull-resume", (unsigned long)_man.fw_version,
              (unsigned long)_cm.have, (unsigned long)_man.n_chunks, (unsigned long)(_man.n_chunks ? 100UL * _cm.have / _man.n_chunks : 0), _last_err);
     return true;
   }
   if (_phase == PH_OFFERING && _resuming) {
-    snprintf(reply, 160, "WAITING for server '%s' : %lu/%lu chunks kept, attempt %u, waited %lus, hops %u/%u, %s%s%s",
-             _man.name, (unsigned long)_cm.have, (unsigned long)_man.n_chunks, _attempts,
+    snprintf(reply, 160, "WAITING fw-%lu '%s' %lu/%lu, try %u, %lus, hops %u/%u%s%s%s",
+             (unsigned long)pullVer(), _man.name, (unsigned long)_cm.have, (unsigned long)_man.n_chunks, _attempts,
              (unsigned long)((millis() - _wait_started_ms) / 1000), (unsigned)rtCount(_route_len), (unsigned)rtCount(_ret_set ? _ret_len : _route_len),
              lastAnsText().c, _last_err[0] ? " - " : "", _last_err);   // (rc11, reply test) no trailing space without a reason
     return true;
   }
   if (_phase == PH_OFFERING && !_resuming) {
     if (_retries >= MAX_RETRIES)
-      snprintf(reply, 160, "offering '%s' : no answer yet, attempt %u, waited %lus, %s - out of reach or another passphrase? (retrying)",
+      snprintf(reply, 160, "offering '%s': no answer, try %u, %lus, %s",
                _man.name, _attempts, (unsigned long)((millis() - _wait_started_ms) / 1000), lastAnsText().c);
     else
-      snprintf(reply, 160, "offering '%s' : asking the server (try %u)%s%s", _man.name, _retries, _last_err[0] ? " - " : "", _last_err);
+      snprintf(reply, 160, "offering '%s': try %u%s%s", _man.name, _retries, _last_err[0] ? " - " : "", _last_err);
     return true;
   }
   if (_phase == PH_DOWNLOADING || _phase == PH_VERIFYING || _phase == PH_COMPLETE || _phase == PH_FAILED) {
@@ -942,6 +1092,7 @@ bool FwOtaTransfer::cmdStatus(char* reply) {
     if (_phase == PH_DOWNLOADING && _fill) snprintf(what, sizeof(what), "filling '%s' (%s, no install)", nm,   // (rc20, C52) mode 1 is
                                                     _fill_mode == FLEET_FILL_EMPTY ? "passive" : "fleet");   //   no 'fleet' pull
     else if (lis) snprintf(what, sizeof(what), "saving shared stream '%s'", nm);
+    else if (const uint32_t v = pullVer()) snprintf(what, sizeof(what), "%s %s-%lu '%s'", ph, _man.kind == KIND_BOOTLOADER ? "rev" : "fw", (unsigned long)v, nm);
     else snprintf(what, sizeof(what), "%s '%s'", ph, nm);
     char dw[24] = "";
     if (_phase == PH_DOWNLOADING && !lis) snprintf(dw, sizeof(dw), " duty %u.%02u win=%u", dp / 100, dp % 100, _win_target);
@@ -954,7 +1105,6 @@ bool FwOtaTransfer::cmdStatus(char* reply) {
              (unsigned)rtCount(_route_len), (unsigned)rtCount(_ret_set ? _ret_len : _route_len));
     // (rc16, F1) the reason only when it fits whole - a cut reason reads as a different one
     if (_last_err[0] && l > 0 && l + 1 + strlen(_last_err) < 159) snprintf(reply + l, 160 - l, " %s", _last_err);
-    if (_phase == PH_COMPLETE && _serving) { size_t l = strlen(reply); snprintf(reply + l, l < 159 ? 160 - l : 0, " | serving"); }
   } else if (_serving) {
     // (rc10, C22) transfer details only while a puller is active (a request in the last 10 min), one short part per puller; else idle.
     // (rc16, sim text audit) listed: the pulls that hold a share (or are starting / done); a session that went quiet (paused, a starter
@@ -1015,6 +1165,9 @@ bool FwOtaTransfer::cmdStatus(char* reply) {
 }
 
 bool FwOtaTransfer::cmdBlInfo(char* reply) {
+#if defined(ESP32)
+  strcpy(reply, "bootloader: ESP-IDF (no LoRa-OTA bootloader)"); return true;   // (Heltec)
+#endif
   if (!_bl_probed) armBlServe();
   uint32_t len = blImageLength(rdFlash, (void*)BL_ADDR);
   snprintf(reply, 160, "bootloader rev %lu, %lu B, crc %08lX, uicr %lX/%lX, %s", (unsigned long)_own_bl_rev, (unsigned long)len,
@@ -1027,25 +1180,34 @@ bool FwOtaTransfer::cmdBlInfo(char* reply) {
 // (rc17, C39, owner) "fw slot" in the form of "fw bl": what, size, CRC (of the app = the release .bin), install state, offer state
 bool FwOtaTransfer::cmdSlot(char* reply) {
   if (_fill_paused && _phase == PH_DOWNLOADING) {         // (rc19, C42, owner) "xx% chunks of fw-##"
-    snprintf(reply, 160, "slot: partial fw-%lu, %lu%% of its chunks (fill paused) - 'fw pull-resume' finishes it", (unsigned long)_man.fw_version,
+    snprintf(reply, 160, "slot: partial fw-%lu, %lu%% of its chunks (paused)", (unsigned long)_man.fw_version,
              (unsigned long)(_man.n_chunks ? 100UL * _cm.have / _man.n_chunks : 0));
     return true;
   }
   // the slot is written once a server answered (its header is cleared then); a pull still asking (or paused before its first offer) left it as is
   if (_phase == PH_DOWNLOADING || _phase == PH_VERIFYING || (_phase == PH_OFFERING && (_erased || _man.n_chunks))) {
-    snprintf(reply, 160, "slot: being pulled into, %s %lu/%lu chunks ('fw pull-status')", _fill ? "fleet fill" : "pull",
+    snprintf(reply, 160, "slot: being pulled into, %s %lu/%lu", _fill ? "fleet fill" : "pull",
              (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
     return true;
   }
   SlotHeader h;
+#if defined(ESP32)
+  if (!slotPartitionOk()) { strcpy(reply, "no slot: install once by USB"); return true; }
+#endif
   if (!readSlotHeader(h)) { strcpy(reply, "slot empty"); return true; }
   const bool valid = slotValid();
   CtrlBlock cb; const bool cv = readCtrl(cb);
   const bool inst = valid && installedImage(h);
-  const char* is = !valid ? "(crc mismatch)" : inst ? "installed here" : bleFilled(h) ? "BLE-filled, not installed"
+  const char* is = !valid ? "(crc mismatch)" : inst ? "installed here" : bleFilled(h) ? FILLED_TEXT
                  : (cv && cb.apply_state == APPLY_PENDING) ? "waiting for apply" : "not installed here";
   const char* os = !valid ? "not offered" : (_serving && imageStillServed()) ? "offered to neighbours" : _serve_disabled ? "not offered (fw serve off)"
-                 : !_circle_set ? "not offered (no passphrase)" : (cv && cb.apply_state == APPLY_FAILED && !inst) ? "not offered (the bootloader refused it)"
+                 : !_circle_set ? "not offered (no passphrase)"
+#if defined(ESP32)
+                 : (cv && failedForSlot(cb, h) && !inst && cb.last_result == 13) ? "not offered (rolled back: it did not confirm itself)"
+                 : (cv && failedForSlot(cb, h) && !inst) ? "not offered (the install refused it, 'fw ctl')"
+                 : (cv && cb.apply_state == APPLY_FAILED) ? "offered shortly (checking)"
+#endif
+                 : (cv && failedForSlot(cb, h) && !inst) ? "not offered (the bootloader refused it)"
                  : "offered shortly (checking)";
   snprintf(reply, 160, "slot: %sapp fw-%lu, %lu B, crc %08lX, %s, %s", valid ? "" : "INVALID ", (unsigned long)h.fw_version,
            (unsigned long)h.raw_len, (unsigned long)h.raw_crc32, is, os);
@@ -1081,11 +1243,14 @@ void FwOtaTransfer::dropPausedFill() {
   if (!_fill_paused) return;
   _fill_paused = false; _fill = false; _phase = PH_IDLE; clearState();
 }
-void FwOtaTransfer::setPaused(bool on, uint8_t hours) {
-  _paused = on; _pause_h = on ? hours : 0; _pause_until_ms = (on && hours) ? millis() + (uint32_t)hours * 3600000UL : 0;
+void FwOtaTransfer::setPaused(bool on, uint16_t mins) {
+  _paused = on; _pause_m = on ? mins : 0; _pause_until_ms = (on && mins) ? millis() + (uint32_t)mins * 60000UL : 0;
   if (!_fs) return;
   _fs->remove(PAUSE_FILE);
-  if (on) { File f = _fs->open(PAUSE_FILE, FILE_O_WRITE); if (f) { f.write(&hours, 1); f.close(); } }
+  if (on) {
+    const uint8_t b[3] = { (uint8_t)((mins + 59) / 60), (uint8_t)(mins & 0xFF), (uint8_t)(mins >> 8) };
+    File f = _fs->open(PAUSE_FILE, FILE_O_WRITE); if (f) { f.write(b, 3); f.close(); }
+  }
 }
 void FwOtaTransfer::resumePull(const char* why) {
   setPaused(false, 0);
@@ -1096,35 +1261,59 @@ void FwOtaTransfer::resumePull(const char* why) {
 }
 bool FwOtaTransfer::cmdPause(const char* arg, char* reply) {
   if (_phase != PH_OFFERING && _phase != PH_DOWNLOADING) { strcpy(reply, "ERR - no pull to pause"); return true; }
-  const int h = pauseHours(arg);
-  if (h < 0) { strcpy(reply, "usage: fw pull-pause [Nh]  (N = 1..168 hours; no N = until 'fw pull-resume')"); return true; }
+  const int h = pauseMinutes(arg);
+  if (h < 0) { strcpy(reply, "usage: fw pull-pause [Nh|Nm|NhMm]"); return true; }
+  char t[20]; pauseText(t, sizeof(t), (uint16_t)h);
   const bool again = _paused;                            // (rc20, C55) a retry whose first reply was lost (or a new timer): no error
   if (_phase == PH_DOWNLOADING) {                       // free the server's share now; the pull resumes later like after a stall
     sendAbort();
     enterWait("paused");
   }
   saveState();
-  setPaused(true, (uint8_t)h);
-  if (again && h) snprintf(reply, 160, "OK - already paused at %lu/%lu chunks; now resumes by itself in %d h", (unsigned long)_cm.have, (unsigned long)_man.n_chunks, h);
-  else if (again) snprintf(reply, 160, "OK - already paused at %lu/%lu chunks, until 'fw pull-resume'", (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
-  else if (h) snprintf(reply, 160, "OK - paused at %lu/%lu chunks: nothing is sent; resumes by itself in %d h (or 'fw pull-resume')", (unsigned long)_cm.have, (unsigned long)_man.n_chunks, h);
-  else   snprintf(reply, 160, "OK - paused at %lu/%lu chunks: nothing is sent until 'fw pull-resume' ('fw pull-abort' drops it)", (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
+  setPaused(true, (uint16_t)h);
+  if (again && h) snprintf(reply, 160, "OK - already paused %lu/%lu, resumes in %s", (unsigned long)_cm.have, (unsigned long)_man.n_chunks, t);
+  else if (again) snprintf(reply, 160, "OK - already paused %lu/%lu", (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
+  else if (h) snprintf(reply, 160, "OK - paused %lu/%lu, resumes in %s", (unsigned long)_cm.have, (unsigned long)_man.n_chunks, t);
+  else   snprintf(reply, 160, "OK - paused %lu/%lu", (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
   return true;
 }
-bool FwOtaTransfer::cmdResume(char* reply) {
+bool FwOtaTransfer::cmdResume(const char* arg, char* reply) {
+  // (rc22, C72, owner 2026-10-21) 'fw pull-resume duty x': THIS pull's duty (the pull's state, not the node's 'fw duty'); the server
+  // still caps it (min of both). A running pull asks again at once through the existing re-offer (chunks kept).
+  uint8_t nd = 0;
+  while (*arg == ' ') arg++;
+  if (*arg) {
+    if (strncmp(arg, "duty", 4) != 0 || (arg[4] != ' ' && arg[4] != 0)) { strcpy(reply, "usage: fw pull-resume [duty 0.1-1.0]"); return true; }
+    const char* v = arg + 4; while (*v == ' ') v++;
+    nd = dutyParse(v);
+    if (!nd) { strcpy(reply, "ERR - duty 0.1-1.0"); return true; }
+    if (_phase != PH_DOWNLOADING && _phase != PH_OFFERING) { strcpy(reply, "ERR - no pull"); return true; }
+    _pull_duty_pct = nd; saveState();
+  }
   if (_fill_paused && _phase == PH_DOWNLOADING) {       // (rc19, C42, owner) a paused fill: finish it from the nearest holder (a pull by image,
     _fill_paused = false; gapEscalate(millis());          //   never installed - 'fw apply' as for any fill)
-    snprintf(reply, 160, "OK - finishing the fill at %lu/%lu chunks from the nearest holder (no install)", (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
+    snprintf(reply, 160, "OK - finishing the fill %lu/%lu", (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
+    return true;
+  }
+  if (!_paused && nd) {                                  // (rc22, C72) a running pull: a new share, no pause/resume cycle
+    if (_phase == PH_DOWNLOADING && (_listening || _gap_phase || (_fill && !_sess_set)))
+      snprintf(reply, 160, "OK - duty %u.%02u from the next request", nd / 100, nd % 100);
+    else if (_phase == PH_DOWNLOADING) {
+      _reagree_at_ms = millis() | 1; _reagree_why = true;
+      int w = snprintf(reply, 160, "OK - duty %u.%02u at %lu/%lu", nd / 100, nd % 100, (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
+      if (_agreed_pct && w > 0) snprintf(reply + w, 160 - w, "; agreed %u.%02u", _agreed_pct / 100, _agreed_pct % 100);
+    } else snprintf(reply, 160, "OK - duty %u.%02u from the next request", nd / 100, nd % 100);
     return true;
   }
   if (!_paused) {                                        // (rc20, C55) a retry whose first reply was lost: say what runs, not an error
     if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING)
-      snprintf(reply, 160, "OK - not paused: the pull runs at %lu/%lu chunks ('fw pull-status')", (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
+      snprintf(reply, 160, "OK - not paused (%lu/%lu)", (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
     else strcpy(reply, "ERR - no paused pull");
     return true;
   }
   resumePull("resumed");
-  snprintf(reply, 160, "OK - resumed at %lu/%lu chunks: asking the server again", (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
+  if (nd) snprintf(reply, 160, "OK - resumed %lu/%lu, duty %u.%02u", (unsigned long)_cm.have, (unsigned long)_man.n_chunks, nd / 100, nd % 100);
+  else snprintf(reply, 160, "OK - resumed %lu/%lu", (unsigned long)_cm.have, (unsigned long)_man.n_chunks);
   return true;
 }
 
@@ -1217,6 +1406,20 @@ bool FwOtaTransfer::stageTakeResult(char* out, size_t outsz) {
   return true;
 }
 
+// (Heltec port) The ESP32's light sleep (IoTThinks power saving: up to 30 s, woken by a LoRa packet) would stall LoRa-OTA's short timers -
+// window pacing, retries, repairs, delayed answers. The node stays awake (MyMesh::hasPendingWork) only while it has such work of its own:
+// a pull/scan/install, a paced window or repairs still to send, a gap election, a pending answer. A holder between requests and a
+// neighbour that merely overhears a transfer sleep as before (the next packet wakes them; sim H20). Long timers (abort repeats, adverts,
+// the clock) may run up to 30 s late. Our own sends wait in MeshCore's outbound queue, which hasPendingWork() already counts.
+// The nRF52 sleep wakes every tick (1 ms): it never asks.
+bool FwOtaTransfer::needsAwake() const {
+  if (_reset_at_ms || _apply_armed || _pb_i || _scan_active || _resolving || _staging || _el_phase) return true;
+  if ((_phase == PH_OFFERING || _phase == PH_DOWNLOADING || _phase == PH_VERIFYING) && !_paused && !_fill_paused) return true;
+  for (uint8_t i = 0; i < PANS_N; i++) if (_pans[i].used) return true;
+  for (uint8_t k = 0; k < DUTY_SESS_N; k++) if (_dsess[k].sess && _dsess[k].q_i < _dsess[k].q_n) return true;   // a window being sent
+  return _rep.i < _rep.n;                                                                                     // gap repairs queued
+}
+
 // ======================= tick ==========================================
 void FwOtaTransfer::tick() {
   uint32_t now = millis();
@@ -1243,15 +1446,23 @@ void FwOtaTransfer::tick() {
 
   if (!_bl_probed && !_staging && now > 6000 && (_phase == PH_IDLE || _phase == PH_COMPLETE || _phase == PH_FAILED)) armBlServe();
   if (_clk_restore && _flood_host) { _clk_restore = false; restoreClock(); }   // (rc21, C58)
+#if defined(ESP32)
+  if (_mesh) probationTick(now, _mesh->getNumRecvFlood() + _mesh->getNumRecvDirect());   // (Heltec port) a new app confirms itself
+#endif
   timeTick(now);                                                               // (rc21, C57)
   if (_reset_at_ms && (int32_t)(now - _reset_at_ms) >= 0) {   // (v1.17.28) `fw pull-ble` / `fw apply`: the reply has gone out, restart now
-    saveClock();
+    saveClock(_reset_magic == GPREGRET_SLOT_DFU);           // (C69) `fw pull-ble`: the SoftDevice may overwrite the RAM clock
     g_wdt.feedAlways();                                    // (rc8) a full watchdog period for the bootloader (it reloads it on every event)
+#if defined(ESP32)
+    Serial.flush(); delay(100);
+    esp_restart();                                         // (Heltec port) `fw apply`: the next boot installs (bootApplyEsp32)
+#else
     uint8_t sd = 0; sd_softdevice_is_enabled(&sd);
     if (sd) { sd_power_gpregret_clr(0, 0xffffffff); if (_reset_magic) sd_power_gpregret_set(0, _reset_magic); }
     else NRF_POWER->GPREGRET = _reset_magic;
     Serial.flush(); delay(100);
     NVIC_SystemReset();
+#endif
   }
   if (_scan_active) {
     if (_scan_pending && (int32_t)(now - _scan_start_ms) >= 0) scanSend();   // (v1.17.28) after the command's reply
@@ -1266,6 +1477,7 @@ void FwOtaTransfer::tick() {
   repTick(now);                                           // (rc17) gap repairs for the neighbours, one at a time in quiet moments
   trickleTick(now);                                       // (study E) summaries to the neighbours
   cxlTick(now);                                           // (rc19, C42) the repeats of a fleet cancel
+  campTick(now);                                          // (rc25, C95) the push campaign
   abtTick(now);                                           // (rc20, C49) the repeats of the session ABORT
   if (_fc.set && since(now, _fc.ms) > FILL_ARM_MS) _fc.set = false;   // (rc17) an announce whose stream never came here
   if (_pb_i) passphraseStep();                              // (v1.17.28) `fw passphrase` in the background
@@ -1277,7 +1489,11 @@ void FwOtaTransfer::tick() {
       else if (ctrlMarkPending()) {
         saveClock();
         Serial.println("fw_ota: pull verified - rebooting to apply"); Serial.flush(); delay(300);
+#if defined(ESP32)
+        esp_restart();                                     // (Heltec port) the next boot installs it (bootApplyEsp32)
+#else
         NVIC_SystemReset();
+#endif
       } else Serial.println("fw_ota: could not set PENDING - not applying");
     }
   }
@@ -1525,6 +1741,10 @@ void FwOtaTransfer::onPacket(mesh::Packet* pkt) {
   // (rc15) image chunks: image key, any puller of the image (not counted as a MAC fail). (rc17) they, fleet announces and gap requests are
   // handled in noteRx(): every packet the radio hears, also one a relay only forwards (this hook sees only the last hop's)
   if (b[1] == MSG_CHUNK_IMG || b[1] == MSG_FLEET_ANN || b[1] == MSG_GAP_REQ) return;
+  if (b[1] == MSG_CAMP) {                                // (rc25, C95) a member's result, direct to us (the origin)
+    const uint8_t enc = (uint8_t)(((pkt->getPathHashSize() - 1) << 6) | pkt->getPathHashCount());
+    onCamp(b, len, pkt->getPathHashCount(), pkt->path, enc); return;
+  }
   if ((b[1] == MSG_CHUNK || b[1] == MSG_PACE) && len >= 6) {   // chunks carry the session: another pull's chunks are not ours (no MAC fail)
     uint32_t cs; memcpy(&cs, &b[2], 4);                           // (rc14, C33) the same for PACE: one overheard for a neighbour's pull
     if (cs != _session || (b[1] == MSG_CHUNK && _phase != PH_DOWNLOADING)) return;   //   counted as mac_fail (twin, 2026-10-06)
@@ -1681,11 +1901,12 @@ void FwOtaTransfer::onOfferAck(const uint8_t* b, uint32_t len) {
   _fair_server = len >= kp + 32 + 8 + 1 + XFER_MAC_LEN && (b[kp + 40] & 0x01);   // (rc11) it will tell us (PACE) when our share changes
   _img_ok = len >= kp + 32 + 8 + 1 + XFER_MAC_LEN && (b[kp + 40] & 0x02);          // (rc15) it sends image chunks (the shared stream)
   _fann_next_ms = _img_ok ? (millis() | 1) : 0;          // (rc17) image chunks = others can collect them: announce the stream (tick)
-  if (g_tune.req_adopt && !_img_set && !_fill && _img_ok && nm.kind == KIND_APP) {   // (study) a pull by id: from now on a pull of this IMAGE
+  // (rc22, C71) a BOOTLOADER pull by id adopts its image too (was app only): holder search, moves and failover as for an app
+  if (g_tune.req_adopt && !_img_set && !_fill && _img_ok && (nm.kind == KIND_APP || (nm.kind == KIND_BOOTLOADER && g_tune.bl_adopt))) {   // (study) a pull by id: from now on a pull of this IMAGE
     uint8_t tid[4];                                                                     //   (nearer holders, moves, failover)
-    if (pullTargetId(tid)) { _img_set = true; _img_kind = KIND_APP; _img_ver = nm.fw_version; memcpy(_img_digest, nm.sha256, 8);
+    if (pullTargetId(tid)) { _img_set = true; _img_kind = nm.kind; _img_ver = nm.fw_version; memcpy(_img_digest, nm.sha256, 8);
                              memcpy(_holders[0], tid, 4); _nholders = 1; _holders_tried = 0;
-                             if (memcmp(_origin_tag, nm.sha256, 4) != 0) { memcpy(_origin, tid, 4); memcpy(_origin_tag, nm.sha256, 4); } }
+                             if (nm.kind == KIND_APP && memcmp(_origin_tag, nm.sha256, 4) != 0) { memcpy(_origin, tid, 4); memcpy(_origin_tag, nm.sha256, 4); } }
   }
   useImgKeys(nm.sha256);                                 // (rc15) image key: any stream of THIS image
   if (_heard_tag_ms && since(millis(), _heard_tag_ms) < STREAM_T_MIN_MS && memcmp(_heard_tag, nm.sha256, 4) == 0) {
@@ -1704,7 +1925,10 @@ void FwOtaTransfer::onOfferAck(const uint8_t* b, uint32_t len) {
   nm.kind = KIND_APP; nm.dst_off = 0;
   if (len >= n + sizeof(nm.lzma_props) + 1 + 8 + XFER_MAC_LEN) {          // kind + board (2026-09-20); absent from older servers = an app image
     nm.kind = b[n + 5];
-    if (memcmp(&b[n + 6], g_fwpull_tag.board, 8) != 0) { if (!_resuming) fail("that image is for another board"); return; }
+    if (memcmp(&b[n + 6], g_fwpull_tag.board, 8) != 0) {                // (Heltec bench) the same text as the scan-answer path, with the board
+      if (!_resuming) { char bd[9], why[48]; memcpy(bd, &b[n + 6], 8); bd[8] = 0; snprintf(why, sizeof(why), "its firmware is for another board (%s)", bd); fail(why); }
+      return;
+    }
   }
   if (nm.kind != _man.kind) { if (!_resuming) fail("the server offered another kind of image"); return; }
   if (nm.kind == KIND_BOOTLOADER &&
@@ -1762,7 +1986,7 @@ void FwOtaTransfer::onOfferAck(const uint8_t* b, uint32_t len) {
   _man = nm; _saved_man = nm;
   if (nm.n_chunks > ChunkMap::MAX_CHUNKS) { fail("image too big for the slot"); return; }
   if (!(nm.kind == KIND_BOOTLOADER && nm.dst_off)) eraseSlotHeader();   // an app: the slot stays invalid until the whole image is in and verified
-  _cm.reset(nm.n_chunks); _erased = false; _erase_next = 0; _strm_top = 0;
+  _cm.reset(nm.n_chunks); _erased = false; _erase_next = 0; _strm_top = 0; _strm_top_ms = 0; _fill_h = false;
   _win_count = 0; _win_target = XFER_WIN_INIT;   // start each pull attempt with a fresh guess
   _retries = 0; _last_req_ms = 0;
   _crc_bad = 0; _crc_bad_idx = -1;
@@ -1917,6 +2141,8 @@ void FwOtaTransfer::noteRx(uint8_t payload_type, const uint8_t* payload, uint16_
   if (payload_type == PAYLOAD_TYPE_RAW_CUSTOM && len && payload[0] == XFER_MAGIC) {
     noteDemand(payload, len);                                // (rc15) streams heard
     if (!_circle_set || len < 2 + XFER_MAC_LEN) return;
+    if (_camp.set && len >= 6 && memcmp(&payload[2], _camp.m.sha256, 4) == 0 && (payload[1] == MSG_CHUNK_IMG || payload[1] == MSG_FLEET_ANN
+        || payload[1] == MSG_GAP_REQ || payload[1] == MSG_SUMM)) _camp_heard_ms = millis() | 1;   // (rc25) the campaign's image near us
     if (payload[1] == MSG_CHUNK_IMG && len >= 8) {          // (rc17) any hop of a stream: collect it (fleet fill), cancel our repair of it
       uint16_t idx; memcpy(&idx, &payload[6], 2);
       repHeard(&payload[2], idx);
@@ -1959,25 +2185,25 @@ bool FwOtaTransfer::floodBudget(uint32_t now) {
 bool FwOtaTransfer::cmdPassphrase(const char* arg, char* reply) {
   while (*arg == ' ') arg++;
   if (!*arg) {
-    if (_pb_i) { snprintf(reply, 160, "computing the circle key: %lu%% ...", (unsigned long)(_pb_i * 100 / PBKDF2_ITER)); return true; }
-    if (!_circle_set) { strcpy(reply, "no passphrase: LoRa-OTA is off on this node ('fw passphrase <phrase>', the same on every node of your circle)"); return true; }
+    if (_pb_i) { snprintf(reply, 160, "circle key %lu%%...", (unsigned long)(_pb_i * 100 / PBKDF2_ITER)); return true; }
+    if (!_circle_set) { strcpy(reply, "no passphrase (LoRa-OTA off)"); return true; }
     uint8_t fp[32]; mesh::Utils::sha256(fp, 32, _circle, 32);
-    snprintf(reply, 160, "circle set, fingerprint %02X%02X%02X%02X (compare it between your nodes)", fp[0], fp[1], fp[2], fp[3]);
+    snprintf(reply, 160, "circle %02X%02X%02X%02X", fp[0], fp[1], fp[2], fp[3]);
     return true;
   }
-  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING) { strcpy(reply, "ERR - a pull is in progress ('fw pull-abort' first)"); return true; }
+  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING) { strcpy(reply, "ERR - pull running (fw pull-abort)"); return true; }
   if (!strcmp(arg, "off")) {
     _circle_set = false; memset(_circle, 0, 32); circleKeys(); stopServing(); _bl_serving = false;
     if (_fs) _fs->remove(CIRCLE_FILE);
-    strcpy(reply, "OK - passphrase removed: LoRa-OTA is off on this node (hidden)"); return true;
+    strcpy(reply, "OK - passphrase removed (LoRa-OTA off)"); return true;
   }
-  if (strlen(arg) < PASS_MIN || strlen(arg) >= sizeof(_pb_pw)) { snprintf(reply, 160, "ERR - %u to %u characters (4 random words are good)", (unsigned)PASS_MIN, (unsigned)sizeof(_pb_pw) - 1); return true; }
-  if (_pb_i) { strcpy(reply, "ERR - still computing the previous passphrase (~20 s)"); return true; }
+  if (strlen(arg) < PASS_MIN || strlen(arg) >= sizeof(_pb_pw)) { snprintf(reply, 160, "ERR - %u-%u characters", (unsigned)PASS_MIN, (unsigned)sizeof(_pb_pw) - 1); return true; }
+  if (_pb_i) { strcpy(reply, "ERR - still computing (~20 s)"); return true; }
   strcpy(_pb_pw, arg);                                    // PBKDF2 block 1: U1 = HMAC(P, salt | INT(1)) - the rest runs in tick()
   static const char salt[] = "LoRa-OTA circle v1";
   pbkdf2Start(_pb_pw, (const uint8_t*)salt, sizeof(salt) - 1, _pb_u, _pb_out);
   _pb_i = 1;
-  strcpy(reply, "OK - computing the circle key (~20 s, the node keeps relaying); 'fw passphrase' shows its fingerprint when done");
+  strcpy(reply, "OK - computing ~20 s, then fw passphrase");
   return true;
 }
 
@@ -1998,31 +2224,71 @@ void FwOtaTransfer::passphraseStep() {
 // "slot zip" whose image is 0x1000 - 160 bytes of 0xFF + a .lota file: the bootloader writes it into the SLOT (never over the app), so the
 // .lota header ends at the slot's first page and its payload sits exactly at the slot payload offset. The node restarts into this app
 // (5 min without DFU activity: also back here), and slotFromLota() turns it into a VALID slot that is served.
+// (Heltec port) `fw pull-wifi`: the counterpart of `fw pull-ble` on the ESP32 - the node restarts into the SEEDER (the "factory" app
+// partition, written once by the USB install, never sent over LoRa): an OPEN Wi-Fi access point "LoRa-OTA-<id>" (owner 2026-11-01: only a
+// logged-in admin can start it, it lives 5 min at most, and the upload is checked like every slot image - board, CRC-32, SHA-256),
+// a page in the phone's browser takes the release's .lota and writes it into the slot exactly where a RAK slot zip lands; the seeder then
+// returns to THIS app partition, and slotFromLota() checks it (board, CRC-32, SHA-256) and serves it. 5 min without an upload = back.
+bool FwOtaTransfer::cmdPullWifi(char* reply) {
+#if !defined(ESP32)
+  return cmdPullBle(reply);    // (owner 2026-11-01) an alias: the RAK seeds its slot over Bluetooth
+#else
+  dropPausedFill();
+  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING) { strcpy(reply, "ERR - pull running (fw pull-abort)"); return true; }
+  if (_staging) { strcpy(reply, "ERR - stage in progress"); return true; }
+  if (!slotPartitionOk()) { strcpy(reply, "ERR - no slot: install once by USB"); return true; }
+  const esp_partition_t* fac = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+  if (!fac) { strcpy(reply, "ERR - no seeder: install once by USB"); return true; }
+  uint8_t b[4 + 4] = {0}; const uint32_t m = SEED_MAGIC, ret = appRunAddr();
+  memcpy(b, &m, 4); memcpy(b + 4, &ret, 4);
+  if (!_fs) { strcpy(reply, "ERR - no file system"); return true; }
+  _fs->remove(SEED_FILE); { File f = _fs->open(SEED_FILE, FILE_O_WRITE); if (!f) { strcpy(reply, "ERR - could not write the seed file"); return true; } f.write(b, sizeof(b)); f.close(); }
+  if (esp_ota_set_boot_partition(fac) != ESP_OK) { _fs->remove(SEED_FILE); strcpy(reply, "ERR - seeder does not start"); return true; }
+  _reset_magic = 0; _reset_at_ms = millis() + 3000;
+  uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);    // the seeder names its network after the same (station) MAC
+  snprintf(reply, 160, "OK - Wi-Fi in 3 s: LoRa-OTA-%02X%02X%02X, http://192.168.4.1", mac[3], mac[4], mac[5]);
+  return true;
+#endif
+}
+
 bool FwOtaTransfer::cmdPullBle(char* reply) {
+#if defined(ESP32)
+  return cmdPullWifi(reply);   // (owner 2026-11-01) one command for both boards: 'fw pull-ble' / 'fw pull-wifi' seed the slot the board's way
+#endif
   dropPausedFill();                                       // (rc19) a paused fill gives way to the Bluetooth fill
-  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING) { strcpy(reply, "ERR - a pull is in progress ('fw pull-abort' first)"); return true; }
+  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING) { strcpy(reply, "ERR - pull running (fw pull-abort)"); return true; }
   if (_staging) { strcpy(reply, "ERR - stage in progress"); return true; }
   if (!_bl_probed) armBlServe();
-  if (_own_bl_rev < 5) { snprintf(reply, 160, "ERR - needs bootloader rev 5+ (this node: rev %lu) - 'fw blupdate' first", (unsigned long)_own_bl_rev); return true; }
+  if (_own_bl_rev < 5) { snprintf(reply, 160, "ERR - needs bootloader rev 5+ (has %lu)", (unsigned long)_own_bl_rev); return true; }
   _reset_magic = GPREGRET_SLOT_DFU; _reset_at_ms = millis() + 3000;
   // (rc19, C46, owner: warn only) a weak battery without USB power: board 3 restarted on DFU entry at 3.29-3.36 V (B4) - the reply says so
+#if !defined(ESP32)
   if (_batt_mv && _batt_mv < BLE_WARN_MV && !(NRF_POWER->USBREGSTATUS & 1))
-    snprintf(reply, 160, "OK - Bluetooth upload into the slot in 3 s (battery %u.%02u V, no USB: it may restart instead - USB power helps). "
-             "DFU app -> 3401_DFU -> -slot.zip", _batt_mv / 1000, (_batt_mv % 1000) / 10);
-  else strcpy(reply, "OK - Bluetooth upload into the slot in 3 s: DFU app -> 3401_DFU -> the release's -slot.zip. Off the mesh until done (5 min idle = back)");
+    snprintf(reply, 160, "OK - Bluetooth in 3 s (batt %u.%02u V, may restart): 3401_DFU", _batt_mv / 1000, (_batt_mv % 1000) / 10);
+  else strcpy(reply, "OK - Bluetooth in 3 s: 3401_DFU, -slot.zip");
+#endif
   return true;
 }
 
 // `fw apply`: install the slot image on THIS node - the bootloader applies it at the next boot (= fw pending + reboot)
 bool FwOtaTransfer::cmdApply(char* reply) {
-  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING || _staging) { strcpy(reply, "ERR - a pull or stage is in progress"); return true; }
-  if (!slotValid()) { strcpy(reply, "ERR - slot not VALID: nothing to install"); return true; }
+  if (_phase == PH_DOWNLOADING || _phase == PH_OFFERING || _staging) { strcpy(reply, "ERR - pull/stage running"); return true; }
+  if (_phase == PH_VERIFYING) { strcpy(reply, "ERR - still checking (wait for COMPLETE)"); return true; }   // (rc22, C74)
+  if (!slotValid()) { strcpy(reply, "ERR - slot not VALID"); return true; }
   { SlotHeader ih; if (readSlotHeader(ih) && installedImage(ih)) {       // (v1.17.28, C1) nothing to do: no flash write, no reboot
-      snprintf(reply, 160, "fw-%lu is already installed (the slot holds the running app) - nothing to do", (unsigned long)ih.fw_version); return true; } }
+      snprintf(reply, 160, "fw-%lu already installed", (unsigned long)ih.fw_version); return true; } }
   if (!ctrlMarkPending()) { strcpy(reply, "ERR - could not mark the slot pending"); return true; }
   SlotHeader h; readSlotHeader(h);
   _reset_magic = 0; _reset_at_ms = millis() + 3000;
-  snprintf(reply, 160, "OK - installing fw-%lu: the node restarts in 3 s and the bootloader applies the slot", (unsigned long)h.fw_version);
+#if defined(ESP32)
+#if defined(FW_OTA_FWNUM)   // (C92, owner's text 2026-11-04)
+  snprintf(reply, 160, "OK - installing fw-%lu: restarts in 3 s; then 2 min application test or roll back to fw-%lu", (unsigned long)h.fw_version, (unsigned long)FW_OTA_FWNUM);
+#else
+  snprintf(reply, 160, "OK - installing fw-%lu: restarts in 3 s; then 2 min application test or roll back", (unsigned long)h.fw_version);
+#endif
+#else
+  snprintf(reply, 160, "OK - installing fw-%lu: restarts in 3 s", (unsigned long)h.fw_version);
+#endif
   return true;
 }
 
@@ -2058,16 +2324,16 @@ void FwOtaTransfer::slotFromLota() {
   }
   if (why) {
     eraseSlotHeader();                                   // the slot reads as empty again; the app was never touched
-    snprintf(_last_err, sizeof(_last_err), "BLE upload refused: %s", why);
+    snprintf(_last_err, sizeof(_last_err), UPLOAD_NAME " upload refused: %s", why);
     Serial.print("fw_ota: "); Serial.println(_last_err);
     return;
   }
   SlotHeader sh2; memset(&sh2, 0, sizeof(sh2));
   sh2.raw_len = rlen; sh2.raw_crc32 = le32(h + 32); sh2.compression = COMP_LZMA; sh2.fw_version = le32(h + 16);
   memcpy(sh2.lzma_props, h + 44, 5);
-  if (!_writer.finishSparse(sh2, plen, pcrc) || !slotValid()) { strcpy(_last_err, "BLE upload: slot header write failed"); return; }
+  if (!_writer.finishSparse(sh2, plen, pcrc) || !slotValid()) { strcpy(_last_err, UPLOAD_NAME " upload: slot header write failed"); return; }
   if (_fs) { _fs->remove(BLEFILL_FILE); File f = _fs->open(BLEFILL_FILE, FILE_O_WRITE); if (f) { f.write((const uint8_t*)&pcrc, 4); f.close(); } }
-  snprintf(_last_err, sizeof(_last_err), "BLE upload: fw-%lu in the slot, served", (unsigned long)sh2.fw_version);
+  snprintf(_last_err, sizeof(_last_err), UPLOAD_NAME " upload: fw-%lu in the slot, served", (unsigned long)sh2.fw_version);
   Serial.print("fw_ota: "); Serial.println(_last_err);
 }
 
@@ -2169,6 +2435,7 @@ void FwOtaTransfer::abtTick(uint32_t now) {
 }
 
 uint8_t FwOtaTransfer::parseDuty(const char* s) { return dutyParse(s); }
+int FwOtaTransfer::parsePause(const char* s) { return pauseMinutes(s); }
 
 // "fw duty" - show; "fw duty 0.3" - set (0.1 .. 1.0, persistent). As server: the most any pull of ours may use. As puller: what a pull asks for
 // (unless "fw pull ... duty x"). Takes effect at the next start / restart of a pull (the pace is agreed once, at the offer).
@@ -2176,18 +2443,18 @@ bool FwOtaTransfer::cmdDuty(const char* arg, char* reply) {
   while (*arg == ' ') arg++;
   if (*arg) {
     uint8_t p = dutyParse(arg);
-    if (!p) { strcpy(reply, "ERR - fw duty 0.10 .. 1.00 (share of airtime LoRa-OTA may use; 1.00 = no limit)"); return true; }
+    if (!p) { strcpy(reply, "ERR - duty 0.10-1.00"); return true; }
     _duty_pct = p; dutyRebalance(millis());               // (rc16, sim text audit) the new shares are known now (they take effect per window)
     if (_fs) { _fs->remove(DUTY_FILE); File f = _fs->open(DUTY_FILE, FILE_O_WRITE); if (f) { f.write(&p, 1); f.close(); } }
     // (rc14, owner) LIVE on both sides: a server re-splits its running pulls at their next window (rc11 fair share); a running pull of ours
     // (without its own 'duty x') asks its server again at once - the existing re-offer, chunks kept
     const bool live = _phase == PH_DOWNLOADING && !_pull_duty_pct;
     if (live) { _reagree_at_ms = millis() | 1; _reagree_why = true; }
-    snprintf(reply, 160, "OK - duty %u.%02u saved (LoRa-OTA <= %u%% airtime): pulls we serve re-split at their next window%s", p / 100, p % 100, p,
+    snprintf(reply, 160, "OK - duty %u.%02u saved (<=%u%% airtime)%s", p / 100, p % 100, p,
              live ? "; our pull asks again now" : "");
     return true;
   }
-  int w = snprintf(reply, 160, "duty %u.%02u (LoRa-OTA <= %u%% of the channel incl. relays, default 0.30)", _duty_pct / 100, _duty_pct % 100, _duty_pct);
+  int w = snprintf(reply, 160, "duty %u.%02u (<=%u%% airtime)", _duty_pct / 100, _duty_pct % 100, _duty_pct);
   if (w > 0 && w < 160 && (_phase == PH_OFFERING || _phase == PH_DOWNLOADING))
     w += snprintf(reply + w, 160 - w, " | pull asks %u.%02u%s, %s", askedPct() / 100, askedPct() % 100, _pull_duty_pct ? " (this pull)" : "",
                   _listening ? "listening (no share needed)" : _agreed_pct ? "agreed " : "agreed - (at the offer)");   // (rc16, F2)
@@ -2225,11 +2492,17 @@ void FwOtaTransfer::onChunkImg(const uint8_t* b, uint32_t len) {
   if (clen == 0 || clen > XFER_CHUNK || 12u + clen + 2u + XFER_MAC_LEN > len || idx >= _cm.n || !macOk(_ik_mac, b, len)) return;
   _img_heard_ms = millis() | 1;                          // (rc17) the stream is alive (repairs included)
   const bool own = _erased && !_listening && (uint16_t)(_seq - rs) <= 2 && idx >= _win_start && idx < _win_start + _win_count;
+  // (rc22, C77) a late copy of one of our own earlier windows (the relay's copy after the direct one, a late answer): our stream, not
+  // another puller's - it must not start listening (bench 10-31: the only puller said "saving shared stream" and stalled each window)
+  const bool late = _erased && !_listening && _sess_set && (uint16_t)(_seq - rs) <= 2 && idx < _win_start;
   // (rc17) a neighbour's gap repair (req seq 0xFxxx) is no stream for a requester: it goes on with its windows; a listener / collector waits
   const bool rep = (rs & 0xF000) == 0xF000;
   const bool rep_for_req = rep && !_listening && !_gap_phase && _sess_set && !own;
-  if (!rep && idx > _strm_top) _strm_top = idx;          // (rc19, C44) how far the stream has come (repairs are not the stream)
-  if (!own && !rep_for_req && !(rep && _fill_paused)) {  // (rc19) a paused fill wakes for a stream, not for a neighbour's repairs                            // a stream for another puller: live while chunks keep coming (its largest gap x 2)
+  if (!rep && _fill_h && _fill && !_sess_set) { _fill_h = false; _fann_have = 0; _fann_heard_ms = millis() | 1; }   // (rc23, C91) a stream after a
+                                                         //   holder-begun fill: somebody pulls - gaps wait behind it like any listener's
+  if (!rep && idx > _strm_top) { _strm_top = idx; _strm_top_ms = millis() | 1; }   // (rc19, C44) how far the stream has come (repairs are not
+                                                         //   the stream); (C91) and when it last moved on
+  if (!own && !late && !rep_for_req && !(rep && _fill_paused)) {  // (rc19) a paused fill wakes for a stream, not for a neighbour's repairs                            // a stream for another puller: live while chunks keep coming (its largest gap x 2)
     const uint32_t now = millis() | 1;                   //   (noted while our slot is still being erased too: no own request after it)
     if (_stream_ms) { const uint32_t g = since(now, _stream_ms); if (g < STREAM_T_MAX_MS) _stream_gap_ms = umax(g, _stream_gap_ms * 7 / 8); }
     _stream_ms = now; _gap_at_ms = 0;
@@ -2289,18 +2562,7 @@ void FwOtaTransfer::finishVerify() {
   uint32_t pcrc = crc32_flash(dstAddr(0), _man.payload_len);
   if (pcrc != _man.payload_crc32) { retryOrFail("payload CRC32 mismatch"); return; }
 
-  // 2) header write (turns the slot VALID) - only after CRC passes. A bootloader never gets a slot header: the bootloader must not apply it as an app.
-  if (!bl) {
-    SlotHeader h; memset(&h, 0, sizeof(h));
-    h.raw_len     = _man.raw_len;
-    h.raw_crc32   = _man.raw_crc32;
-    h.compression = _man.compression;
-    h.fw_version  = _man.fw_version;
-    memcpy(h.lzma_props, _man.lzma_props, sizeof(h.lzma_props));
-    if (!_writer.finishSparse(h, _man.payload_len, pcrc)) { fail("finish/header failed"); return; }
-  }
-
-  // 3) SHA-256 over the payload in flash must match the manifest
+  // 2) SHA-256 over the payload in flash must match the manifest
   SHA256 sh; static uint8_t buf[512]; uint8_t out[32];
   sh.reset();
   uint32_t plen = _man.payload_len;
@@ -2311,14 +2573,25 @@ void FwOtaTransfer::finishVerify() {
     off += n; if ((off & 0x1FFF) == 0) yield();
   }
   sh.finalize(out, sizeof(out));
-  if (memcmp(out, _man.sha256, 32) != 0) {
-    if (!bl) eraseSlotHeader();          // invalidate - do not leave a bad slot VALID
-    retryOrFail("SHA-256 mismatch");
-    return;
+  if (memcmp(out, _man.sha256, 32) != 0) { retryOrFail("SHA-256 mismatch"); return; }
+
+  // 3) (rc22, C74) header write (turns the slot VALID) - only after BOTH checks passed, so the slot is never VALID with an unchecked
+  //    SHA-256. A bootloader never gets a slot header: the bootloader must not apply it as an app.
+  if (!bl) {
+    SlotHeader h; memset(&h, 0, sizeof(h));
+    h.raw_len     = _man.raw_len;
+    h.raw_crc32   = _man.raw_crc32;
+    h.compression = _man.compression;
+    h.fw_version  = _man.fw_version;
+    memcpy(h.lzma_props, _man.lzma_props, sizeof(h.lzma_props));
+    if (!_writer.finishSparse(h, _man.payload_len, pcrc)) { fail("finish/header failed"); return; }
   }
 
   // 4) a bootloader is also checked as what it is (vectors, identity descriptor, flash layout, board) before the MBR may copy it over ours
   if (bl) {
+#if defined(ESP32)
+    fail("no LoRa-OTA bootloader on this board"); return;  // (Heltec port) bootloader pulls are refused up front; never kept
+#else
     BlDesc d;
     BlCheck c = blImageCheck(rdFlash, (void*)dstAddr(0), plen, g_fwpull_tag.board, uicrBl(), uicrMbr(), &d);
     if (c == BL_OK && d.bl_rev != _man.fw_version) c = BL_NO_DESC;
@@ -2326,6 +2599,7 @@ void FwOtaTransfer::finishVerify() {
     _phase = PH_COMPLETE; _resuming = false;   // state stays until the copy starts: a reboot before that verifies again (needs no server) and applies
     _apply_armed = true; _apply_at_ms = millis() + 5000;
     return;
+#endif
   }
 
   _phase = PH_COMPLETE;
@@ -2335,8 +2609,15 @@ void FwOtaTransfer::finishVerify() {
   SlotHeader ih;
   if (readSlotHeader(ih) && installedImage(ih))         // (v1.17.28, C1) the node already RUNS this image: fill the slot, serve it, no re-flash
     strncpy(_last_err, "already installed: slot filled, served", sizeof(_last_err) - 1);   // (rc15) no announce: it speaks when there is demand
-  else if (_fill) strcpy(_last_err, "fleet fill done: served, not installed");   // (rc17, owner 9.1 b) never installs by itself
-  else if (!_noapply) { _apply_armed = true; _apply_at_ms = millis() + 5000; }   // verified: apply without anyone babysitting it
+  else if (_fill) {
+    strcpy(_last_err, "fleet fill done: served, not installed");   // (rc17, owner 9.1 b) never installs by itself
+    if (!_camp.set && _circle_set && _mesh) _camp_q_ms = (millis() + 5000 + (uint32_t)_mesh->getRNG()->nextInt(0, 55000)) | 1;   // (rc25) filled
+  }                                                      //   without knowing a campaign (its invite was lost): ask once, then report
+  else if (_camp.island && campImg(_man.sha256)) { _camp.island = 0; strcpy(_last_err, "push fill done: served, not installed"); }   // (rc25)
+  else {
+    if (_fleet_mode == FLEET_REPLACE && _man.kind == KIND_APP && _circle_set) campStart(_man);   // (rc25, C95) a fleet pull = a campaign
+    if (!_noapply) { _apply_armed = true; _apply_at_ms = millis() + 5000; }   // verified: apply without anyone babysitting it
+  }
   _next_autoserve_ms = millis();     // become a server right away
   MESH_DEBUG_PRINTLN("fw_ota: pull COMPLETE, slot valid");
 }
@@ -2370,17 +2651,24 @@ void FwOtaTransfer::scanSend() {
   _scan_resend_ms = scanResendAt(0, millis(), (uint32_t)_mesh->getRNG()->nextInt(0, SCAN_REQ_SPREAD_MS + 1), _scan_end_ms);
 }
 
-bool FwOtaTransfer::cmdList(char* reply) {
-  if (!_circle_set) { strcpy(reply, "ERR - set 'fw passphrase <phrase>' first: only nodes of your circle are listed"); return true; }
+bool FwOtaTransfer::cmdList(char* reply) { return scanCmd(reply, false); }
+
+// 'fw peers' (auto = false) or (rc22, C70, owner 2026-10-21) 'fw list' before any scan (auto = true): the same scan, a reply that says
+// it started by itself. Only when no scan was ever done: "found nothing" never rescans by itself (a scan is airtime).
+bool FwOtaTransfer::scanCmd(char* reply, bool autoscan) {
+  if (!_circle_set) { strcpy(reply, "ERR - no passphrase"); return true; }
   // allowed while a pull WAITS for its server (PH_OFFERING): the scan is independent and shows what else is in reach
-  if ((_phase == PH_DOWNLOADING && !_fill_paused) || _phase == PH_VERIFYING || _staging) { strcpy(reply, "ERR - busy (download/stage in progress)"); return true; }
+  if ((_phase == PH_DOWNLOADING && !_fill_paused) || _phase == PH_VERIFYING || _staging) { strcpy(reply, "ERR - busy (pull/stage)"); return true; }
   startScan(SCAN_START_MS);
   if (_flood_host && !_flood_host->regionSet() && !_region_hint) {   // relays that only forward region floods drop an unscoped discovery
     _region_hint = true;                                 // (rc21, C60) once per boot, not on every scan
-    strcpy(reply, "scanning ~25 s, then: fw list. No default region set: region-only relays drop the discovery ('region default <name>')");
+    strcpy(reply, autoscan ? "no scan yet - scanning now, fw list in ~25s; no default region (region default <name>)"   // (rc25, C93 follow-up:
+                           : "scanning - fw list in ~25s; no default region (region default <name>)");               //   were 139 / 120 chars)
   }
+  else if (autoscan)
+    strcpy(reply, "scanning - fw list in ~25s");
   else
-    strcpy(reply, "scanning for peers that offer firmware (direct and through relays) - wait ~25 s, then type: fw list");
+    strcpy(reply, "scanning - fw list in ~25s");
   return true;
 }
 
@@ -2625,7 +2913,7 @@ void FwOtaTransfer::startResolve(const uint8_t* id, uint8_t len, bool bl, char* 
   _resolving = true; _res_scanning = false; _res_scans = 0; _res_interval_ms = 0; _res_next_ms = millis(); _res_msg[0] = 0;
   saveResolve();
   char hex[8]; snprintf(hex, sizeof(hex), "%02X%02X", id[0], id[1]); if (len == 3) snprintf(hex + 4, 4, "%02X", id[2]);
-  snprintf(reply, 160, "OK - looking for %s (scan ~20 s); the %s starts by itself when exactly one node matches ('fw pull-status')",
+  snprintf(reply, 160, "OK - looking for %s (~20 s); %s starts on one match",
            hex, bl ? "bootloader update" : "pull");
 }
 
@@ -2657,7 +2945,7 @@ void FwOtaTransfer::resolveTick(uint32_t now) {
     if (!_bl_probed) armBlServe();
     if (_own_bl_rev && p.fw_version <= _own_bl_rev) {
       clearResolve();
-      snprintf(_res_msg, sizeof(_res_msg), "%s offers bootloader rev %lu, this node runs rev %lu (not newer): nothing done",
+      snprintf(_res_msg, sizeof(_res_msg), "%s: bootloader rev %lu, here rev %lu (not newer)",
                hex, (unsigned long)p.fw_version, (unsigned long)_own_bl_rev);
       _phase = PH_FAILED; _last_err[0] = 0;
       return;
@@ -2707,6 +2995,10 @@ void FwOtaTransfer::onDiscovery(mesh::Packet* pkt, const uint8_t* data, size_t l
     onTime(data + 11, (uint32_t)len - 11, pkt->getPathHashCount()); return;
   }
   if (len >= 5 + 6 + 2 && memcmp(data + 5, FLOOD_CLAIM, 6) == 0) { onClaim(data + 11, (uint32_t)len - 11); return; }   // (study C/D)
+  if (len >= 11 + CAMP_LEN && memcmp(data + 5, FLOOD_CAMP, 6) == 0) {   // (rc25, C95) the push campaign
+    const uint8_t enc = (uint8_t)(((pkt->getPathHashSize() - 1) << 6) | pkt->getPathHashCount());
+    onCamp(data + 11, CAMP_LEN, pkt->getPathHashCount(), pkt->path, enc); return;
+  }
   if (len >= 5 + 6 + 2 + XFER_MAC_LEN && (memcmp(data + 5, FLOOD_RSP, 6) == 0 || memcmp(data + 5, FLOOD_HEAL, 6) == 0
                                         || memcmp(data + 5, FLOOD_ANN, 6) == 0)) {   // (swarm v1) an announcement is a session-0 answer
     // a flooded answer (or heal notice) from a server: its collected path is the way from that server to here
@@ -2724,6 +3016,12 @@ void FwOtaTransfer::onDiscovery(mesh::Packet* pkt, const uint8_t* data, size_t l
   unsigned long sess = 0; unsigned seq = 0; char target[33] = {0}; char fl = 0;
   int nf = sscanf(txt, "LOTA1 %8lx%4x %32s %c", &sess, &seq, target, &fl);
   if (nf < 3) return;
+  if (_camp.set && !_camp.mine) {                        // (rc25) another member looks for the origin or the image: its island pull starts
+    char o8[9]; snprintf(o8, sizeof(o8), "%02X%02X%02X%02X", _camp.origin[0], _camp.origin[1], _camp.origin[2], _camp.origin[3]);
+    uint8_t dg[8];
+    if ((target[0] == '@' && strncasecmp(target + 1, o8, 8) == 0)
+        || (target[0] == '=' && strlen(target) == 17 && hexN(dg, 8, target + 1) && memcmp(dg, _camp.m.sha256, 8) == 0)) _camp_disc_ms = millis() | 1;
+  }
   const bool flood = (nf == 4 && fl == 'F');           // the puller asks for a flooded answer (v1.17.23)
   uint8_t hops = pkt->getPathHashCount();
   uint8_t enc = (uint8_t)(((pkt->getPathHashSize() - 1) << 6) | hops);
@@ -2775,7 +3073,15 @@ void FwOtaTransfer::onListRsp(const uint8_t* b, uint32_t len, int8_t snr4, const
   const uint8_t* sw = nullptr;                                     // (swarm v1) digest, duty, pulls, power
   if (len >= 2 + 4 + 2 + 4 + 4 + 4 + 16 + 1 + 8 + XFER_MAC_LEN) {
     kind = b[36] & 0x7F;
-    if (memcmp(&b[37], g_fwpull_tag.board, 8) != 0) return;     // a server of another board has nothing we could use: not listed
+    if (memcmp(&b[37], g_fwpull_tag.board, 8) != 0) {           // a server of another board has nothing we could use: not listed
+      // (Heltec port) ... and a pull by id aimed at it stops at once with the reason (it used to wait for an answer: "out of reach?")
+      uint8_t tid[4]; char bd[9]; memcpy(bd, &b[37], 8); bd[8] = 0;
+      if (_phase == PH_OFFERING && !_resuming && pullTargetId(tid) && memcmp(tid, id, 4) == 0) {
+        char why[48]; snprintf(why, sizeof(why), "its firmware is for another board (%s)", bd);   // fits _last_err
+        fail(why);
+      }
+      return;
+    }
     if (len >= 46 + XFER_MAC_LEN) {
       rl = b[45];                                                   // encoded route length
       if (!rtValid(rl) || len < 46u + rtBytes(rl) + XFER_MAC_LEN) return;
@@ -2839,7 +3145,18 @@ void FwOtaTransfer::onListRsp(const uint8_t* b, uint32_t len, int8_t snr4, const
     }
     return;
   }
-  if (!holder_ans && (!_scan_active || sess != _scan_sess)) return;
+  bool over = false;
+  if (!holder_ans && (!_scan_active || sess != _scan_sess)) {
+    // (rc22, C71, owner 2026-10-21) an answer to ANOTHER node's scan: keep it (RAM only) so 'fw list' works here at once. The route inside
+    // the answer is that asker's way to the holder, NOT ours: use only what is valid from here - a flooded answer: the reverse of the path
+    // it came by; a direct answer the holder sent itself (route 0 = it answered a zero-hop scan, zero-hop): the holder is our neighbour.
+    // A direct answer that travelled along a route may come from the last relay: not listed (no valid route from here).
+    if (_scan_active || sess == 0 || sess == _session || sess == _disc_sess || !g_tune.keep_overheard) return;
+    if (ret) { rtReverse(rev, ret, ret_enc); rt = rev; rl = ret_enc; }
+    else if (rtCount(rl) == 0) { rt = nullptr; rl = 0; }
+    else return;
+    over = true;
+  }
   PeerInfo* p = nullptr;
   for (uint8_t i = 0; i < MAX_PEERS; i++) if (_peers[i].used && memcmp(_peers[i].id, id, 4) == 0 && _peers[i].kind == kind) { p = &_peers[i]; break; }
   if (p && sw) { memcpy(p->digest, sw, 8); p->sduty = sw[8]; p->spulls = sw[9]; p->spower = sw[10]; p->swarm = true;   // the latest state
@@ -2852,7 +3169,9 @@ void FwOtaTransfer::onListRsp(const uint8_t* b, uint32_t len, int8_t snr4, const
     if (!known && _nholders < SWARM_HOLDERS) { memcpy(_holders[_nholders++], id, 4); saveState(); }
     _last_ans_ms = millis() ? millis() : 1;
   }
+  if (p && over && !p->overheard) return;                        // (rc22, C71) our own scan's entry stays as it is
   if (p) {                                                        // heard again (zero-hop and flooded answers): keep the shortest path
+    if (over) p->heard_ms = millis() | 1;                         // (rc22, C71) fresh again
     if (rtCount(rl) < rtCount(p->route_len)) {
       if (rtBytes(rl)) memcpy(p->route, rt, rtBytes(rl));
       p->route_len = rl; p->has_ret = ret != nullptr; p->ret_len = ret ? ret_enc : 0;
@@ -2864,6 +3183,9 @@ void FwOtaTransfer::onListRsp(const uint8_t* b, uint32_t len, int8_t snr4, const
     return;
   }
   for (uint8_t i = 0; i < MAX_PEERS; i++) if (!_peers[i].used) { p = &_peers[i]; break; }
+  if (!p && over) {                                               // (rc22, C71) table full: an overheard entry replaces only the oldest overheard one
+    for (uint8_t i = 0; i < MAX_PEERS; i++) if (_peers[i].overheard && (!p || (int32_t)(_peers[i].heard_ms - p->heard_ms) < 0)) p = &_peers[i];
+  }
   if (!p && holder_ans) {                                         // (swarm v1) table full: a holder of our image replaces a non-holder
     for (uint8_t i = 0; i < MAX_PEERS && !p; i++) {
       bool is_h = false; for (uint8_t h = 0; h < _nholders; h++) if (memcmp(_holders[h], _peers[i].id, 4) == 0) is_h = true;
@@ -2881,6 +3203,7 @@ void FwOtaTransfer::onListRsp(const uint8_t* b, uint32_t len, int8_t snr4, const
   p->route_len = rl;
   p->has_ret = ret != nullptr; p->ret_len = ret ? ret_enc : 0;
   if (ret && rtBytes(ret_enc)) memcpy(p->ret, ret, rtBytes(ret_enc));
+  if (over) { p->overheard = true; p->heard_ms = millis() | 1; }   // (rc22, C71)
 }
 
 // (swarm v1, owner decisions 8.1/8.2) "fw peers [n]": the circle's IMAGES, newest app first: "#1 fw-295 x3 (0hop) | #2 bl-rev-7 x4 (0hop)".
@@ -2888,9 +3211,11 @@ void FwOtaTransfer::onListRsp(const uint8_t* b, uint32_t len, int8_t snr4, const
 bool FwOtaTransfer::cmdPeers(const char* arg, char* reply) {
   while (*arg == ' ') arg++;
   if (strncmp(arg, "hosts", 5) == 0) return cmdPeersHosts(arg + 5, reply);
-  if (_scan_active) { snprintf(reply, 160, "still scanning (%lu s left)...", (unsigned long)((_scan_end_ms - millis()) / 1000 + 1)); return true; }
+  if (_scan_active) { snprintf(reply, 160, "scanning (%lus left)", (unsigned long)((_scan_end_ms - millis()) / 1000 + 1)); return true; }
+  pruneOverheard(millis());                              // (rc22, C71)
   ImgInfo im[MAX_PEERS]; const int n = imageList(im, MAX_PEERS);
-  if (!n) { strcpy(reply, _scanned ? "the last scan found no firmware in your circle ('fw peers' scans again)" : "no scan yet - 'fw peers' scans ~25 s"); return true; }   // (rc17, C38) nothing sent
+  if (!n && !_scanned) return scanCmd(reply, true);     // (rc22, C70) the first 'fw list' scans by itself
+  if (!n) { strcpy(reply, "no peers with firmware"); return true; }   // (rc17, C38) nothing sent
   int from = atoi(arg); if (from < 1) from = 1;
   if (from > n) { snprintf(reply, 160, "no image #%d (%d found)", from, n); return true; }
   size_t l = 0; reply[0] = 0; int next = 0;
@@ -2906,7 +3231,13 @@ bool FwOtaTransfer::cmdPeers(const char* arg, char* reply) {
     memcpy(reply + l, e, (size_t)w); l += (size_t)w; reply[l] = 0;
   }
   static const char HINT[] = " | holders: 'fw list hosts'";
+  const uint32_t oa = overheardAgeS(millis());
   if (next) snprintf(reply + l, 160 - l, " | ...'fw list %d'", next);
+  else if (oa) {                                         // (rc22, C71) heard from another node's scan: say how old ('fw peers' asks again)
+    char ago[16], note[56]; agoText(oa, ago, sizeof(ago));
+    snprintf(note, sizeof(note), " (heard %s ago)", ago);
+    if (l + strlen(note) < 159) strcpy(reply + l, note);
+  }
   else if (l + sizeof(HINT) < 158) memcpy(reply + l, HINT, sizeof(HINT));    // (C31) only when it fits whole, with margin (it was cut at 160 B)
   return true;
 }
@@ -2915,12 +3246,14 @@ bool FwOtaTransfer::cmdPeersHosts(const char* arg, char* reply) {
   // "fw peers hosts [n]" (v1.17.23: one block per host): "AABBCCDD NAME -37dBm snr12.75 [2hop] #1 fw-210 #2 bl-rev-3 | next host ...". The #n numbers
   // are the same as before (every offer in table order), so 'fw pull #n' / 'fw blupdate #n' are unchanged. A page never splits a host and never
   // drops an entry: what does not fit opens the next page, which the reply names (lesson of v1.17.18: #3 used to vanish between pages).
-  if (_scan_active) { snprintf(reply, 160, "still scanning (%lu s left)...", (unsigned long)((_scan_end_ms - millis()) / 1000 + 1)); return true; }
+  if (_scan_active) { snprintf(reply, 160, "scanning (%lus left)", (unsigned long)((_scan_end_ms - millis()) / 1000 + 1)); return true; }
   while (*arg == ' ') arg++;
   int from = atoi(arg); if (from < 1) from = 1;
+  pruneOverheard(millis());                                    // (rc22, C71)
   uint8_t num[MAX_PEERS] = {0}, total = 0;                     // #n of each table entry
   for (uint8_t i = 0; i < MAX_PEERS; i++) if (_peers[i].used) num[i] = ++total;
-  if (!total) { strcpy(reply, _scanned ? "the last scan found no peers offering firmware ('fw peers' scans again)" : "no scan yet - 'fw peers' scans ~25 s"); return true; }
+  if (!total && !_scanned) return scanCmd(reply, true);  // (rc22, C70)
+  if (!total) { strcpy(reply, "no peers with firmware"); return true; }
   if (from > total) { snprintf(reply, 160, "no peer #%d (%u found)", from, (unsigned)total); return true; }
   // hosts in order of their first offer; the page starts at the host that holds #from
   int8_t host_of[MAX_PEERS]; uint8_t hosts[MAX_PEERS], nh = 0;   // host_of[i] = index into hosts[] ; hosts[h] = table index of the host's first offer
@@ -2996,7 +3329,7 @@ bool FwOtaTransfer::cmdRoute(const char* arg, char* reply) {
   if (strcmp(arg, "auto") == 0) {
     _route_manual = false; if (_ret_typed) _ret_typed = false; _typed_failed = false;
     if (!in_pull) routeReset();
-    strcpy(reply, "route: automatic (discovered route pairs, failover on unanswered requests, heal of the way back)");
+    strcpy(reply, "route: auto");
     return true;
   }
   if (strcmp(arg, "off") == 0) { _route_len = 0; _route_manual = false; setRet(nullptr, 0, false); routeUse(routeAdd(_route, 0)); if (in_pull) saveState(); }
@@ -3006,7 +3339,7 @@ bool FwOtaTransfer::cmdRoute(const char* arg, char* reply) {
     uint8_t tmp[MAX_ROUTE_BYTES], enc = 0, rtmp[MAX_ROUTE_BYTES], renc = 0;
     bool ok = parseHops(arg, sl ? sl : end, tmp, &enc);
     if (ok && sl) { const char* r = sl + 1; ok = (r < end) && (strncmp(r, "direct", 6) == 0 ? (renc = 0, r + 6 == end) : parseHops(r, end, rtmp, &renc)); }
-    if (!ok) { snprintf(reply, 160, "ERR - usage: fw route AA[,BB..] | AABB[,..] | AABBCC[,..] [/<way back>] (relay hashes, max %u) | auto | off", (unsigned)MAX_HOPS); return true; }
+    if (!ok) { snprintf(reply, 160, "ERR - usage: fw route AA[,BB..][/back]|auto|off (max %u)", (unsigned)MAX_HOPS); return true; }
     int ri = routeAdd(tmp, enc, sl ? rtmp : nullptr, renc);
     if (ri < 0) { strcpy(reply, "ERR - route table full"); return true; }
     routeUse(ri); _route_manual = true; _ret_typed = sl != nullptr; _typed_failed = false;
@@ -3025,7 +3358,7 @@ bool FwOtaTransfer::cmdRoute(const char* arg, char* reply) {
     if (l < 150) l += (size_t)snprintf(reply + l, 160 - l, " %u/%u", (unsigned)r.ok, (unsigned)r.fail);
     if (r.rtt_ms && l < 150) l += (size_t)snprintf(reply + l, 160 - l, " %ums", (unsigned)r.rtt_ms);
   }
-  if (!any) l += (size_t)snprintf(reply + l, 160 - l, " direct (no pull yet; a listed peer's discovered route is used automatically)");
+  if (!any) l += (size_t)snprintf(reply + l, 160 - l, " direct (no pull yet)");
   if (_sw_why && l < 118) {                               // (rc20, C48) the last holder change of the pull, when it fits (37 B)
     static const char* const WHY[] = { "", "silent", "faster", "back", "nearer" };
     char ago[16]; agoText(since(millis(), _sw_ms) / 1000, ago, sizeof(ago));
@@ -3036,11 +3369,15 @@ bool FwOtaTransfer::cmdRoute(const char* arg, char* reply) {
 
 // "fw pull <id|#n>" / "fw blupdate [force] <id|#n>"
 bool FwOtaTransfer::cmdPullPeer(const char* args, char* reply, bool bl) {
-  if (!_circle_set) { strcpy(reply, "ERR - set 'fw passphrase <phrase>' first (the same on every node of your circle)"); return true; }
+#if defined(ESP32)
+  if (bl) { strcpy(reply, "ERR - no LoRa-OTA bootloader here"); return true; }
+#endif
+  if (!_circle_set) { strcpy(reply, "ERR - no passphrase"); return true; }
+  _camp.island = 0;                                      // (rc25) a pull the user starts installs as before (campTick sets it for its own)
   // During a pull the same command SWITCHES the source (checked below, once the peer is known): the chunks are kept when the new server
   // offers the identical image. That is how a pull survives a server that went away for good.
   const bool in_pull = (_phase == PH_DOWNLOADING || _phase == PH_OFFERING) && !_fill_paused;   // (rc19) a paused fill gives way to a new pull
-  if (in_pull && (_man.kind == KIND_BOOTLOADER) != bl) { strcpy(reply, "ERR - a pull of the other kind is in progress ('fw pull-abort' to cancel)"); return true; }
+  if (in_pull && (_man.kind == KIND_BOOTLOADER) != bl) { statusLine(reply); return true; }
   while (*args == ' ') args++;
   _bl_force = false;
   if (bl && strncmp(args, "force ", 6) == 0) { _bl_force = true; args += 6; while (*args == ' ') args++; }
@@ -3051,22 +3388,28 @@ bool FwOtaTransfer::cmdPullPeer(const char* args, char* reply, bool bl) {
   int idx = -1;
   // (swarm v1) '#n' = image n of 'fw peers'; 'fw-295' / 'bl-rev-7' = that version: the BEST HOLDER is chosen (fair share, relays, SNR,
   // power) and the other holders are kept for failover
+  pruneOverheard(millis());                              // (rc22, C71) an entry older than 24 h is not pulled from
   int img = -1; ImgInfo im[MAX_PEERS]; const int ni = imageList(im, MAX_PEERS);
+  // (owner 2026-11-04) during a pull, 'fw pull fw-124' (another version) - listed or not - only shows what runs: nothing is changed
+  if (in_pull && (strncasecmp(tok, "fw-", 3) == 0 || strncasecmp(tok, "bl-rev-", 7) == 0)) {
+    const uint32_t v = (uint32_t)strtoul(tok + (strncasecmp(tok, "bl-rev-", 7) == 0 ? 7 : 3), nullptr, 10);
+    if (pullVer() && v != pullVer()) { statusLine(reply); return true; }
+  }
   if (tok[0] == '#' || (tl <= 2 && tok[0] >= '0' && tok[0] <= '9')) {
     const int want = atoi(tok[0] == '#' ? tok + 1 : tok);
-    if (want < 1 || want > ni) { snprintf(reply, 160, "ERR - no image #%d ('fw peers', then 'fw list')", want); return true; }
+    if (want < 1 || want > ni) { snprintf(reply, 160, "ERR - no image #%d (fw peers)", want); return true; }
     img = want - 1;
   } else if (strncasecmp(tok, "fw-", 3) == 0 || strncasecmp(tok, "bl-rev-", 7) == 0) {
     const bool want_bl = strncasecmp(tok, "bl-rev-", 7) == 0; const uint32_t v = (uint32_t)strtoul(tok + (want_bl ? 7 : 3), nullptr, 10);
     int hits = 0;
     for (int k = 0; k < ni; k++) if ((im[k].kind == KIND_BOOTLOADER) == want_bl && im[k].ver == v) { if (!hits) img = k; hits++; }
-    if (!hits) { snprintf(reply, 160, "ERR - nobody in your circle offers %s ('fw peers', then 'fw list')", tok); return true; }
-    if (hits > 1) { snprintf(reply, 160, "ERR - two different builds are called %s: pick one by #n ('fw list')", tok); return true; }
+    if (!hits) { snprintf(reply, 160, "ERR - nobody offers %s (fw peers)", tok); return true; }
+    if (hits > 1) { snprintf(reply, 160, "ERR - 2 builds named %s: use #n", tok); return true; }
   }
   if (img >= 0) {
     if ((im[img].kind == KIND_BOOTLOADER) != bl) { strcpy(reply, bl ? "ERR - that is an app image: use 'fw pull'" : "ERR - that is a bootloader image: use 'fw blupdate'"); return true; }
     idx = bestHolder(im[img].kind, im[img].ver, im[img].swarm ? im[img].digest : nullptr, nullptr, 0);
-    if (idx < 0) { strcpy(reply, "ERR - every holder of that image is on a CRITICAL battery - try later"); return true; }
+    if (idx < 0) { strcpy(reply, "ERR - all holders on CRITICAL battery"); return true; }
     if (!in_pull) {                                       // a new pull by image: the image and up to 4 holders, best first
       _img_set = im[img].swarm; _img_kind = im[img].kind; _img_ver = im[img].ver; memcpy(_img_digest, im[img].digest, 8);
       _nholders = 0; _holders_tried = 0;
@@ -3086,7 +3429,7 @@ bool FwOtaTransfer::cmdPullPeer(const char* args, char* reply, bool bl) {
         if (ll + 30 < sizeof(list)) ll += (size_t)snprintf(list + ll, sizeof(list) - ll, "%s%s %.12s", ll ? ", " : "", hx, _peers[i].name);
       }
     }
-    if (hits > 1) { snprintf(reply, 160, "ERR - %d peers match %s: %s - give more of the id (or #n)", hits, tok, list); return true; }   // collision: refuse
+    if (hits > 1) { snprintf(reply, 160, "ERR - %d peers match %s: %s", hits, tok, list); return true; }   // collision: refuse
   }
   if (idx < 0 && tl >= 3) {         // by node name (prefix, case-insensitive), as listed by fw peers
     for (uint8_t i = 0; i < MAX_PEERS; i++)
@@ -3094,7 +3437,7 @@ bool FwOtaTransfer::cmdPullPeer(const char* args, char* reply, bool bl) {
   }
   if (idx < 0 && tl == 8) {         // a full 8-hex id that fw list could not see (e.g. behind relays): pull from it directly
     uint8_t id[4];
-    if (bl && !_route_len) { strcpy(reply, "ERR - a bootloader update needs a compatible offer in reach: run 'fw peers' first (behind relays: 'fw route ..' then the full 8-hex id)"); return true; }
+    if (bl && !_route_len) { strcpy(reply, "ERR - no bootloader offer in reach (fw peers)"); return true; }
     if (hexN(id, 4, tok)) {                              // (v1.17.28) hexN: Utils::fromHex() takes 'status' for 00A000
       for (uint8_t i = 0; i < MAX_PEERS && idx < 0; i++) if (!_peers[i].used) idx = i;
       if (idx < 0) idx = MAX_PEERS - 1;
@@ -3108,9 +3451,32 @@ bool FwOtaTransfer::cmdPullPeer(const char* args, char* reply, bool bl) {
       startResolve(sid, tl / 2, bl, reply); return true;
     }
   }
-  if (idx < 0) { strcpy(reply, "ERR - unknown peer: 'fw peers' first, or give 2/3 bytes of its id (AABB / AABBCC) or the full 8-hex id"); return true; }
+  if (idx < 0) { strcpy(reply, "ERR - unknown peer (fw peers)"); return true; }
   if (img < 0 && !in_pull) { _img_set = false; _nholders = 0; }   // (swarm v1) a pull from one named host: no holder failover
   const PeerInfo& p = _peers[idx];
+  if ((p.kind == KIND_BOOTLOADER) != bl) {
+    strcpy(reply, bl ? "ERR - that peer offers firmware, not a bootloader: use 'fw pull'" : "ERR - that is a bootloader offer: use 'fw blupdate'");
+    return true;
+  }
+  if (in_pull) {                                          // source switch pre-flight: must be the same image version, and another server
+    char want[16]; snprintf(want, sizeof(want), "@%02X%02X%02X%02X%s", p.id[0], p.id[1], p.id[2], p.id[3], bl ? "!" : "");
+    const uint32_t cur_ver = pullVer();
+    if (strcmp(want, _man.name) == 0) {                  // (T9/C55) a retry whose first reply was lost: say what runs, not an error
+      statusLine(reply);
+      return true;
+    }
+    if (cur_ver && strcmp(p.name, "(not listed)") == 0) { strcpy(reply, "ERR - to switch, pick from fw list"); return true; }
+    if (cur_ver && p.fw_version != cur_ver) { statusLine(reply); return true; }   // (owner 2026-11-04) another image: show what runs
+  }
+  if (bl && !in_pull) {                                   // pre-flight: nothing is touched unless this offer is one we may take
+    if (!_bl_probed) armBlServe();                        // learns the running bootloader's revision
+    if (!_bl_force && _own_bl_rev && p.fw_version <= _own_bl_rev) {
+      snprintf(reply, 160, "ERR - bootloader rev %lu, offer rev %lu (force?)",
+               (unsigned long)_own_bl_rev, (unsigned long)p.fw_version);
+      return true;
+    }
+  }
+  // (2026-11-04) moved here from before the pre-flight checks: a refused 'fw pull' replaced the RUNNING pull's route
   if (in_pull && !_switching) {
     memcpy(_switch_prev_route, _route, sizeof(_switch_prev_route)); _switch_prev_route_len = _route_len;
     memcpy(_switch_prev_ret, _ret, sizeof(_switch_prev_ret)); _switch_prev_ret_len = _ret_len; _switch_prev_ret_set = _ret_set;
@@ -3119,29 +3485,7 @@ bool FwOtaTransfer::cmdPullPeer(const char* args, char* reply, bool bl) {
     if (rtBytes(p.route_len)) memcpy(_route, p.route, rtBytes(p.route_len));
     _route_len = p.route_len; setRet(p.has_ret ? p.ret : nullptr, p.ret_len, false);
   }
-  if ((p.kind == KIND_BOOTLOADER) != bl) {
-    strcpy(reply, bl ? "ERR - that peer offers firmware, not a bootloader: use 'fw pull'" : "ERR - that is a bootloader offer: use 'fw blupdate'");
-    return true;
-  }
-  if (in_pull) {                                          // source switch pre-flight: must be the same image version, and another server
-    char want[16]; snprintf(want, sizeof(want), "@%02X%02X%02X%02X%s", p.id[0], p.id[1], p.id[2], p.id[3], bl ? "!" : "");
-    const uint32_t cur_ver = _man.fw_version ? _man.fw_version : _saved_man.fw_version;
-    if (strcmp(want, _man.name) == 0) { strcpy(reply, "ERR - that is the server this pull already uses ('fw pull-status')"); return true; }
-    if (cur_ver && strcmp(p.name, "(not listed)") == 0) { strcpy(reply, "ERR - to switch, pick the new server from 'fw peers' / 'fw list' (its version is checked first)"); return true; }
-    if (cur_ver && p.fw_version != cur_ver) {
-      snprintf(reply, 160, "ERR - that peer offers %s-%lu, this pull is %s-%lu: not the same image ('fw pull-abort' to start over)",
-               bl ? "rev" : "fw", (unsigned long)p.fw_version, bl ? "rev" : "fw", (unsigned long)cur_ver);
-      return true;
-    }
-  }
-  if (bl && !in_pull) {                                   // pre-flight: nothing is touched unless this offer is one we may take
-    if (!_bl_probed) armBlServe();                        // learns the running bootloader's revision
-    if (!_bl_force && _own_bl_rev && p.fw_version <= _own_bl_rev) {
-      snprintf(reply, 160, "ERR - this node already runs bootloader rev %lu; the offer is rev %lu (not newer). 'fw blupdate force ..' overrides",
-               (unsigned long)_own_bl_rev, (unsigned long)p.fw_version);
-      return true;
-    }
-  }
+
   // a word typed after the id (an old habit: the admin password of v1.17.27 and older) is ignored
   char target[16]; snprintf(target, sizeof(target), "@%02X%02X%02X%02X%s", p.id[0], p.id[1], p.id[2], p.id[3], bl ? "!" : "");
   if (in_pull) { switchSource(target, reply); return true; }
@@ -3183,7 +3527,7 @@ void FwOtaTransfer::switchSource(const char* target, char* reply) {
   _phase = PH_OFFERING;
   strncpy(_last_err, "switching source", sizeof(_last_err) - 1);
   saveState();
-  snprintf(reply, 160, "OK - switching the pull to %s: %lu/%lu chunks are kept if it serves the same image ('fw pull-status')",
+  snprintf(reply, 160, "OK - switching to %s (%lu/%lu kept if same image)",
            target, (unsigned long)_cm.have, (unsigned long)_saved_man.n_chunks);
 }
 
@@ -3238,16 +3582,17 @@ void FwOtaTransfer::onTime(const uint8_t* b, uint32_t len, uint8_t hops) {
   if (d < -CLK_BOUND_S || (_clk_synced && d > CLK_BOUND_S)) { _clk_refused++; return; }   // a peer far off: not taken
   _clk_synced = true; _clk_n++;
   _clk_how = d >= CLK_STEP_MIN_S ? 1 : d <= -CLK_HOLD_MIN_S ? 2 : 0;
-  if (d >= CLK_STEP_MIN_S || d <= -CLK_HOLD_MIN_S) _flood_host->clockDiscipline(ref);
+  // (C76) a found but unset chip always gets the time (the host writes it to the chip: it then keeps it across power cuts and answers)
+  if (d >= CLK_STEP_MIN_S || d <= -CLK_HOLD_MIN_S || _flood_host->clockChipFound()) _flood_host->clockDiscipline(ref);
 }
 
 bool FwOtaTransfer::cmdTime(const char* arg, char* reply) {
   while (*arg == ' ') arg++;
   const bool rtc = _flood_host && _flood_host->clockSource();
   if (!strcmp(arg, "ask")) {
-    if (!_circle_set) strcpy(reply, "ERR - set 'fw passphrase <phrase>' first: the time comes from your circle");
-    else if (rtc) strcpy(reply, "OK - this node has a valid RTC: it answers time requests, it does not ask");
-    else { _tq_next_ms = millis() | 1; _tq_tries = 3; strcpy(reply, "OK - asking the neighbours with an RTC for the time: 'fw time' in ~10 s"); }
+    if (!_circle_set) strcpy(reply, "ERR - no passphrase");
+    else if (rtc) strcpy(reply, "OK - has an RTC (answers, does not ask)");
+    else { _tq_next_ms = millis() | 1; _tq_tries = 3; strcpy(reply, "OK - asking; fw time in ~10 s"); }
     return true;
   }
   if (*arg) { strcpy(reply, "usage: fw time [ask]"); return true; }
@@ -3257,12 +3602,14 @@ bool FwOtaTransfer::cmdTime(const char* arg, char* reply) {
   uint32_t dd = doy - (153 * mp + 2) / 5 + 1, mm = mp < 10 ? mp + 3 : mp - 9, yy = yoe + era * 400 + (mm <= 2);
   int l = snprintf(reply, 160, "%02lu:%02lu:%02lu %lu/%lu/%lu UTC | ", (unsigned long)(t % 86400 / 3600), (unsigned long)(t % 3600 / 60),
                    (unsigned long)(t % 60), (unsigned long)dd, (unsigned long)mm, (unsigned long)yy);
-  if (rtc) snprintf(reply + l, 160 - l, "RTC chip: answers neighbours' requests (sent %u, dropped %u)", _ta_sent, _ta_supp);
-  else if (!_circle_set) snprintf(reply + l, 160 - l, "no RTC; no circle: no swarm time");
-  else if (!_clk_at_ms) snprintf(reply + l, 160 - l, "no RTC: no swarm time yet (asked %u times)", _tq_tries);
+  // (C76) a chip that answers but holds no valid time (new / lost power) is not "no RTC": it takes the swarm time ('clock sync' sets it too)
+  const char* nr = _flood_host && _flood_host->clockChipFound() ? "RTC chip found, not set" : "no RTC";
+  if (rtc) snprintf(reply + l, 160 - l, "RTC chip: answers (sent %u, dropped %u)", _ta_sent, _ta_supp);
+  else if (!_circle_set) snprintf(reply + l, 160 - l, "%s; no circle: no swarm time ('clock sync' sets it)", nr);
+  else if (!_clk_at_ms) snprintf(reply + l, 160 - l, "%s: no swarm time yet (asked %u times)", nr, _tq_tries);
   else {
     const int32_t d = _clk_delta; const uint32_t ago = (millis() - _clk_at_ms) / 60000;
-    snprintf(reply + l, 160 - l, "no RTC: from %02X%02X%02X%02X %lum ago, %+ld s (%s) | next ask in %lum", _clk_from[0], _clk_from[1], _clk_from[2],
+    snprintf(reply + l, 160 - l, "%s: from %02X%02X%02X%02X %lum ago, %+ld s (%s) | next ask in %lum", nr, _clk_from[0], _clk_from[1], _clk_from[2],
              _clk_from[3], (unsigned long)ago, (long)d,
              _clk_how == 3 ? "refused: > 1 h" : _clk_how == 1 ? "stepped" : _clk_how == 2 ? "held" : "in step",
              (unsigned long)(_tq_next_ms && (int32_t)(_tq_next_ms - millis()) > 0 ? (_tq_next_ms - millis()) / 60000 : 0));
@@ -3276,7 +3623,7 @@ bool FwOtaTransfer::cmdWdt(const char* arg, char* reply) {
 #ifdef FW_OTA_DEV
   else if (strcmp(arg, "hang") == 0) {
     _wdt_hang_at = millis() + 3000;
-    snprintf(reply, 160, "OK - the loop freezes in 3 s; the watchdog must restart the node within %s ('fw wdt' afterwards: last reset watchdog)",
+    snprintf(reply, 160, "OK - loop freezes in 3 s (wdt test, %s)",
              g_wdt.runningText());
     return true;
   }
@@ -3284,11 +3631,11 @@ bool FwOtaTransfer::cmdWdt(const char* arg, char* reply) {
   else if (*arg) { strcpy(reply, "usage: fw wdt [clear]"); return true; }
   if (g_wdt.draining()) {                                 // (rc10, C27) another firmware's timeout is running out
     char ours[12]; Watchdog::secsText(FW_OTA_WDT_SECS, ours);
-    snprintf(reply, 160, "watchdog switching %s -> %s: one planned restart within %s (old timeout running out) | last reset: %s | watchdog resets: %u",
+    snprintf(reply, 160, "wdt %s->%s: 1 restart within %s | last reset %s | wdt resets %u",
              g_wdt.runningText(), ours, g_wdt.runningText(), g_wdt.lastResetText(), (unsigned)_wdt_resets);
     return true;
   }
-  snprintf(reply, 160, "watchdog %s, %s, fed from the main loop | last reset: %s%s | watchdog resets: %u ('fw wdt clear')",
+  snprintf(reply, 160, "wdt %s, %s | last reset %s%s | wdt resets %u",
            g_wdt.armed() ? "armed" : "NOT armed", g_wdt.runningText(), g_wdt.lastResetText(), _wdt_planned ? " (planned: timeout change)" : "",
            (unsigned)_wdt_resets);
   return true;
@@ -3298,11 +3645,12 @@ bool FwOtaTransfer::cmdAutoApply(const char* arg, char* reply) {
   while (*arg == ' ') arg++;
   if (strcmp(arg, "off") == 0) {
     _noapply = true; _apply_armed = false;
-    if (_fs) { _fs->remove(NOAPPLY_FILE); File f = _fs->open(NOAPPLY_FILE, FILE_O_WRITE); if (f) { f.write((const uint8_t*)"1", 1); f.close(); } }
+    if (_fs) { _fs->remove(APPLY_FILE); _fs->remove(NOAPPLY_FILE); File f = _fs->open(NOAPPLY_FILE, FILE_O_WRITE); if (f) { f.write((const uint8_t*)"1", 1); f.close(); } }
   } else if (strcmp(arg, "on") == 0) {
-    _noapply = false; if (_fs) _fs->remove(NOAPPLY_FILE);
+    _noapply = false;
+    if (_fs) { _fs->remove(NOAPPLY_FILE); _fs->remove(APPLY_FILE); File f = _fs->open(APPLY_FILE, FILE_O_WRITE); if (f) { f.write((const uint8_t*)"1", 1); f.close(); } }   // (rc22, C65) an explicit choice
   }
-  snprintf(reply, 160, "auto-apply after a verified pull: %s ('fw autoapply on|off')", _noapply ? "OFF" : "on");
+  snprintf(reply, 160, "autoapply %s", _noapply ? "OFF" : "on");
   return true;
 }
 
@@ -3328,6 +3676,15 @@ uint32_t FwOtaTransfer::holderScore(const PeerInfo& p) const {
 
 // The images of the circle from the peer table (one entry per kind + version + digest; holders of older firmware without a digest count
 // by version), newest app first, then bootloaders - owner decision 8.2 (Z to A). best = the holder with the best expected rate.
+void FwOtaTransfer::pruneOverheard(uint32_t now) {
+  for (uint8_t i = 0; i < MAX_PEERS; i++) if (_peers[i].used && _peers[i].overheard && now - _peers[i].heard_ms > OVERHEARD_MAX_MS) _peers[i].used = false;
+}
+uint32_t FwOtaTransfer::overheardAgeS(uint32_t now) const {
+  uint32_t a = 0;
+  for (uint8_t i = 0; i < MAX_PEERS; i++) if (_peers[i].used && _peers[i].overheard) { uint32_t s2 = (now - _peers[i].heard_ms) / 1000; if (s2 > a) a = s2; if (!a) a = 1; }
+  return a;
+}
+
 int FwOtaTransfer::imageList(ImgInfo* out, int cap) const {
   int n = 0;
   for (uint8_t i = 0; i < MAX_PEERS; i++) {
@@ -3547,7 +3904,9 @@ void FwOtaTransfer::pendAnsTick(uint32_t now) {
 // [24..27]raw_crc32 [28..29]compression [30..31]n_chunks [32..63]sha256 [64..68]lzma props [69..76]board [77..80]server id [81..82]seq
 // [83..84]the requester's chunks (= n_chunks: its stream is done) [85..88]the requester's id [mac]
 static const uint32_t FANN_LEN = 89 + XFER_MAC_LEN;
-static const uint32_t FANN_ALIVE_MS = 3 * FANN_IVL_MS + 60000;   // a requester not heard for 16 min (3 announces lost) has stopped or died ...
+static const uint32_t FANN_ALIVE_MS = 5 * FANN_IVL_MS + 60000;   // a requester not heard for 26 min (5 announces lost) has stopped or died ...
+                                                                 // (rc23, C91) was 3: a listener hears the requester only through the server's one
+                                                                 // zero-hop echo; 3 lost in a row made it ask ahead of a running stream (H3: 31 %)
 static const uint32_t STREAM_DEAD_MS = 180000;                   // ... and so has a stream with no chunk of it heard for 3 min
 static const uint16_t GAP_BEHIND = 16;                           // (rc19, C44) gaps this far behind the stream's top are its own: asked for
 
@@ -3626,7 +3985,7 @@ void FwOtaTransfer::onFleetAnn(const uint8_t* b, uint32_t len) {
     // them from the first offer) made rc18's listeners think the stream was done - they left it and asked for the chunks ahead of it
     // (C42) whose stream we follow, its mode. Never a LOWER mode: a neighbour that went on to pull the image along its path announces mode 1,
     // and that made a fleet fill passive (it paused when that pull ended: T3/T4 sims). Only the fleet's cancel makes it passive
-    if (!hann && (!_fill || mode >= _fill_mode)) { _fann_heard_ms = millis() | 1; _fann_have = rhave; memcpy(_fann_req, &b[85], 4); if (_fill) _fill_mode = mode; }
+    if (!hann && (!_fill || mode >= _fill_mode)) { _fill_h = false; _fann_heard_ms = millis() | 1; _fann_have = rhave; memcpy(_fann_req, &b[85], 4); if (_fill) _fill_mode = mode; }
     if (g_tune.algo == ALGO_E && _gap_phase && rhave > _cm.have) {   // (study E) a holder near us: ask it now
       _gap_dry = 0; _e_wait = false; _e_prog_ms = millis() | 1; _gapr_at_ms = millis() + (uint32_t)_mesh->getRNG()->nextInt(0, GAP_SPREAD_MS);
     }
@@ -3639,7 +3998,10 @@ void FwOtaTransfer::onFleetAnn(const uint8_t* b, uint32_t len) {
   _fc.set = true; _fc.m = m; memcpy(_fc.server, &b[77], 4); _fc.mode = mode; _fc.have = rhave; if (fresh) _fc.ms = millis() | 1;
   memcpy(_fc.origin, hann ? &b[85] : &b[77], 4); memcpy(_fc.req, &b[85], 4);
   const uint32_t now = millis();                          // its stream is on the air already: start now (else at its next chunk)
-  if (_heard_tag_ms && since(now, _heard_tag_ms) < STREAM_T_MIN_MS && memcmp(_heard_tag, m.sha256, 4) == 0) startFill();
+  if (_heard_tag_ms && since(now, _heard_tag_ms) < STREAM_T_MIN_MS && memcmp(_heard_tag, m.sha256, 4) == 0) {
+    if (hann) _fc.have = 0;                              // (rc23, C91) a holder's announce says nothing of the stream's requester: not done
+    startFill();
+  }
   else if (g_tune.algo == ALGO_E && g_tune.e_spread && rhave >= m.n_chunks && (hann || memcmp(&b[77], &b[85], 4) == 0)) startFill();   // (study E) a holder:
 }                                                         //   no stream will come - fill from it by gap rounds
 
@@ -3654,6 +4016,7 @@ void FwOtaTransfer::startFill() {
   memcpy(_holders[0], _fc.server, 4); _nholders = 1; _holders_tried = 0;
   memcpy(_origin, _fc.origin, 4); memcpy(_origin_tag, _man.sha256, 4);
   _fill = true; _fill_mode = _fc.mode; _fc.set = false; stats.fills++; memcpy(_fann_req, _fc.req, 4); _fill_paused = false; _strm_top = 0; _fann_heard_ms = now | 1; _fann_have = _fc.have; _img_heard_ms = now | 1;
+  _fill_h = _fc.have >= _fc.m.n_chunks; _strm_top_ms = 0;   // (rc23, C91) begun from a holder's announce: no requester known yet
   useImgKeys(_man.sha256);
   eraseSlotHeader();
   _cm.reset(_man.n_chunks); _erased = false; _erase_next = 0;
@@ -3736,7 +4099,10 @@ void FwOtaTransfer::gapTick(uint32_t now) {
   // 739 repairs for 1766 chunks). Nothing behind it = wait, not a dry round (no escalation while the requester pulls)
   // (rc20 study: C50 - gaps behind the stream for 30 min of requester silence - and C53 - its stream as a sign of life - cut the bench's
   // repairs but made the valley 67 % slower with 14 % more air: the listeners' early repairs are what spreads the image hop by hop. Not built)
-  const bool live = _fann_heard_ms && since(now, _fann_heard_ms) < FANN_ALIVE_MS && _fann_have < _man.n_chunks;
+  // (rc23, C91) a stream that still moves on keeps its requester alive (its announces lost) - bounded by the passive hour. Its study (test
+  // host, H3 x100 + T1-T4 valley): together with FANN_ALIVE_MS 5 and the holder-begun fill fix, failing runs 31 -> 7 %, same air
+  const bool live = _fann_heard_ms && _fann_have < _man.n_chunks && (since(now, _fann_heard_ms) < FANN_ALIVE_MS
+      || (since(now, _fann_heard_ms) < PASSIVE_QUIET_MS && _strm_top_ms && since(now, _strm_top_ms) < STREAM_DEAD_MS));
   const uint16_t lim = !live ? (uint16_t)_cm.n : _strm_top > GAP_BEHIND ? (uint16_t)(_strm_top - GAP_BEHIND) : 0;
   if (_cm.firstMissing() >= lim) { _gap_round = 0; _gap_dry = 0; _gapr_at_ms = now + g_tune.gap_round_ms; return; }
   if (_gap_round) { if (_cm.have == _gap_have0) _gap_dry++; else { _gap_dry = 0; _e_prog_ms = now | 1; } }
@@ -3872,15 +4238,15 @@ bool FwOtaTransfer::cmdMinBatt(const char* arg, char* reply) {
   while (*arg == ' ') arg++;
   if (*arg) {
     long v = strcmp(arg, "off") == 0 ? 0 : strtol(arg, nullptr, 10);
-    if (v && (v < 2500 || v > 4500)) { strcpy(reply, "usage: fw minbatt <2500-4500 mV>|off - below = LOW holder (taken last), 150 mV below = CRITICAL (no serving)"); return true; }
+    if (v && (v < 2500 || v > 4500)) { strcpy(reply, "usage: fw minbatt <2500-4500>|off"); return true; }
     _minbatt_mv = (uint16_t)v;
     if (_fs) { _fs->remove(MINBATT_FILE); if (v) { File f = _fs->open(MINBATT_FILE, FILE_O_WRITE); if (f) { f.write((const uint8_t*)&_minbatt_mv, 2); f.close(); } } }
   }
-  static const char* const PS[] = { "unknown", "OK", "LOW", "CRITICAL" };
+  static const char* const PSTXT[] = { "unknown", "OK", "LOW", "CRITICAL" };   // (Heltec port) not "PS": an Xtensa register macro
   char bv[24]; if (_batt_mv) snprintf(bv, sizeof(bv), "%u mV", (unsigned)_batt_mv); else strcpy(bv, "not measured yet");
-  if (!_minbatt_mv) snprintf(reply, 160, "minbatt off (power state unknown = ranked like OK) | battery %s", bv);
-  else snprintf(reply, 160, "minbatt %u mV | battery %s: %s (LOW = taken last as a holder, CRITICAL = no serving below %u mV)",
-                (unsigned)_minbatt_mv, bv, PS[powerState()], (unsigned)(_minbatt_mv - POWER_CRIT_MV));
+  if (!_minbatt_mv) snprintf(reply, 160, "minbatt off | batt %s", bv);
+  else snprintf(reply, 160, "minbatt %u mV | batt %s: %s",
+                (unsigned)_minbatt_mv, bv, PSTXT[powerState()]);
   return true;
 }
 
@@ -3956,7 +4322,8 @@ void FwOtaTransfer::trickleTick(uint32_t now) {
   if (g_tune.algo != ALGO_E) return;
   const bool missing = _phase == PH_DOWNLOADING && _erased && _man.kind == KIND_APP && _gap_phase;
   const bool spread = memcmp(_spread_tag, _serve_man.sha256, 4) == 0;   // (rc19, C42) a fleet image: the 48 h window; another one fades in an hour
-  const bool holder = _serving && _tr_inc_ms && since(now, _tr_inc_ms) < (spread ? g_tune.gossip_life_ms : PASSIVE_QUIET_MS) && memcmp(_serve_man.sha256, _tr_tag, 4) == 0;
+  const bool camp = spread && campOn() && campImg(_serve_man.sha256);   // (rc25, C95) a push campaign's image: gossiped for the campaign's life
+  const bool holder = _serving && _tr_inc_ms && (camp || since(now, _tr_inc_ms) < (spread ? g_tune.gossip_life_ms : PASSIVE_QUIET_MS)) && memcmp(_serve_man.sha256, _tr_tag, 4) == 0;
   if (!missing && !holder) { _tr_on = false; return; }
   if (!_tr_on) { _tr_on = true; trickleStart(now, g_tune.tr_imin_ms); }
   if (_tr_t && (int32_t)(now - _tr_t) >= 0) { _tr_t = 0;
@@ -4023,6 +4390,291 @@ void FwOtaTransfer::onSumm(const uint8_t* b, uint32_t len) {
     _gap_dry = 0; _e_wait = false; _e_prog_ms = now | 1; _gapr_at_ms = now + (uint32_t)_mesh->getRNG()->nextInt(0, GAP_SPREAD_MS);
   }
   if (_tr_on && _tr_i > g_tune.tr_imin_ms) trickleStart(now, g_tune.tr_imin_ms);
+}
+
+// ======================= (rc25, C95, owner 2026-11-04/11-07) fw push: the campaign =======================
+// `fw push` on the source (or a completed `fw pull ... fleet`, origin = its requester) starts a 7-day CAMPAIGN for the image: every
+// circle node of the board that runs and holds an OLDER image fills its slot (never installs - owner: installs stay the user's job).
+// The data moves by the rc18 wave (holders' zero-hop announces, unchanged - older firmware keeps filling from them) and, where no holder
+// or stream of it is heard, by the member's own routed fleet pull ("island", the farthest first). The campaign itself travels in
+// MSG_CAMP packets flooded on the discovery channel as LOTA1P (stock relays forward channel floods; older LoRa-OTA firmware ignores the
+// marker): the INVITE, one newcomer QUERY per boot (members ANSWER, at most 2), a daily REMINDER for the whole circle (one member's is
+// heard -> the others skip theirs), the origin's CANCEL. Members send RESULTs (joined / complete / stuck / refused) to the origin.
+uint32_t FwOtaTransfer::campLeftS() const {
+  if (!_mesh || !_camp.set) return 0;
+  const uint32_t t = _mesh->getRTCClock()->getCurrentTime();
+  return _camp.end_s > t ? _camp.end_s - t : 0;
+}
+// this node runs, or holds in its slot, another image that is not older than the campaign's: it does not take part (reported)
+bool FwOtaTransfer::campNewerHere(const XferManifest& m) const {
+#if defined(FW_OTA_FWNUM)
+  if ((uint32_t)FW_OTA_FWNUM >= m.fw_version) return true;
+#endif
+  SlotHeader h;
+  return readSlotHeader(h) && slotValid() && h.fw_version >= m.fw_version && h.raw_crc32 != m.raw_crc32;
+}
+bool FwOtaTransfer::campOn() const { return _camp.set && !_camp.cancelled && campLeftS() > 0; }
+
+// MSG_CAMP: magic type kind | tag4 | kind fw plen rlen pcrc rcrc comp n sha32 props5 (the FLEET_ANN manifest layout) | board8 | origin4 |
+// sender4 | sender's hops from the origin, 0 | minutes left u16 | aux4 (query nonce / result) | MAC (camp key)
+uint32_t FwOtaTransfer::campBuild(uint8_t* b, uint8_t kind, uint32_t aux) const {
+  const XferManifest& m = _camp.m; uint32_t n = 0;
+  b[n++] = XFER_MAGIC; b[n++] = MSG_CAMP; b[n++] = kind; memcpy(&b[n], m.sha256, 4); n += 4; b[n++] = m.kind;
+  memcpy(&b[n], &m.fw_version, 4); n += 4; memcpy(&b[n], &m.payload_len, 4); n += 4; memcpy(&b[n], &m.raw_len, 4); n += 4;
+  memcpy(&b[n], &m.payload_crc32, 4); n += 4; memcpy(&b[n], &m.raw_crc32, 4); n += 4; memcpy(&b[n], &m.compression, 2); n += 2;
+  const uint16_t nc = (uint16_t)m.n_chunks; memcpy(&b[n], &nc, 2); n += 2;
+  memcpy(&b[n], m.sha256, 32); n += 32; memcpy(&b[n], m.lzma_props, 5); n += 5;
+  memcpy(&b[n], g_fwpull_tag.board, 8); n += 8; memcpy(&b[n], _camp.origin, 4); n += 4; memcpy(&b[n], _pub, 4); n += 4;
+  b[n++] = _camp.mine ? 0 : _camp.hops; b[n++] = 0;
+  const uint32_t lm = campOn() ? campLeftS() / 60 + 1 : 0; const uint16_t l16 = lm > 65535 ? 65535 : (uint16_t)lm;
+  memcpy(&b[n], &l16, 2); n += 2; memcpy(&b[n], &aux, 4); n += 4;
+  n += XFER_MAC_LEN; macFillKey(b, n, _camp_key);
+  return n;
+}
+void FwOtaTransfer::campFlood(uint8_t kind, uint32_t aux, uint32_t delay_ms) {
+  if (!_mesh || !_circle_set) return;
+  uint8_t d[11 + CAMP_LEN]; const uint32_t ts = _mesh->getRTCClock()->getCurrentTime();
+  memcpy(d, &ts, 4); d[4] = 0; memcpy(&d[5], FLOOD_CAMP, 6);
+  const uint32_t n = campBuild(&d[11], kind, aux);
+  floodOut(_mesh->createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _disc_ch, d, 11 + n), delay_ms);
+}
+// a result for the origin: direct along the reversed path of its own packet (stock relays forward direct packets), else a flood
+void FwOtaTransfer::campResult(uint8_t st) {
+  if (!_camp.set || _camp.mine) return;
+  _camp_res_st = st; _camp_res_n = 4; _camp_res_ms = millis() + 1000 + (uint32_t)_mesh->getRNG()->nextInt(0, 15000);
+}
+void FwOtaTransfer::campSave() {
+  if (!_fs) return;
+  _fs->remove(CAMP_FILE);
+  if (!_camp.set) return;
+  File f = _fs->open(CAMP_FILE, FILE_O_WRITE);
+  if (!f) return;
+  const uint32_t mg = CAMP_MAGIC; const uint16_t sz = sizeof(_camp);
+  f.write((const uint8_t*)&mg, 4); f.write((const uint8_t*)&sz, 2); f.write((const uint8_t*)&_camp, sizeof(_camp));
+  f.close();
+}
+void FwOtaTransfer::campLoad() {
+  memset(&_camp, 0, sizeof(_camp));
+  if (!_fs || !_fs->exists(CAMP_FILE)) return;
+  File f = _fs->open(CAMP_FILE);
+  if (!f) return;
+  uint32_t mg = 0; uint16_t sz = 0;
+  const bool ok = f.read((uint8_t*)&mg, 4) == 4 && mg == CAMP_MAGIC && f.read((uint8_t*)&sz, 2) == 2 && sz == sizeof(_camp)
+               && f.read((uint8_t*)&_camp, sizeof(_camp)) == (int)sizeof(_camp);
+  f.close();
+  if (!ok || !_camp.set) memset(&_camp, 0, sizeof(_camp));
+}
+void FwOtaTransfer::campIslandArm(uint32_t now) {
+  const uint8_t h = _camp.hops > 7 ? 7 : _camp.hops;
+  _camp_island_ms = (now + (uint32_t)(8 - h) * g_tune.island_step_ms + (uint32_t)_mesh->getRNG()->nextInt(0, 30000)) | 1;
+}
+void FwOtaTransfer::campStart(const XferManifest& m) {
+  memset(&_camp, 0, sizeof(_camp));
+  _camp.set = 1; _camp.mine = 1; _camp.m = m; _camp.m.dst_off = 0; memcpy(_camp.origin, _pub, 4);
+  _camp.end_s = _mesh->getRTCClock()->getCurrentTime() + g_tune.camp_life_ms / 1000;
+  campSave();
+  _ncpeers = 0; _camp_done = 1; _camp_rem_ms = 0; _camp_rem_heard_ms = 0; _camp_end_done = 0;
+  _camp_inv_ms = (millis() + 600000) | 1;              // the invite once more in 10 min (one flood can be lost behind a relay: P1)
+  if (_serving && memcmp(_serve_man.sha256, m.sha256, 32) == 0) spreadStart(m.sha256);
+  campFlood(CK_INVITE, 0, 100); stats.camp_invites++;
+}
+// cancelled: stop spreading the image, a fill or our island pull of it pauses (chunks kept: a newer push or 'fw pull-resume' goes on)
+void FwOtaTransfer::campStopLocal() {
+  if (memcmp(_spread_tag, _camp.m.sha256, 4) == 0) { memset(_spread_tag, 0, 4); _tr_inc_ms = 0; }
+  const bool on_it = (_phase == PH_OFFERING || _phase == PH_DOWNLOADING) && memcmp(_man.sha256, _camp.m.sha256, 32) == 0;
+  if (_camp.island && (_phase == PH_OFFERING || _phase == PH_DOWNLOADING || _resolving)) { char t[160]; cmdAbort(t); }
+  else if (on_it && _fill) {
+    if (_sess_set) sendAbort();
+    _fill_mode = FLEET_FILL_EMPTY;
+    if (_erased) { _phase = PH_DOWNLOADING; _resuming = false; _sess_set = false; saveState(); pauseFill("push cancelled by its origin"); }
+    else { _phase = PH_IDLE; _fill = false; clearState(); }
+  }
+  _camp.island = 0; _camp_island_ms = 0; _camp_res_n = 0;
+}
+
+void FwOtaTransfer::onCamp(const uint8_t* b, uint32_t len, uint8_t hops, const uint8_t* path, uint8_t enc) {
+  if (len < CAMP_LEN || b[0] != XFER_MAGIC || b[1] != MSG_CAMP || !macOk(_camp_key, b, CAMP_LEN)) return;
+  if (memcmp(&b[81], _pub, 4) == 0) return;               // our own, relayed back to us
+  const uint8_t kind = b[2]; const uint32_t now = millis();
+  uint32_t aux; memcpy(&aux, &b[89], 4); uint16_t left_m; memcpy(&left_m, &b[87], 2);
+  if (memcmp(&b[69], g_fwpull_tag.board, 8) != 0) return; // another board's campaign (a query names the asker's board)
+  if (kind == CK_QUERY) {                                 // a newcomer: members answer, the first 2 answers silence the rest
+    if (!campOn() || (_camp_ans_ms && _camp_ans_nonce == aux)) return;
+    _camp_ans_nonce = aux; _camp_ans_heard = 0;
+    _camp_ans_ms = (now + CAMP_ANS_MIN_MS + (uint32_t)_mesh->getRNG()->nextInt(0, CAMP_ANS_SPREAD_MS) + (uint32_t)hops * CAMP_ANS_HOP_MS) | 1;
+    return;
+  }
+  if (kind == CK_ANSWER && _camp_ans_ms && aux == _camp_ans_nonce && ++_camp_ans_heard >= 2) _camp_ans_ms = 0;
+  XferManifest m; memset(&m, 0, sizeof(m));
+  m.kind = b[7]; memcpy(&m.fw_version, &b[8], 4); memcpy(&m.payload_len, &b[12], 4); memcpy(&m.raw_len, &b[16], 4);
+  memcpy(&m.payload_crc32, &b[20], 4); memcpy(&m.raw_crc32, &b[24], 4); memcpy(&m.compression, &b[28], 2);
+  uint16_t nc; memcpy(&nc, &b[30], 2); m.n_chunks = nc; m.chunk_size = XFER_CHUNK;
+  memcpy(m.sha256, &b[32], 32); memcpy(m.lzma_props, &b[64], 5);
+  if (m.kind != KIND_APP || memcmp(&b[3], m.sha256, 4) != 0 || !m.payload_len || m.payload_len > SLOT_PAYLOAD_MAX
+      || m.n_chunks != (m.payload_len + XFER_CHUNK - 1) / XFER_CHUNK || m.n_chunks > ChunkMap::MAX_CHUNKS) return;
+  snprintf(m.name, sizeof(m.name), "@%02X%02X%02X%02X", b[77], b[78], b[79], b[80]);
+  const bool same = campImg(m.sha256), from_origin = memcmp(&b[81], &b[77], 4) == 0;
+  if (same && _camp.mine && _camp.cancelled && kind != CK_CANCEL) {   // a member still runs our cancelled push (it missed the cancel): again
+    if (!_camp_cxl_ms || since(now, _camp_cxl_ms) > 3600000u) { _camp_cxl_ms = now | 1; campFlood(CK_CANCEL, 0, 500); }
+    return;
+  }
+  if (kind == CK_RESULT) {                                // the origin's table
+    if (!same || !_camp.mine) return;
+    int k = -1; for (uint8_t i = 0; i < _ncpeers; i++) if (memcmp(_cpeers[i].id, &b[81], 4) == 0) k = i;
+    if (k < 0 && _ncpeers < CAMP_PEERS) { k = _ncpeers++; memcpy(_cpeers[k].id, &b[81], 4); }
+    if (k >= 0 && (aux & 0xFF) >= CR_JOINED && (aux & 0xFF) <= CR_REFUSED) { _cpeers[k].st = (uint8_t)(aux & 0xFF); _cpeers[k].pct = (uint8_t)(aux >> 8); }
+    return;
+  }
+  if (kind == CK_REMIND && same) _camp_rem_heard_ms = now | 1;
+  if (kind == CK_CANCEL) {
+    if (!from_origin) return;                             // only the origin cancels its campaign
+    if (same) { if (!_camp.cancelled) { _camp.cancelled = 1; campSave(); campStopLocal(); } return; }
+    if (_camp.set && m.fw_version < _camp.m.fw_version) return;
+    memset(&_camp, 0, sizeof(_camp)); _camp.set = 1; _camp.cancelled = 1; _camp.m = m; memcpy(_camp.origin, &b[77], 4);   // never join it later
+    _camp.end_s = _mesh->getRTCClock()->getCurrentTime() + (uint32_t)left_m * 60; campSave();
+    return;
+  }
+  if (!left_m) return;                                    // ended at its sender
+  const uint8_t oh = from_origin ? hops : (uint8_t)(b[85] + hops + 1 > 63 ? 63 : b[85] + hops + 1);   // hops from the origin
+  if (same) {
+    if (_camp.cancelled || _camp.mine) return;
+    if (from_origin && !_camp.back_ok && rtValid(enc)) { rtReverse(_camp.back, path, enc); _camp.back_enc = enc; _camp.back_ok = 1; _camp.hops = hops; }
+    if (oh < _camp.hops) _camp.hops = oh;
+    return;
+  }
+  if (_camp.set && m.fw_version <= _camp.m.fw_version) return;   // we know this or a newer one (a newer campaign replaces an older at once)
+  if (_camp.set && !_camp.cancelled) campStopLocal();
+  const uint8_t refuse = campNewerHere(m) ? 1 : 0;       // a running or slot image that is not older: nothing to fill (reported)
+  memset(&_camp, 0, sizeof(_camp));
+  _camp.set = 1; _camp.m = m; memcpy(_camp.origin, &b[77], 4); _camp.hops = oh;
+  _camp.end_s = _mesh->getRTCClock()->getCurrentTime() + (uint32_t)left_m * 60;
+  if (from_origin && rtValid(enc)) { rtReverse(_camp.back, path, enc); _camp.back_enc = enc; _camp.back_ok = 1; }
+  campSave(); stats.camp_joins++;
+  _camp_refused = refuse; _camp_done = 0; _camp_tries = 0; _camp_stuck_ms = 0; _camp_rem_ms = 0; _camp_end_done = 0;
+  _camp_heard_ms = 0; _camp_island_ms = 0; if (!refuse) campIslandArm(now);
+  campResult(refuse ? CR_REFUSED : CR_JOINED);
+}
+
+void FwOtaTransfer::campTick(uint32_t now) {
+  if (!_mesh || !_circle_set || (int32_t)(now - _camp_tick_ms) < 0) return;
+  _camp_tick_ms = now + 1000;
+  if (_camp_q_ms && (int32_t)(now - _camp_q_ms) >= 0) {   // the newcomer query: once per boot, only without a campaign
+    _camp_q_ms = 0;
+    if (!_camp.set && _camp_qd < 2) { _camp_qd++; _camp_q_nonce = _mesh->getRNG()->nextInt(1, 0x7FFFFFFF); campFlood(CK_QUERY, _camp_q_nonce, 100); stats.camp_queries++; }
+  }
+  if (_camp_ans_ms && (int32_t)(now - _camp_ans_ms) >= 0) {
+    _camp_ans_ms = 0;
+    if (campOn() && _camp_ans_heard < 2) { campFlood(CK_ANSWER, _camp_ans_nonce, 0); stats.camp_answers++; }
+  }
+  if (_camp_res_n && (int32_t)(now - _camp_res_ms) >= 0 && _camp.set && !_camp.mine) {   // the result, 4 times
+    _camp_res_n--; _camp_res_ms = now + CAMP_RES_GAP_MS[_camp_res_n & 3];
+    const uint8_t pct = _phase == PH_DOWNLOADING && _man.n_chunks && campImg(_man.sha256) ? (uint8_t)(100u * _cm.have / _man.n_chunks) : _camp_done ? 100 : 0;
+    uint8_t b[CAMP_LEN]; const uint32_t n = campBuild(b, CK_RESULT, (uint32_t)_camp_res_st | (uint32_t)pct << 8);
+    stats.camp_results++;
+    if (_camp.back_ok) send(b, n, 50, _camp.back, _camp.back_enc);
+    else if (floodBudget(now)) { uint8_t d[11 + CAMP_LEN]; const uint32_t ts = _mesh->getRTCClock()->getCurrentTime();
+      memcpy(d, &ts, 4); d[4] = 0; memcpy(&d[5], FLOOD_CAMP, 6); memcpy(&d[11], b, n);
+      floodOut(_mesh->createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _disc_ch, d, 11 + n), 50); }
+  }
+  if (_camp_cxl_n && _camp.mine && _camp.cancelled && (int32_t)(now - _camp_cxl_at) >= 0) {   // the cancel's repeats
+    _camp_cxl_n--; _camp_cxl_at = now + CAMP_CXL_MS[_camp_cxl_n % 3]; _camp_cxl_ms = now | 1; campFlood(CK_CANCEL, 0, 0);
+  }
+  if (!_camp.set || _camp.cancelled) return;
+  if (!campOn()) {                                        // the campaign ended: no more pulls of our own; one last STUCK if we never filled
+    if (!_camp_end_done) {
+      _camp_end_done = 1;
+      if (_camp.island && (_phase == PH_OFFERING || _phase == PH_DOWNLOADING || _resolving)) { char t[160]; cmdAbort(t); }
+      _camp.island = 0;
+      if (!_camp.mine && !_camp_done && !_camp_refused) campResult(CR_STUCK);
+    }
+    return;
+  }
+  if (!_camp_rem_ms) _camp_rem_ms = (now + (uint32_t)_mesh->getRNG()->nextInt((int)(g_tune.remind_ms / 2), (int)(g_tune.remind_ms / 2 * 3))) | 1;
+  else if ((int32_t)(now - _camp_rem_ms) >= 0) {          // the daily reminder: skipped when another member's was heard within a day
+    _camp_rem_ms = (now + (uint32_t)_mesh->getRNG()->nextInt((int)(g_tune.remind_ms / 2), (int)(g_tune.remind_ms / 2 * 3))) | 1;
+    if (!(_camp_rem_heard_ms && since(now, _camp_rem_heard_ms) < g_tune.remind_ms) && powerState() != 3) { campFlood(CK_REMIND, 0, 0); stats.camp_reminders++; }
+  }
+  const bool serving_it = _serving && memcmp(_serve_man.sha256, _camp.m.sha256, 32) == 0;
+  if (serving_it && memcmp(_spread_tag, _camp.m.sha256, 4) != 0) spreadStart(_camp.m.sha256);   // (also after a reboot: the tag is RAM)
+  if (_camp.mine) {
+    if (!_camp_inv_ms) _camp_inv_ms = (now + 120000) | 1;  // after a boot (a fleet pull's requester restarted to install): invite again once
+    else if (_camp_inv_ms != 1 && (int32_t)(now - _camp_inv_ms) >= 0) { _camp_inv_ms = 1; if (now > 100000) { campFlood(CK_INVITE, 0, 0); stats.camp_invites++; } }
+    return;
+  }
+  SlotHeader h;
+  const bool done = readSlotHeader(h) && slotValid() && h.fw_version == _camp.m.fw_version && h.raw_crc32 == _camp.m.raw_crc32;
+  if (done) { if (!_camp_done) { _camp_done = 1; _camp.island = 0; campResult(CR_COMPLETE); } return; }
+  if (campNewerHere(_camp.m) && !_camp_refused) { _camp_refused = 1; campResult(CR_REFUSED); }
+  if (_camp_refused) return;
+  const bool busy = _phase == PH_OFFERING || _phase == PH_DOWNLOADING || _phase == PH_VERIFYING || _resolving || _staging || _reset_at_ms || _apply_armed;
+  if (busy && !_fill_paused) {
+    if (campImg(_man.sha256) || _camp.island) _camp_heard_ms = now | 1;
+    if (_camp.island && _camp_tries) _camp_island_ms = (now + CAMP_RETRY_MS[_camp_tries - 1 < 4 ? _camp_tries - 1 : 4]) | 1;
+    return;
+  }
+  if (powerState() == 3) return;                         // CRITICAL battery: wait (the holders keep gossiping for the campaign's life)
+  if (!_camp_island_ms) campIslandArm(now);
+  if ((int32_t)(now - _camp_island_ms) < 0) return;
+  if (_camp_heard_ms && since(now, _camp_heard_ms) < CAMP_HEARD_MS) { campIslandArm(now); return; }   // the image is near: the wave brings it
+  if (_camp_disc_ms && since(now, _camp_disc_ms) < CAMP_DISC_MS && _camp_defer < 3) { _camp_defer++; campIslandArm(now); return; }   // another
+  //   island node's pull is starting (its search passed us): its stream will pass us too - at most 3 times (it may never get through)
+  if (_camp_tries >= 3 && (!_camp_stuck_ms || since(now, _camp_stuck_ms) > 86400000u)) { _camp_stuck_ms = now | 1; campResult(CR_STUCK); }
+  // an island: our own routed fleet pull from the origin (failover holders; the nodes on its way and near it collect the stream). Fill only.
+  char id[12], r[160]; snprintf(id, sizeof(id), "%02X%02X%02X%02X", _camp.origin[0], _camp.origin[1], _camp.origin[2], _camp.origin[3]);
+  if (_fill_paused) dropPausedFill();
+  setNextPullDuty(0); setNextPullOpts(true, 0);
+  cmdPullPeer(id, r, false);
+  if (_phase == PH_OFFERING || _phase == PH_DOWNLOADING || _resolving) { _camp.island = 1; campSave(); }
+  stats.island_pulls++; _camp_tries++; _camp_heard_ms = 0;
+  _camp_island_ms = (now + CAMP_RETRY_MS[_camp_tries - 1 < 4 ? _camp_tries - 1 : 4]) | 1;
+}
+
+bool FwOtaTransfer::cmdPush(char* reply) {
+  if (!_circle_set) { strcpy(reply, "ERR - no passphrase"); return true; }
+  if (_phase == PH_OFFERING || _phase == PH_DOWNLOADING || _phase == PH_VERIFYING) { strcpy(reply, "ERR - a pull runs (fw pull-status)"); return true; }
+  if (!_serving || _serve_man.kind != KIND_APP) { strcpy(reply, "ERR - no image offered here (fw slot / fw serve)"); return true; }
+  if (campOn() && _camp.mine && campImg(_serve_man.sha256)) {   // again: idempotent (members ignore it, new nodes join)
+    campFlood(CK_INVITE, 0, 100); stats.camp_invites++;
+    snprintf(reply, 160, "OK - push fw-%lu invited again", (unsigned long)_camp.m.fw_version); return true;
+  }
+  if (_camp.set && !_camp.cancelled && campOn() && _camp.m.fw_version > _serve_man.fw_version) {
+    snprintf(reply, 160, "ERR - a push of newer fw-%lu runs", (unsigned long)_camp.m.fw_version); return true;
+  }
+  if (campOn() && _camp.mine) { campFlood(CK_CANCEL, 0, 0); }   // our older campaign: superseded
+  campStart(_serve_man);
+  snprintf(reply, 160, "OK - push fw-%lu: 7 d swarm fill, slots only (fw push-status)", (unsigned long)_camp.m.fw_version);
+  return true;
+}
+
+bool FwOtaTransfer::cmdPushStatus(char* reply) {
+  if (!_camp.set) { strcpy(reply, "no push"); return true; }
+  const unsigned long fw = (unsigned long)_camp.m.fw_version;
+  if (_camp.cancelled) { snprintf(reply, 160, "push fw-%lu cancelled", fw); return true; }
+  const uint32_t l = campLeftS();
+  char left[16]; if (!l) strcpy(left, "ended"); else if (l >= 86400) snprintf(left, sizeof(left), "%lud%luh left", (unsigned long)(l / 86400), (unsigned long)(l % 86400 / 3600));
+  else snprintf(left, sizeof(left), "%luh%02lum left", (unsigned long)(l / 3600), (unsigned long)(l % 3600 / 60));
+  if (_camp.mine) {
+    uint8_t c[5] = {0}; for (uint8_t i = 0; i < _ncpeers; i++) if (_cpeers[i].st <= CR_REFUSED) c[_cpeers[i].st]++;
+    snprintf(reply, 160, "push fw-%lu %s: %u complete, %u filling, %u stuck, %u refused", fw, left, c[CR_COMPLETE], c[CR_JOINED], c[CR_STUCK], c[CR_REFUSED]);
+    return true;
+  }
+  char st[40];
+  if (_camp_done) strcpy(st, "filled");
+  else if (_camp_refused) strcpy(st, "refused: newer here");
+  else if (_phase == PH_DOWNLOADING && campImg(_man.sha256) && _man.n_chunks) snprintf(st, sizeof(st), "filling %u%%", (unsigned)(100u * _cm.have / _man.n_chunks));
+  else if (_camp_stuck_ms) strcpy(st, "stuck: no holder answers");
+  else strcpy(st, "waiting");
+  snprintf(reply, 160, "push fw-%lu from @%02X%02X%02X%02X %s: %s", fw, _camp.origin[0], _camp.origin[1], _camp.origin[2], _camp.origin[3], left, st);
+  return true;
+}
+
+bool FwOtaTransfer::cmdPushCancel(char* reply) {
+  if (!campOn()) { strcpy(reply, "ERR - no push runs"); return true; }
+  if (!_camp.mine) { snprintf(reply, 160, "ERR - only its origin @%02X%02X%02X%02X cancels", _camp.origin[0], _camp.origin[1], _camp.origin[2], _camp.origin[3]); return true; }
+  _camp.cancelled = 1; campSave(); campStopLocal();
+  _camp_cxl_n = 3; _camp_cxl_at = millis();             // now, +10 min, +60 min (campTick)
+  snprintf(reply, 160, "OK - push fw-%lu cancelled: filled slots stay, nothing installs", (unsigned long)_camp.m.fw_version);
+  return true;
 }
 
 }  // namespace fw_ota

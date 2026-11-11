@@ -188,6 +188,7 @@ size_t SerialBLEInterface::writeFrame(const uint8_t src[], size_t len) {
 
 #define  BLE_WRITE_MIN_INTERVAL   60
 
+// PowerSaving variant
 bool SerialBLEInterface::isReadBusy() const {
   return uxQueueMessagesWaiting(recv_queue) > 0;
 }

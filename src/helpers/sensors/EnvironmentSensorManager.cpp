@@ -15,7 +15,6 @@
 #if ENV_INCLUDE_BME680_BSEC
 #ifndef TELEM_BME680_ADDRESS
 #define TELEM_BME680_ADDRESS 0x76
-#define TELEM_BME680_ADDRESS_2 0x77
 #endif
 #define TELEM_BME680_SEALEVELPRESSURE_HPA (1013.25)
 #include <bsec.h>
@@ -41,7 +40,6 @@ static uint32_t bsec_last_save_ms    = 0;
 #ifdef ENV_INCLUDE_BME680
 #ifndef TELEM_BME680_ADDRESS
 #define TELEM_BME680_ADDRESS 0x76
-#define TELEM_BME680_ADDRESS_2 0x77
 #endif
 #define TELEM_BME680_SEALEVELPRESSURE_HPA (1013.25)
 #include <Adafruit_BME680.h>
@@ -65,7 +63,6 @@ static Adafruit_AHTX0 AHTX0;
 #if ENV_INCLUDE_BME280
 #ifndef TELEM_BME280_ADDRESS
 #define TELEM_BME280_ADDRESS    0x76      // BME280 environmental sensor I2C address
-#define TELEM_BME280_ADDRESS_2  0x77
 #endif
 #define TELEM_BME280_SEALEVELPRESSURE_HPA (1013.25)    // Atmospheric pressure at sea level
 #include <Adafruit_BME280.h>
@@ -75,7 +72,6 @@ static Adafruit_BME280 BME280;
 #if ENV_INCLUDE_BMP280
 #ifndef TELEM_BMP280_ADDRESS
 #define TELEM_BMP280_ADDRESS    0x76      // BMP280 environmental sensor I2C address
-#define TELEM_BMP280_ADDRESS_2  0x77
 #endif
 #define TELEM_BMP280_SEALEVELPRESSURE_HPA (1013.25)    // Atmospheric pressure at sea level
 #include <Adafruit_BMP280.h>
@@ -169,9 +165,11 @@ static RAK12035_SoilMoisture RAK12035;
 #endif
 
 #ifdef RAK_WISBLOCK_GPS
+// PowerSaving variant
 // -1 = no enable pin; out-of-range values are no-ops in pinMode/digitalWrite,
 // while 0 would be a real GPIO (P0.00 = LFXO crystal on nRF52)
 static uint32_t gpsResetPin = -1;
+
 static bool i2cGPSFlag = false;
 static bool serialGPSFlag = false;
 #ifndef TELEM_RAK12500_ADDRESS
@@ -187,6 +185,8 @@ class RAK12500LocationProvider : public LocationProvider {
   int _sats = 0;
   long _epoch = 0;
   bool _fix = false;
+
+  // PowerSaving variant
   int _pin_en = -1;
 public:
   long getLatitude() override { return _lat; }
@@ -200,6 +200,7 @@ public:
   void begin() override { }
   void stop() override { }
   void loop() override {
+    // PowerSaving variant
     static long next_gps_update = 0;
     if ((int32_t)(millis() - next_gps_update) >= 0) {
       if (ublox_GNSS.getGnssFixOk(8)) {
@@ -217,6 +218,8 @@ public:
     }
   }
   bool isEnabled() override { return true; }
+
+  // PowerSaving variant
   void setPinEn(int pin_en) override { _pin_en = pin_en; }
   int getPinEn() override { return _pin_en; }
 };
@@ -553,6 +556,8 @@ static void query_bme680_bsec(uint8_t ch, uint8_t, CayenneLPP& lpp) {
 // are compiled in. The sentinel at the end keeps the array
 // non-empty regardless of which sensors are enabled.
 //
+// Bosch BMP/BME SDO selects 0x76 or 0x77; probe both.
+//
 // Ordering here determines channel assignment at runtime:
 // the first detected+initialized sensor gets channel 2, the
 // next gets channel 3, and so on.
@@ -565,33 +570,27 @@ struct SensorDef {
   void      (*query)(uint8_t channel, uint8_t sub_channel, CayenneLPP& telemetry);
 };
 
+#define TELEM_BOSCH_ALT_ADDR(addr) ((uint8_t)((addr) == 0x76 ? 0x77 : 0x76))
+
 static const SensorDef SENSOR_TABLE[] = {
 #if ENV_INCLUDE_AHTX0
   { TELEM_AHTX_ADDRESS,    "AHT10/AHT20", init_ahtx0,    query_ahtx0    },
 #endif
 #ifdef ENV_INCLUDE_BME680
-  { TELEM_BME680_ADDRESS,  "BME680",       init_bme680,   query_bme680   },
-  #ifdef TELEM_BME680_ADDRESS_2
-  { TELEM_BME680_ADDRESS_2, "BME680",      init_bme680,   query_bme680   },
-  #endif
+  { TELEM_BME680_ADDRESS,                       "BME680",       init_bme680,      query_bme680      },
+  { TELEM_BOSCH_ALT_ADDR(TELEM_BME680_ADDRESS), "BME680",       init_bme680,      query_bme680      },
 #endif
 #if ENV_INCLUDE_BME680_BSEC
-  { TELEM_BME680_ADDRESS,  "BME680+BSEC",   init_bme680_bsec, query_bme680_bsec },
-  #ifdef TELEM_BME680_ADDRESS_2
-    { TELEM_BME680_ADDRESS_2, "BME680+BSEC", init_bme680_bsec, query_bme680_bsec },
-  #endif
+  { TELEM_BME680_ADDRESS,                       "BME680+BSEC",  init_bme680_bsec, query_bme680_bsec },
+  { TELEM_BOSCH_ALT_ADDR(TELEM_BME680_ADDRESS), "BME680+BSEC",  init_bme680_bsec, query_bme680_bsec },
 #endif
 #if ENV_INCLUDE_BME280
-  { TELEM_BME280_ADDRESS,  "BME280",       init_bme280,   query_bme280   },
-  #ifdef TELEM_BME280_ADDRESS_2
-  { TELEM_BME280_ADDRESS_2, "BME280",      init_bme280,   query_bme280   },
-  #endif
+  { TELEM_BME280_ADDRESS,                       "BME280",       init_bme280,      query_bme280      },
+  { TELEM_BOSCH_ALT_ADDR(TELEM_BME280_ADDRESS), "BME280",       init_bme280,      query_bme280      },
 #endif
 #if ENV_INCLUDE_BMP280
-  { TELEM_BMP280_ADDRESS,  "BMP280",       init_bmp280,   query_bmp280   },
-  #ifdef TELEM_BMP280_ADDRESS_2
-  { TELEM_BMP280_ADDRESS_2, "BMP280",       init_bmp280,   query_bmp280   },
-  #endif
+  { TELEM_BMP280_ADDRESS,                       "BMP280",       init_bmp280,      query_bmp280      },
+  { TELEM_BOSCH_ALT_ADDR(TELEM_BMP280_ADDRESS), "BMP280",       init_bmp280,      query_bmp280      },
 #endif
 #if ENV_INCLUDE_SHTC3
   { 0x70,                  "SHTC3",        init_shtc3,    query_shtc3    },
@@ -628,6 +627,8 @@ static const SensorDef SENSOR_TABLE[] = {
 #endif
   { 0, nullptr, nullptr, nullptr }  // sentinel — keeps the array non-empty
 };
+
+#undef TELEM_BOSCH_ALT_ADDR
 
 static const size_t SENSOR_TABLE_SIZE = (sizeof(SENSOR_TABLE) / sizeof(SENSOR_TABLE[0])) - 1;
 
@@ -666,6 +667,12 @@ bool EnvironmentSensorManager::begin() {
   _active_sensor_count = 0;
   for (size_t i = 0; i < SENSOR_TABLE_SIZE && _active_sensor_count < MAX_ACTIVE_SENSORS; i++) {
     const SensorDef& def = SENSOR_TABLE[i];
+    // One static driver instance per type: an alternate address is a fallback, not a second device.
+    bool already_active = false;
+    for (int j = 0; j < _active_sensor_count; j++) {
+      if (_active_sensors[j].query == def.query) { already_active = true; break; }
+    }
+    if (already_active) continue;
     if (!detected[def.address]) {
       MESH_DEBUG_PRINTLN("%s not detected at I2C address %02X", def.name, def.address);
       continue;
@@ -676,6 +683,7 @@ bool EnvironmentSensorManager::begin() {
       continue;
     }
     MESH_DEBUG_PRINTLN("Found %s at address: %02X", def.name, def.address);
+    detected[def.address] = false;  // consumed; later entries must not re-claim this device
     for (uint8_t sub = 0; sub < n && _active_sensor_count < MAX_ACTIVE_SENSORS; sub++) {
       _active_sensors[_active_sensor_count++] = { def.query, sub };
     }
@@ -740,9 +748,11 @@ bool EnvironmentSensorManager::setSettingValue(const char* name, const char* val
   #if ENV_INCLUDE_GPS
   if (gps_detected && strcmp(name, "gps") == 0) {
     if (strcmp(value, "0") == 0) {
+      // PowerSaving variant
       gps_active = false; // Disabled by CLI or App
       stop_gps();
     } else {
+      // PowerSaving variant
       gps_active = true; // Enabled by CLI or App
       start_gps();
     }
@@ -776,14 +786,18 @@ void EnvironmentSensorManager::initBasicGPS() {
     MESH_DEBUG_PRINTLN("No GPS wake/reset pin found for this board. Continuing on...");
   #endif
 
-  // Give GPS a moment to power up and send data
-  delay(1000);
-
-  // We'll consider GPS detected if we see any data on Serial1
+  // Give the GPS time to power up and emit its first NMEA sentence. Cold-start
+  // modules can take several seconds, so poll for up to ~5s instead of checking
+  // once after a fixed 1s delay -- returning as soon as any data appears, so
+  // fast modules add no boot delay (issue #2258).
 #ifdef ENV_SKIP_GPS_DETECT
   gps_detected = true;
 #else
-  gps_detected = (Serial1.available() > 0);
+  gps_detected = false;
+  for (int i = 0; i < 20 && !gps_detected; i++) {
+    delay(250);
+    gps_detected = (Serial1.available() > 0);
+  }
 #endif
 
   if (gps_detected) {
@@ -802,14 +816,15 @@ void EnvironmentSensorManager::initBasicGPS() {
 // gps code for rak might be moved to MicroNMEALoactionProvider
 // or make a new location provider ...
 #ifdef RAK_WISBLOCK_GPS
-void EnvironmentSensorManager::rakGPSInit() {
+void EnvironmentSensorManager::rakGPSInit(){
+
   Serial1.setPins(PIN_GPS_TX, PIN_GPS_RX);
 
-#ifdef GPS_BAUD_RATE
+  #ifdef GPS_BAUD_RATE
   Serial1.begin(GPS_BAUD_RATE);
-#else
+  #else
   Serial1.begin(9600);
-#endif
+  #endif
 
   // search for the correct IO standby pin depending on socket used
   if (gpsIsAwake(WB_IO2)) {
@@ -822,13 +837,13 @@ void EnvironmentSensorManager::rakGPSInit() {
     return;
   }
 
-#ifndef FORCE_GPS_ALIVE // for use with repeaters, until GPS toggle is implimented
-  // Now that GPS is found and set up, set to sleep for initial state
+  #ifndef FORCE_GPS_ALIVE // for use with repeaters, until GPS toggle is implimented
+  //Now that GPS is found and set up, set to sleep for initial state
   stop_gps();
-#endif
+  #endif
 }
 
-bool EnvironmentSensorManager::gpsIsAwake(uint8_t ioPin) {
+bool EnvironmentSensorManager::gpsIsAwake(uint8_t ioPin){
 
   #if defined(ETHERNET_ENABLED) && defined(RAK_BOARD)
     if (ioPin == WB_IO2) {
@@ -836,16 +851,21 @@ bool EnvironmentSensorManager::gpsIsAwake(uint8_t ioPin) {
       return false;
     }
   #endif
+
+  #ifndef RAK_3401
   //set initial waking state
-  pinMode(ioPin, OUTPUT);
-  digitalWrite(ioPin, LOW);
+  pinMode(ioPin,OUTPUT);
+  digitalWrite(ioPin,LOW);
   delay(500);
-  digitalWrite(ioPin, HIGH);
+  digitalWrite(ioPin,HIGH);
+  #endif
+
+  // give gps time to power up
   delay(500);
 
-  // Try to init RAK12500 on I2C
-  if (ublox_GNSS.begin(Wire) == true) {
-    MESH_DEBUG_PRINTLN("RAK12500 GPS init correctly with pin %i", ioPin);
+  //Try to init RAK12500 on I2C
+  if (ublox_GNSS.begin(Wire) == true){
+    MESH_DEBUG_PRINTLN("RAK12500 GPS init correctly with pin %i",ioPin);
     ublox_GNSS.setI2COutput(COM_TYPE_UBX);
     ublox_GNSS.enableGNSS(true, SFE_UBLOX_GNSS_ID_GPS);
     ublox_GNSS.enableGNSS(true, SFE_UBLOX_GNSS_ID_GALILEO);
@@ -865,7 +885,7 @@ bool EnvironmentSensorManager::gpsIsAwake(uint8_t ioPin) {
     return true;
   } else if (Serial1.available()) { // RAK12501 (L76K) on UART
     MESH_DEBUG_PRINTLN("Serial GPS init correctly and is turned on");
-    gpsResetPin = ioPin;
+    gpsResetPin = ioPin;  // WB_IO2
     serialGPSFlag = true;
     gps_active = true;
     gps_detected = true;
@@ -881,6 +901,7 @@ bool EnvironmentSensorManager::gpsIsAwake(uint8_t ioPin) {
 #endif
 
 void EnvironmentSensorManager::start_gps() {
+  // PowerSaving variant
   if (_location->isPowerSavingEnabled()) {
     gps_wake = true;           // gps_active is unchanged (true for GPS sleep, false for GPS off)
     _location->syncTime();     // Clear GPS data and force sync time
@@ -890,16 +911,13 @@ void EnvironmentSensorManager::start_gps() {
      gps_wake = true;
   }
 
-#ifdef RAK_WISBLOCK_GPS
-#ifdef FORCE_GPS_ALIVE
-  // There is no UART command to enter power save for L76K
-  if (i2cGPSFlag) ublox_GNSS.powerSaveMode(false);
-#else
-  pinMode(gpsResetPin, OUTPUT);
-  digitalWrite(gpsResetPin, HIGH); // WB_IO2
-#endif
-  return;
-#endif
+  #ifdef RAK_WISBLOCK_GPS
+    #ifndef RAK_3401
+    pinMode(gpsResetPin, OUTPUT);
+    digitalWrite(gpsResetPin, HIGH);
+    #endif
+    return;
+  #endif
 
   _location->begin();
   _location->reset();
@@ -910,6 +928,7 @@ void EnvironmentSensorManager::start_gps() {
 }
 
 void EnvironmentSensorManager::stop_gps() {
+  // PowerSaving variant
   if (_location->isPowerSavingEnabled()) {
     gps_wake = false;          // gps_active is unchanged (true for GPS sleep, false for GPS off)
     _location->stopTimeSync(); // Stop time sync
@@ -920,13 +939,10 @@ void EnvironmentSensorManager::stop_gps() {
   }
 
   #ifdef RAK_WISBLOCK_GPS
-  #ifdef FORCE_GPS_ALIVE
-    // There is no UART command to enter power save for L76K
-    if(i2cGPSFlag) ublox_GNSS.powerSaveMode(false);
-  #else
+    #ifndef RAK_3401 // rak3401 shouldn't turn off WB_IO2 as it powers the PA
     pinMode(gpsResetPin, OUTPUT);
-    digitalWrite(gpsResetPin, LOW); // WB_IO2
-  #endif
+    digitalWrite(gpsResetPin, LOW);
+    #endif
     return;
   #endif
 
@@ -944,7 +960,7 @@ void EnvironmentSensorManager::loop() {
   #if ENV_INCLUDE_GPS
   static long next_gps_update = 0;
 
-  // PowerSaving
+  // PowerSaving variant
   if (_location->isPowerSavingEnabled() && gps_detected && gps_active) {
     // Handle change in PowerSaving mode
     _location->updatePowerSavingSettings(gps_wake);
@@ -974,6 +990,7 @@ void EnvironmentSensorManager::loop() {
     _location->loop();
   }
 
+  // PowerSaving variant
   if ((int32_t)(millis() - next_gps_update) >= 0) {
     if((!_location->isPowerSavingEnabled() && gps_active) || (_location->isPowerSavingEnabled() && gps_wake)){
     #ifdef RAK_WISBLOCK_GPS

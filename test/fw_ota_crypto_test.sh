@@ -43,6 +43,7 @@ HEAD = r"""#include <cstdio>
 #include <AES.h>
 #define MESH_DEBUG_PRINTLN(...) do {} while (0)
 static void yield() {}
+static uint32_t millis() { return 1; }   // (rc25) onDiscovery notes another member's island search
 namespace mesh {
 class GroupChannel { public: uint8_t hash[PATH_HASH_SIZE]; uint8_t secret[PUB_KEY_SIZE]; };   // = src/Mesh.h
 struct Clock { uint32_t t = 1790600000; uint32_t getCurrentTime() { return t; } };
@@ -98,6 +99,8 @@ class FwOtaTransfer { public:
   void answerHeard(const uint8_t*, uint32_t) {}                                           // (rc15) suppression: tested in the simulator
   void answerLater(const uint8_t* r, uint32_t n, uint32_t d) { floodListRsp(r, n, d, false); }
   static const uint32_t ANS_HOP_MS = 1500;
+  uint8_t _camp_key[16] = {0}; struct { uint8_t set = 0, mine = 0; uint8_t origin[4] = {0}; XferManifest m = {}; } _camp; uint32_t _camp_disc_ms = 0;   // (rc25, C95)
+  void onCamp(const uint8_t*, uint32_t, uint8_t, const uint8_t*, uint8_t) {}                // (rc25) the campaign: simulator P1-P10
   void onClaim(const uint8_t*, uint32_t) {}                                                // (study C/D) election claims: simulator
   void onTime(const uint8_t*, uint32_t, uint8_t) {}                                        // (rc21, C57) swarm time: simulator (H15)
   void onDiscovery(Packet* pkt, const uint8_t* data, size_t len);
@@ -161,7 +164,7 @@ int main() {
   }
   { FwOtaTransfer srv, pul; initNode(srv, &air, PUB_S, "PERSIST-TEST-BOARD1"); initNode(pul, &air, PUB_P, "B2");   // "@ID8" and another node's id
     pul._disc_sess = 0x55; pul.sendDiscovery("@1F2E3D4C"); assert(deliver(srv, pul.floods[0]) && srv.floods.size() == 1); checks++;
-    pul.sendDiscovery("@1F2E3D4D"); assert(deliver(srv, pul.floods[1]) && srv.floods.size() == 1); checks++; }
+    pul.sendDiscovery("@A7683B7F"); assert(deliver(srv, pul.floods[1]) && srv.floods.size() == 1); checks++; }
   { // (swarm v1) an IMAGE search ("=<16 hex of its SHA-256>") through the real encryption: the holder answers with its swarm block; another
     // image is not answered; an announcement (session 0, marker LOTA1A) arrives like an answer
     FwOtaTransfer srv, pul; initNode(srv, &air, PUB_S, "PERSIST-TEST-BOARD1"); initNode(pul, &air, PUB_P, "B2");
@@ -224,7 +227,7 @@ int main() {
 cg = fn(mesh, "Packet* Mesh::createGroupDatagram(").replace("Packet* Mesh::createGroupDatagram(", "Packet* MeshStub::createGroupDatagram(", 1)
 statics = "\n".join([fn(src, "static uint32_t listRspLen("), line(r"^static bool isListMsg\(.*$"),
                      fn(src, "static void hmac("), fn(src, "static void pbkdf2Start("), fn(src, "static uint32_t pbkdf2Steps("), fn(src, "static void pbkdf2("), fn(src, "static void ctrXor("),
-                     line(r'^static const char\s+FLOOD_RSP\[\].*$'), line(r'^static const char\s+FLOOD_HEAL\[\].*$'), line(r'^static const char\s+FLOOD_ANN\[\].*$'), line(r'^static const char\s+FLOOD_CLAIM\[\].*$'), line(r'^static const char\s+FLOOD_TREQ\[\].*$'), line(r'^static const char\s+FLOOD_TANS\[\].*$'), fn(src, "static bool hexN("),
+                     line(r'^static const char\s+FLOOD_RSP\[\].*$'), line(r'^static const char\s+FLOOD_HEAL\[\].*$'), line(r'^static const char\s+FLOOD_ANN\[\].*$'), line(r'^static const char\s+FLOOD_CLAIM\[\].*$'), line(r'^static const char\s+FLOOD_TREQ\[\].*$'), line(r'^static const char\s+FLOOD_TANS\[\].*$'), line(r'^static const char\s+FLOOD_CAMP\[\].*$'), line(r'^static const uint32_t CAMP_BODY .*$'), fn(src, "static bool hexN("),
                      line(r'^static const uint32_t LIST_RSP_MAX = .*$'),
                      line(r'^static const uint32_t DISC_RSP_MIN_MS .*$'), line(r'^static const uint32_t DISC_RSP_SPREAD_MS .*$'),
                      fn(src, "static uint8_t discAnswer(")])

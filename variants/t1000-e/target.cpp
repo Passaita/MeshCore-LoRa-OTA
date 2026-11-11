@@ -2,6 +2,7 @@
 #include "t1000e_sensors.h"
 #include "target.h"
 #include <helpers/sensors/MicroNMEALocationProvider.h>
+#include <helpers/sensors/AirohaSleep.h>
 
 T1000eBoard board;
 
@@ -89,46 +90,11 @@ void T1000SensorManager::start_gps() {
     gps_wake = true;
   }
 
-  //_nmea->begin();
-  // this init sequence should be better 
-  // comes from seeed examples and deals with all gps pins
-  pinMode(GPS_EN, OUTPUT);
   digitalWrite(GPS_EN, HIGH);
   delay(10);
-  pinMode(GPS_VRTC_EN, OUTPUT);
-  digitalWrite(GPS_VRTC_EN, HIGH);
-  delay(10);
-       
-  pinMode(GPS_RESET, OUTPUT);
-  digitalWrite(GPS_RESET, HIGH);
-  delay(10);
-  digitalWrite(GPS_RESET, LOW);
-       
-  pinMode(GPS_SLEEP_INT, OUTPUT);
-  digitalWrite(GPS_SLEEP_INT, HIGH);
-  pinMode(GPS_RTC_INT, OUTPUT);
+  digitalWrite(GPS_RTC_INT, HIGH);
+  delay(5);
   digitalWrite(GPS_RTC_INT, LOW);
-  pinMode(GPS_RESETB, INPUT_PULLUP);
-}
-
-void T1000SensorManager::sleep_gps() {
-  if (_nmea->isPowerSavingEnabled()) {
-    gps_wake = false;      // gps_active is unchanged (true) even the GPS sleep (e.g: off)
-    _nmea->stopTimeSync(); // Stop time sync
-    _nmea->setNextWake();  // Next time to on
-  } else {
-    gps_active = false;
-    gps_wake = false; // When GPS is off, wake is false to be sure
-  }
-
-  digitalWrite(GPS_VRTC_EN, HIGH);
-  digitalWrite(GPS_EN, LOW);
-  digitalWrite(GPS_RESET, HIGH);
-  digitalWrite(GPS_SLEEP_INT, HIGH);
-  digitalWrite(GPS_RTC_INT, LOW);
-  pinMode(GPS_RESETB, OUTPUT);
-  digitalWrite(GPS_RESETB, LOW);
-  //_nmea->stop();
 }
 
 void T1000SensorManager::stop_gps() {
@@ -141,20 +107,19 @@ void T1000SensorManager::stop_gps() {
     gps_wake = false; // When GPS is off, wake is false to be sure
   }
 
-  digitalWrite(GPS_VRTC_EN, LOW);
+  digitalWrite(GPS_VRTC_EN, HIGH);   // keep GPS RTC alive for faster fix on wake
+  digitalWrite(GPS_RTC_INT, LOW);    // make sure this is LOW so we can pulse it to wake
+  airohaEnterSleep(_nmea);           // send command to put the GPS into RTC backup sleep
   digitalWrite(GPS_EN, LOW);
-  digitalWrite(GPS_RESET, HIGH);
-  digitalWrite(GPS_SLEEP_INT, HIGH);
-  digitalWrite(GPS_RTC_INT, LOW);
-  pinMode(GPS_RESETB, OUTPUT);
-  digitalWrite(GPS_RESETB, LOW);
-  //_nmea->stop();
 }
 
 
 bool T1000SensorManager::begin() {
   // init GPS
   Serial1.begin(115200);
+  digitalWrite(GPS_RESET, HIGH);
+  delay(10);
+  digitalWrite(GPS_RESET, LOW);
   return true;
 }
 
@@ -182,10 +147,10 @@ void T1000SensorManager::loop() {
       // GPS is awake: check whether it should sleep
       if ((int32_t)(millis() - _nmea->getNextSleep()) >= 0) {
         POWERSAVING_DEBUG_PRINTLN("GPS wake timeout. Enter sleep");
-        sleep_gps();
+        stop_gps();
       } else if (!_nmea->waitingTimeSync()) {
         POWERSAVING_DEBUG_PRINTLN("GPS set. Enter sleep early");
-        sleep_gps();
+        stop_gps();
       }
     } else {
       // GPS is asleep: check whether it should wake
@@ -205,7 +170,7 @@ void T1000SensorManager::loop() {
 
   if ((int32_t)(millis() - next_gps_update) >= 0) {
     if ((!_nmea->isPowerSavingEnabled() && gps_active) || (_nmea->isPowerSavingEnabled() && gps_wake)) {
-      if (_nmea->isValid()) {
+      if (gps_active && _nmea->isValid()) {
         node_lat = ((double)_nmea->getLatitude()) / 1000000.;
         node_lon = ((double)_nmea->getLongitude()) / 1000000.;
         MESH_DEBUG_PRINTLN("lat %f lon %f", node_lat, node_lon);
@@ -236,7 +201,7 @@ bool T1000SensorManager::setSettingValue(const char* name, const char* value) {
   if (strcmp(name, "gps") == 0) {
     if (strcmp(value, "0") == 0) {
       gps_active = false; // Disabled by CLI or App
-      sleep_gps(); // sleep for faster fix !
+      stop_gps();
     } else {
       gps_active = true; // Enabled by CLI or App
       start_gps();

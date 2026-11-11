@@ -1,29 +1,5 @@
 #include "MyMesh.h"
 #include <algorithm>
-#include "helpers/radiolib/RXPowerSaving.h"
-
-static RxPowerSavingControl* getRxPowerSavingControl() {
-#ifdef WRAPPER_CLASS
-  return &radio_driver;
-#else
-  return nullptr;
-#endif
-}
-
-static void applyRxPowerSavingConfig(NodePrefs& prefs, uint8_t sf, float bw) {
-  RxPowerSavingControl* control = getRxPowerSavingControl();
-  normalizeRxPowerSavingConfig(&prefs.rxps, sf, bw, rxPowerSavingCaptureCost(control),
-                               rxPowerSavingTransition(control));
-  bool ok = control != nullptr
-      ? control->setRxPowerSaving(
-            prefs.rxps.enabled != 0, prefs.rxps.rx_us, prefs.rxps.sleep_us)
-      : prefs.rxps.enabled == 0;
-  MESH_DEBUG_PRINTLN("RX Power Saving: desired=%s, rx=%lu, sleep=%lu, %s",
-                     prefs.rxps.enabled ? "on" : "off",
-                     (unsigned long)prefs.rxps.rx_us,
-                     (unsigned long)prefs.rxps.sleep_us,
-                     ok ? "accepted" : "unsupported");
-}
 
 #ifdef FW_OTA
 #include <helpers/fw_ota/FwOtaCli.h>
@@ -131,7 +107,11 @@ uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secr
     uint8_t perms;
     if (strcmp((char *)data, _prefs.password) == 0) { // check for valid admin password
       perms = PERM_ACL_ADMIN;
+#ifdef FLEET_REPEATER_DEFAULTS
+    } else if (_prefs.guest_password[0] && strcmp((char *)data, _prefs.guest_password) == 0) { // (rc22, C65) guest login only with a guest password set
+#else
     } else if (strcmp((char *)data, _prefs.guest_password) == 0) { // check guest password
+#endif
       perms = PERM_ACL_GUEST;
     } else {
 #if MESH_DEBUG
@@ -371,7 +351,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
       int results_offset = 0;
       uint8_t results_buffer[130];
       for(int index = 0; index < count && index + offset < neighbours_count; index++){
-        
+
         // stop if we can't fit another entry in results
         int entry_size = pubkey_prefix_length + 4 + 1;
         if(results_offset + entry_size > sizeof(results_buffer)){
@@ -722,8 +702,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
         mesh::Packet *reply =
             createDatagram(PAYLOAD_TYPE_RESPONSE, client->id, secret, reply_data, reply_len);
         if (reply) {
-          // Outpath PR
-          if (mesh::Packet::isValidPathLen(client->out_path_len)) { // we have an out_path, so send DIRECT
+          if (client->out_path_len != OUT_PATH_UNKNOWN) { // we have an out_path, so send DIRECT
             sendDirect(reply, client->out_path, client->out_path_len, SERVER_RESPONSE_DELAY);
           } else {
             sendFloodReply(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
@@ -738,7 +717,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
     memcpy(&sender_timestamp, data, 4); // timestamp (by sender's RTC clock - which could be wrong)
     uint8_t flags = (data[4] >> 2);        // message attempt number, and other flags
 
-    if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA)) {
+    if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA || flags == TXT_TYPE_CLI_COMMAND)) {
       MESH_DEBUG_PRINTLN("onPeerDataRecv: unsupported text type received: flags=%02x", (uint32_t)flags);
     } else if (sender_timestamp >= client->last_timestamp) { // prevent replay attacks
       bool is_retry = (sender_timestamp == client->last_timestamp);
@@ -756,12 +735,10 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
         mesh::Packet *ack = createAck(ack_hash);
         if (ack) {
-          // Outpath PR
-          if (mesh::Packet::isValidPathLen(client->out_path_len)) {
-            sendDirect(ack, client->out_path, client->out_path_len, TXT_ACK_DELAY);
-          } else {
-            // Outpath PR
+          if (client->out_path_len == OUT_PATH_UNKNOWN) {
             sendFloodReply(ack, TXT_ACK_DELAY, packet->getPathHashSize());
+          } else {
+            sendDirect(ack, client->out_path, client->out_path_len, TXT_ACK_DELAY);
           }
         }
       }
@@ -772,8 +749,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
       if (is_retry) {
         *reply = 0;
       } else {
-        // Outpath PR
-        handleCommand(sender_timestamp, client, command, reply);
+        handleCommand(sender_timestamp, command, reply);
       }
       int text_len = strlen(reply);
       if (text_len > 0) {
@@ -787,12 +763,10 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
         auto reply = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, secret, temp, 5 + text_len);
         if (reply) {
-          // Outpath PR
-          if (mesh::Packet::isValidPathLen(client->out_path_len)) {
-            sendDirect(reply, client->out_path, client->out_path_len, CLI_REPLY_DELAY_MILLIS);
-          } else {
-            // Outpath PR
+          if (client->out_path_len == OUT_PATH_UNKNOWN) {
             sendFloodReply(reply, CLI_REPLY_DELAY_MILLIS, packet->getPathHashSize());
+          } else {
+            sendDirect(reply, client->out_path, client->out_path_len, CLI_REPLY_DELAY_MILLIS);
           }
         }
       }
@@ -811,11 +785,8 @@ bool MyMesh::onPeerPathRecv(mesh::Packet *packet, int sender_idx, const uint8_t 
     MESH_DEBUG_PRINTLN("PATH to client, path_len=%d", (uint32_t)path_len);
     auto client = acl.getClientByIdx(i);
 
-    // Outpath PR
     // store a copy of path, for sendDirect()
-    if (client->out_path_len != OUT_PATH_FORCE_FLOOD) {
-      client->out_path_len = mesh::Packet::copyPath(client->out_path, path, path_len);
-    }
+    client->out_path_len = mesh::Packet::copyPath(client->out_path, path, path_len);
     client->last_activity = getRTCClock()->getCurrentTime();
   } else {
     MESH_DEBUG_PRINTLN("onPeerPathRecv: invalid peer idx: %d", i);
@@ -832,6 +803,7 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
   uint8_t type = packet->payload[0] & 0xF0;    // just test upper 4 bits
   if (type == CTL_TYPE_NODE_DISCOVER_REQ && packet->payload_len >= 6
       && !_prefs.disable_fwd && discover_limiter.allow(rtc_clock.getCurrentTime())
+      && !isHiddenNode()   // this node wishes to NOT be discoverable
   ) {
     int i = 1;
     uint8_t  filter = packet->payload[i++];
@@ -904,7 +876,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
                mesh::RTCClock &rtc, mesh::MeshTables &tables)
     : mesh::Mesh(radio, ms, rng, rtc, *new StaticPoolPacketManager(32), tables),
       region_map(key_store), temp_map(key_store),
-      _cli(board, rtc, sensors, region_map, acl, &_prefs, this, getRxPowerSavingControl()),
+      _cli(board, rtc, sensors, region_map, acl, &_prefs, this),
       telemetry(MAX_PACKET_PAYLOAD - 4),
       discover_limiter(4, 120),  // max 4 every 2 minutes
       anon_limiter(4, 180)   // max 4 every 3 minutes
@@ -949,6 +921,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.flood_max_advert = 8;
   _prefs.interference_threshold = 0; // disabled
   _prefs.cad_enabled = 0;            // hardware CAD before TX (off by default; 'set cad on')
+  _prefs.loop_detect = LOOP_DETECT_MINIMAL;
 
   // bridge defaults
   _prefs.bridge_enabled = 1;    // enabled
@@ -973,14 +946,26 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.rx_boosted_gain = 1; // enabled by default;
 #endif
 #endif
-  _prefs.radio_fem_rxgain = 0; // PowerSaving and better signal
+
+// PowerSaving variant
+#ifdef RADIO_FEM_RXGAIN
+  _prefs.radio_fem_rxgain = RADIO_FEM_RXGAIN;
+#else
+  _prefs.radio_fem_rxgain = 0;
+#endif
+
+#ifdef RADIO_FEM_TXGAIN
+  _prefs.radio_fem_txgain = RADIO_FEM_TXGAIN;   // board-specific default for PA
+#else
   _prefs.radio_fem_txgain = 0;
+#endif
 
   pending_discover_tag = 0;
   pending_discover_until = 0;
 
   memset(default_scope.key, 0, sizeof(default_scope.key));
 
+  // PowerSaving variant
   // PowerSaving defaults
   _prefs.powersaving_enabled = 1;
 
@@ -992,6 +977,17 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   // (rc21, C63, owner 2026-10-14) receiver (AGC) reset every 60 s on fresh installs: recovers a drifted / desensed front end
   // (built-in MeshCore, off by default). Stored prefs win: an update never changes a running node's setting.
   _prefs.agc_reset_interval = 60 / 4;
+#endif
+#ifdef FLEET_REPEATER_DEFAULTS
+  // (rc22, C65, owner 2026-10-29) the owner's repeater standard for a NEW install (no saved prefs); `set ...` still changes them and an
+  // update never touches stored prefs. The airtime factor stays MeshCore's 1.0 (50 %, owner 2026-10-29); LoRa-OTA's own 'fw duty' is 0.3.
+  _prefs.advert_interval = 0;                // local (zero-hop) adverts off
+  _prefs.flood_advert_interval = 23;         // flood advert every 23 h
+  _prefs.multi_acks = 1;
+  _prefs.loop_detect = LOOP_DETECT_MINIMAL;
+  _prefs.path_hash_mode = 2;                 // 3-byte path hashes
+  _prefs.allow_read_only = 0;
+  _prefs.guest_password[0] = 0;              // empty = guest login OFF (see handleLoginReq)
 #endif
 }
 
@@ -1031,6 +1027,8 @@ void MyMesh::begin(FILESYSTEM *fs) {
 #endif
 
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  // PowerSaving variant
+  _prefs.getRadioPrefs()->applyRxPowerSaving(_prefs.sf, _prefs.bw);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
 
 #ifdef FW_OTA
@@ -1048,6 +1046,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
       // (rc21, C57) a node without an RTC takes the time of a swarm member that has one (never steps back: hold)
       uint8_t clockSource() override { return rtc_clock.chipValid() ? 1 : 0; }
       void clockDiscipline(uint32_t ref) override { rtc_clock.discipline(ref); }
+      bool clockChipFound() override { return rtc_clock.chipFound(); }   // (C76)
     };
     static FloodHost host; host.m = this;
     fw_ota::g_xfer.setFloodHost(&host);
@@ -1058,9 +1057,8 @@ void MyMesh::begin(FILESYSTEM *fs) {
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
-  board.setLoRaFemLnaEnabled(_prefs.radio_fem_rxgain);
-  board.setLoRaFemPaGainEnabled(_prefs.radio_fem_txgain);
-  applyRxPowerSavingConfig(_prefs, _prefs.sf, _prefs.bw);
+
+  board.attachDynamicPrefs(_prefs.getCustom());
 
   updateAdvertTimer();
   updateFloodAdvertTimer();
@@ -1248,7 +1246,7 @@ void MyMesh::formatRadioStatsReply(char *reply) {
 }
 
 void MyMesh::formatPacketStatsReply(char *reply) {
-  StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(), 
+  StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(),
                                        getNumRecvFlood(), getNumRecvDirect());
 }
 
@@ -1271,110 +1269,7 @@ void MyMesh::clearStats() {
   ((SimpleMeshTables *)getTables())->resetStats();
 }
 
-// Outpath PR
-static char* trimSpaces(char* s) {
-  while (*s == ' ') s++;
-  char* end = s + strlen(s);
-  while (end > s && end[-1] == ' ') end--;
-  *end = 0;
-  return s;
-}
-
-static bool parsePathCommand(char* raw, uint8_t* out_path, uint8_t& out_path_len, const char*& err) {
-  if (raw == NULL || out_path == NULL) {
-    err = "Err - bad params";
-    return false;
-  }
-
-  char* spec = trimSpaces(raw);
-  if (*spec == 0) {
-    err = "Err - missing path";
-    return false;
-  }
-  if (strcmp(spec, "clear") == 0 || strcmp(spec, "-") == 0 || strcmp(spec, "none") == 0) {
-    out_path_len = OUT_PATH_UNKNOWN;
-    return true;
-  }
-  if (strcmp(spec, "flood") == 0) {
-    out_path_len = OUT_PATH_FORCE_FLOOD;
-    return true;
-  }
-  if (strcmp(spec, "direct") == 0) {
-    out_path_len = 0;
-    return true;
-  }
-
-  uint8_t hash_size = 0;
-  uint8_t hop_count = 0;
-  char* token = spec;
-  while (token && *token) {
-    char* comma = strchr(token, ',');
-    if (comma) *comma = 0;
-    token = trimSpaces(token);
-
-    int hex_len = strlen(token);
-    if (!(hex_len == 2 || hex_len == 4 || hex_len == 6)) {
-      err = "Err - bad params";
-      return false;
-    }
-
-    uint8_t hop_hash_size = (uint8_t)(hex_len / 2);
-    if (hash_size == 0) {
-      hash_size = hop_hash_size;
-    } else if (hash_size != hop_hash_size) {
-      err = "Err - bad params";
-      return false;
-    }
-
-    if (hop_count >= 63 || (hop_count + 1) * hash_size > MAX_PATH_SIZE) {
-      err = "Err - bad params";
-      return false;
-    }
-    if (!mesh::Utils::fromHex(&out_path[hop_count * hash_size], hash_size, token)) {
-      err = "Err - bad hex";
-      return false;
-    }
-
-    hop_count++;
-    token = comma ? comma + 1 : NULL;
-  }
-
-  if (hash_size == 0 || hop_count == 0) {
-    err = "Err - missing path";
-    return false;
-  }
-  out_path_len = ((hash_size - 1) << 6) | (hop_count & 63);
-  return true;
-}
-
-static void formatPathReply(const uint8_t* path, uint8_t path_len, char* out, size_t out_len) {
-  if (path_len == OUT_PATH_FORCE_FLOOD) {
-    snprintf(out, out_len, "> flood");
-    return;
-  }
-  if (path_len == OUT_PATH_UNKNOWN) {
-    snprintf(out, out_len, "> unknown");
-    return;
-  }
-  if (!mesh::Packet::isValidPathLen(path_len)) {
-    snprintf(out, out_len, "> invalid");
-    return;
-  }
-  if ((path_len & 63) == 0) {
-    snprintf(out, out_len, "> direct");
-    return;
-  }
-
-  uint8_t hash_size = (path_len >> 6) + 1;
-  uint8_t hop_count = path_len & 63;
-  uint8_t byte_len = hop_count * hash_size;
-  char hex[(MAX_PATH_SIZE * 2) + 1];
-  mesh::Utils::toHex(hex, path, byte_len);
-  snprintf(out, out_len, "> hs=%u hops=%u hex=%s", (uint32_t)hash_size, (uint32_t)hop_count, hex);
-}
-
-// Outpath PR
-void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *command, char *reply) {
+void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
   if (region_load_active) {
     if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate 'load' operation
       region_map = temp_map;  // copy over the temp instance as new current map
@@ -1458,34 +1353,6 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char *
       Serial.printf("\n");
     }
     reply[0] = 0;
-  } else if (strcmp(command, "get outpath") == 0
-          || strcmp(command, "set outpath") == 0
-          || strncmp(command, "set outpath ", 12) == 0) {
-    bool is_get = strncmp(command, "get ", 4) == 0;
-    if (sender == NULL) {
-      strcpy(reply, "Err - command needs remote client context");
-    } else if (is_get) {
-      formatPathReply(sender->out_path, sender->out_path_len, reply, 160);
-    } else {
-      char* spec = command + 11;  // length of "set outpath"
-      if (*spec == ' ') spec++;
-
-      uint8_t path[MAX_PATH_SIZE];
-      uint8_t path_len = OUT_PATH_UNKNOWN;
-      const char* err = NULL;
-      if (!parsePathCommand(spec, path, path_len, err)) {
-        strcpy(reply, err ? err : "Err - invalid path");
-      } else {
-        if (path_len == OUT_PATH_UNKNOWN || path_len == OUT_PATH_FORCE_FLOOD) {
-          memset(sender->out_path, 0, sizeof(sender->out_path));
-          sender->out_path_len = path_len;
-        } else {
-          sender->out_path_len = mesh::Packet::copyPath(sender->out_path, path, path_len);
-        }
-        dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
-        formatPathReply(sender->out_path, sender->out_path_len, reply, 160);
-      }
-    }
   } else if (memcmp(command, "discover.neighbors", 18) == 0) {
     const char* sub = command + 18;
     while (*sub == ' ') sub++;
@@ -1543,14 +1410,16 @@ void MyMesh::loop() {
   if (set_radio_at && millisHasNowPassed(set_radio_at)) { // apply pending (temporary) radio params
     set_radio_at = 0;                                     // clear timer
     radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
-    applyRxPowerSavingConfig(_prefs, pending_sf, pending_bw);
+    // PowerSaving variant
+    _prefs.getRadioPrefs()->applyRxPowerSaving(pending_sf, pending_bw);
     MESH_DEBUG_PRINTLN("Temp radio params");
   }
 
   if (revert_radio_at && millisHasNowPassed(revert_radio_at)) { // revert radio params to orig
     revert_radio_at = 0;                                        // clear timer
     radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-    applyRxPowerSavingConfig(_prefs, _prefs.sf, _prefs.bw);
+    // PowerSaving variant
+    _prefs.getRadioPrefs()->applyRxPowerSaving(_prefs.sf, _prefs.bw);
     MESH_DEBUG_PRINTLN("Radio params restored");
   }
 
@@ -1571,7 +1440,10 @@ bool MyMesh::hasPendingWork() const {
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
 #endif
-  const RxPowerSavingControl* control = getRxPowerSavingControl();
-  if (control != nullptr && control->isRxPowerSavingCalibrationActive()) return true;
-  return _mgr->getOutboundTotal() > 0;
+  // PowerSaving variant
+#if defined(FW_OTA) && defined(ESP32)
+  if (fw_ota::g_xfer.needsAwake()) return true;   // (Heltec port) LoRa-OTA timers must not wait out a 30 s light sleep
+#endif
+  return _mgr->getOutboundTotal() > 0 || _mgr->getInboundTotal() > 0 ||  // rxdelay packets wait in the inbound queue
+         isTransmitting() || _prefs.getRadioPrefs()->isRxPowerSavingCalibrationActive();
 }

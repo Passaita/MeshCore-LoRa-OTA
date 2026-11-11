@@ -1,6 +1,6 @@
 /* Linker script for RAK3401 with LoRa firmware-pull (fw_ota) staging slot.
  *
- * Fork of nrf52840_s140_v6.ld.  The only change is the FLASH region LENGTH:
+ * Fork of nrf52840_s140_v6.ld (IoTThinks v18 incl. PERSISTENT_RAM).  The only change is the FLASH region LENGTH:
  * the application is capped at 0x96000 so the space between there and the
  * LittleFS region (0xED000) can hold one fw_ota staging slot plus a control
  * page.
@@ -35,8 +35,26 @@ MEMORY
 {
   FLASH (rx)     : ORIGIN = 0x26000, LENGTH = 0x96000 - 0x26000
 
-  RAM (rwx) :  ORIGIN = 0x20006000, LENGTH = 0x20040000 - 0x20006000
+  /* (rc23, v18 keep-time, C69) 8 B kept across resets: the software clock's time (IoTThinks PowerSaving-v18, same as their scripts).
+   * Our bootloader's RAM starts at 0x20007F80 (NOINIT) / 0x20008000, so a reset and a LoRa-OTA apply keep it. */
+  PERSISTENT_RAM (rwx) : ORIGIN = 0x20006000, LENGTH = 8
+
+  RAM (rwx) :  ORIGIN = 0x20006000 + 8, LENGTH = 0x20040000 - 0x20006000 - 8
 }
+
+/* (rc24, C98 fix) .persistent goes in its OWN block BEFORE .data. In rc23 it sat in the `INSERT AFTER .data` block below: after it the
+ * location counter was the end of PERSISTENT_RAM (0x20006008), nrf52_common_fwota.ld's `.bss ALIGN(4)` started there = on top of .data,
+ * and the startup zeroing of .bss wiped .data incl. init_array -> HardFault before main() on every boot (fw-315).
+ * release_guard.py elf refuses any image whose RAM sections overlap. */
+SECTIONS
+{
+  .persistent (NOLOAD) :
+  {
+    KEEP(*(.persistent_magic))
+    KEEP(*(.persistent_data))
+    . = ALIGN(4);
+  } > PERSISTENT_RAM
+} INSERT BEFORE .data;
 
 SECTIONS
 {

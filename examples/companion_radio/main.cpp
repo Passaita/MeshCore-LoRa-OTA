@@ -2,10 +2,8 @@
 #include <Mesh.h>
 #include "MyMesh.h"
 
-#ifdef ESP32_PLATFORM
-#include "esp_pm.h"
-#include "esp_bt.h"
-#endif
+// PowerSaving variant
+#include "helpers/PowerSaving.h"
 
 // Believe it or not, this std C function is busted on some platforms!
 static uint32_t _atoi(const char* sp) {
@@ -31,19 +29,38 @@ MultiSerialInterface interface_manager;
     // include nrf52 bluetooth interface
     #include <helpers/nrf52/SerialBLEInterface.h>
     SerialBLEInterface bluetooth_interface;
+  #elif defined(RP2040_PLATFORM)
+    // include rp2040 (Pico W / CYW43) bluetooth interface
+    #include <helpers/rp2040/SerialBLEInterface.h>
+    SerialBLEInterface bluetooth_interface;
   #else
     #error "SerialBLEInterface is not defined for this platform"
   #endif
 #endif
 
 // include wifi interface
-#ifdef WIFI_SSID
+#ifdef ENABLE_WIFI_INTERFACE
+  #ifndef WIFI_SSID
+    #define WIFI_SSID ""
+  #endif
+  #ifndef WIFI_PWD
+    #define WIFI_PWD ""
+  #endif
   #ifndef TCP_PORT
     #define TCP_PORT 5000
   #endif
-  #ifdef ESP32
-    // include esp32 wifi interface
-    #include <helpers/esp32/SerialWifiInterface.h>
+  #ifndef WIFI_RETRY_INTERVAL
+    #if defined(RP2040_PLATFORM)
+      #define WIFI_RETRY_INTERVAL 30000   // each attempt blocks loop(), so retry less often
+    #else
+      #define WIFI_RETRY_INTERVAL 10000   // millis between reconnect attempts
+    #endif
+  #endif
+  #ifndef WIFI_RETRY_TIMEOUT
+    #define WIFI_RETRY_TIMEOUT 5000     // RP2040: cap on how long one join may block loop()
+  #endif
+  #if defined(ESP32) || defined(RP2040_PLATFORM)
+    #include <helpers/wifi/SerialWifiInterface.h>
     SerialWifiInterface wifi_interface;
   #else
     #error "SerialWifiInterface is not defined for this platform"
@@ -100,11 +117,7 @@ MultiSerialInterface interface_manager;
 
 StdRNG fast_rng;
 SimpleMeshTables tables;
-MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store
-   #ifdef DISPLAY_CLASS
-      , &ui_task
-   #endif
-);
+MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store);
 
 /* END GLOBAL OBJECTS */
 
@@ -113,9 +126,13 @@ void halt() {
 }
 
 /* WIFI RECONNECT TRACKERS */
-#if defined(ESP32) && defined(WIFI_SSID)
+#ifdef ENABLE_WIFI_INTERFACE
   bool wifi_needs_reconnect = false;
   unsigned long last_wifi_reconnect_attempt = 0;
+  char wifi_ssid[33] = WIFI_SSID;   // replaced by stored prefs at boot, if set
+  char wifi_pwd[64] = WIFI_PWD;
+  bool wifi_was_connected = false;
+  bool wifi_enabled = false;   // set at boot from prefs; false also when the effective SSID is blank
 #endif
 
 void setup() {
@@ -158,35 +175,36 @@ void setup() {
   #endif
   #endif
   store.begin();
-  the_mesh.begin(
-    #ifdef DISPLAY_CLASS
-        disp != NULL
-    #else
-        false
-    #endif
-  );
+  the_mesh.begin();
 #elif defined(RP2040_PLATFORM)
   LittleFS.begin();
   store.begin();
-  the_mesh.begin(
-    #ifdef DISPLAY_CLASS
-        disp != NULL
-    #else
-        false
-    #endif
-  );
+  the_mesh.begin();
 #elif defined(ESP32)
   SPIFFS.begin(true);
   store.begin();
-  the_mesh.begin(
-    #ifdef DISPLAY_CLASS
-        disp != NULL
-    #else
-        false
-    #endif
-  );
+  the_mesh.begin();
 #else
   #error "need to define filesystem"
+#endif
+
+#ifdef BLE_PIN_CODE // 123456 by default
+  if (the_mesh.getNodePrefs()->ble_pin == 0) {
+#ifdef DISPLAY_CLASS
+    if (disp != NULL && BLE_PIN_CODE == 123456) {
+      StdRNG rng;
+      the_mesh.setBLEPin(rng.nextInt(100000, 999999)); // random pin each session
+    } else {
+      the_mesh.setBLEPin(BLE_PIN_CODE); // otherwise static pin
+    }
+#else
+    the_mesh.setBLEPin(BLE_PIN_CODE); // otherwise static pin
+#endif
+  } else {
+    the_mesh.setBLEPin(the_mesh.getNodePrefs()->ble_pin);
+  }
+#else
+  the_mesh.setBLEPin(0);
 #endif
 
 // add bluetooth interface
@@ -196,23 +214,47 @@ void setup() {
 #endif
 
 // add wifi interface
-#ifdef WIFI_SSID
-  board.setInhibitSleep(true);   // prevent sleep when WiFi is active
-  WiFi.setAutoReconnect(true);
+#ifdef ENABLE_WIFI_INTERFACE
+  // use wifi ssid and password from prefs if ssid is not empty, otherwise use the build flag defaults
+  if (the_mesh.getNodePrefs()->wifi_ssid[0]) {
+    strcpy(wifi_ssid, the_mesh.getNodePrefs()->wifi_ssid);
+    strcpy(wifi_pwd, the_mesh.getNodePrefs()->wifi_pwd);
+  }
+  // only start wifi if enabled and ssid is not empty
+  wifi_enabled = the_mesh.getNodePrefs()->wifi_enabled;
+  if (wifi_enabled && wifi_ssid[0]) {
+#if defined(ESP32)
+    board.setInhibitSleep(true);   // prevent sleep when WiFi is active
+    WiFi.setAutoReconnect(true);
 
-  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info){
-      if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-          WIFI_DEBUG_PRINTLN("WiFi disconnected. Flagging for reconnect...");
-          wifi_needs_reconnect = true;
-      } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
-          WIFI_DEBUG_PRINTLN("WiFi connected successfully!");
-          wifi_needs_reconnect = false;
-      }
-  });
+    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info){
+        if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+            WIFI_DEBUG_PRINTLN("WiFi disconnected (reason=%s). Flagging for reconnect...",
+              WiFi.disconnectReasonName((wifi_err_reason_t)info.wifi_sta_disconnected.reason));
+            wifi_needs_reconnect = true;
+        } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+            WIFI_DEBUG_PRINTLN("WiFi connected successfully!");
+            wifi_needs_reconnect = false;
+        }
+    });
+#endif
 
-  WiFi.begin(WIFI_SSID, WIFI_PWD);
-  wifi_interface.begin(TCP_PORT);
-  interface_manager.addInterface(InterfaceType::WiFi, &wifi_interface);
+    WIFI_DEBUG_PRINTLN("connecting to %s", wifi_ssid);
+
+#if defined(RP2040_PLATFORM)
+    // the join itself blocks inside the core (CYW43::begin busy-waits for the
+    // association), so every attempt stalls the mesh loop. beginNoBlock() only skips the
+    // extra DHCP wait. Give the first connect a full window, then bound the retries below.
+    WiFi.beginNoBlock(wifi_ssid, wifi_pwd);
+    last_wifi_reconnect_attempt = millis();   // let DHCP finish before the poll can retry
+#else
+    WiFi.begin(wifi_ssid, wifi_pwd);
+#endif
+    wifi_interface.begin(TCP_PORT);
+    interface_manager.addInterface(InterfaceType::WiFi, &wifi_interface);
+  } else {
+    WIFI_DEBUG_PRINTLN("wifi disabled");
+  }
 #endif
 
 // add usb interface
@@ -236,16 +278,6 @@ void setup() {
 #endif
 
   the_mesh.startInterface(interface_manager);
-
-#if ENV_INCLUDE_GPS == 1
-  // Apply PowerSaving profile for GPS
-  if (sensors.getLocationProvider() != NULL) {
-    // GPS on and off duration in seconds
-    sensors.getLocationProvider()->setPowerSavingProfile(the_mesh.getNodePrefs()->powersaving_enabled, 600,
-                                                         1800); // Max 10 minutes, 30 minutes
-  }
-#endif
-
   sensors.begin();
 
 #if ENV_INCLUDE_GPS == 1
@@ -254,40 +286,13 @@ void setup() {
 
 #ifdef DISPLAY_CLASS
   ui_task.begin(disp, &sensors, the_mesh.getNodePrefs());  // still want to pass this in as dependency, as prefs might be moved
+  the_mesh.setListener(&ui_task);
 #endif
 
   board.onBootComplete();
 
 #if defined(ESP32_PLATFORM)
-  #if defined(BLE_PIN_CODE) && !CONFIG_IDF_TARGET_ESP32C6
-    // Enable BLE sleep
-    esp_bt_sleep_enable();
-  #endif
-
-#if CONFIG_IDF_TARGET_ESP32C3
-  esp_pm_config_esp32c3_t pm_config;
-#elif CONFIG_IDF_TARGET_ESP32S3
-  esp_pm_config_esp32s3_t pm_config;
-#elif CONFIG_IDF_TARGET_ESP32
-  esp_pm_config_esp32_t pm_config;
-#elif CONFIG_IDF_TARGET_ESP32C6
-  esp_pm_config_t pm_config;
-#endif
-
-  // Configure Power Management
-#if (defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT) || defined(ENABLE_USB_INTERFACE)
-  // Disable automatic light sleep for USB CDC Serial and USB Companion
-  pm_config = { .max_freq_mhz = 80, .min_freq_mhz = 40, .light_sleep_enable = false };
-#else
-  pm_config = { .max_freq_mhz = 80, .min_freq_mhz = 40, .light_sleep_enable = true };
-#endif
-
-  esp_err_t errPM = esp_pm_configure(&pm_config);
-  if (errPM == ESP_OK) {
-    Serial.println("Power Management configured successfully");
-  } else {
-    Serial.printf("Power Management failed to configure: %d\r\n", errPM);
-  }
+  PowerSaving::applyCompanionPowerSaving(the_mesh.getNodePrefs()->powersaving_enabled);
 #endif
 }
 
@@ -299,31 +304,63 @@ void loop() {
   ui_task.loop();
 #endif
   rtc_clock.tick();
+  board.loop();
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.loop();
 #endif
 
-  if (!the_mesh.hasPendingWork()) {
+  if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)
     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
 #elif defined(ESP32_PLATFORM)
   #if defined(BLE_PIN_CODE)
-    if (!bluetooth_interface.isReadBusy() && !bluetooth_interface.isWriteBusy()) { // BLE is not busy
-      vTaskDelay(pdMS_TO_TICKS(10)); // attempt to sleep
-    }
+      if (!bluetooth_interface.isReadBusy() && !bluetooth_interface.isWriteBusy()) { // BLE is not busy
+        vTaskDelay(pdMS_TO_TICKS(10));                                               // attempt to sleep
+      }
   #elif defined(ENABLE_USB_INTERFACE)
-    vTaskDelay(pdMS_TO_TICKS(10)); // attempt to sleep
+      if(!usb_serial_interface.isReadBusy() && !usb_serial_interface.isWriteBusy()){
+        vTaskDelay(pdMS_TO_TICKS(10)); // attempt to sleep
+      }
   #endif
 #endif
   }
 
-#if defined(ESP32) && defined(WIFI_SSID)
-  // Safely attempt to reconnect every 10 seconds if flagged
-  if (wifi_needs_reconnect && (millis() - last_wifi_reconnect_attempt > 10000)) {
-    WIFI_DEBUG_PRINTLN("Attempting manual WiFi reconnect...");
-    WiFi.disconnect();
-    WiFi.reconnect();
-    last_wifi_reconnect_attempt = millis();
+#if defined(ESP32_PLATFORM)
+  static uint8_t applied_powersaving = the_mesh.getNodePrefs()->powersaving_enabled;
+  if (the_mesh.getNodePrefs()->powersaving_enabled != applied_powersaving) { // changed via CLI
+    applied_powersaving = the_mesh.getNodePrefs()->powersaving_enabled;
+    PowerSaving::applyCompanionPowerSaving(applied_powersaving);
+  }
+#endif
+
+#ifdef ENABLE_WIFI_INTERFACE
+  if (wifi_enabled) {
+    // RP2040 has no WiFi event callbacks, so poll the link state instead
+  #if defined(RP2040_PLATFORM)
+      wifi_needs_reconnect = (WiFi.status() != WL_CONNECTED);
+      if (wifi_was_connected == wifi_needs_reconnect) {   // link state changed
+        wifi_was_connected = !wifi_needs_reconnect;
+        if (wifi_was_connected) {
+          WIFI_DEBUG_PRINTLN("connected, listening on %s:%d", WiFi.localIP().toString().c_str(), TCP_PORT);
+        } else {
+          WIFI_DEBUG_PRINTLN("link lost");
+        }
+      }
+  #endif
+
+    // Safely attempt to reconnect if flagged. On RP2040 each attempt blocks the mesh loop
+    // for up to WIFI_RETRY_TIMEOUT, so retry less often and cap how long a join may stall.
+    if (wifi_needs_reconnect && (millis() - last_wifi_reconnect_attempt > WIFI_RETRY_INTERVAL)) {
+      WIFI_DEBUG_PRINTLN("Attempting manual WiFi reconnect to %s (status %d)...", wifi_ssid, WiFi.status());
+    #if defined(RP2040_PLATFORM)
+        WiFi.setTimeout(WIFI_RETRY_TIMEOUT);
+        WiFi.beginNoBlock(wifi_ssid, wifi_pwd);   // no reconnect() on this platform
+    #else
+        WiFi.disconnect();
+        WiFi.reconnect();
+    #endif
+      last_wifi_reconnect_attempt = millis();
+    }
   }
 #endif
 }

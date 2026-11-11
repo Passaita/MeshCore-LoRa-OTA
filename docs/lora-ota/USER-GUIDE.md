@@ -1,6 +1,7 @@
 # LoRa-OTA - user guide
 
-Current for **app v1.17.28-rc21 (fw-304)** and **bootloader rev 8**. All commands are typed in the repeater's CLI: the serial console,
+Current for **app v1.18.0-rc25** (RAK3401 fw-318, Heltec V4 fw-319) and **bootloader rev 8** (RAK3401). This guide is written for the
+RAK3401; the Heltec V4 differences (USB first install, Wi-Fi seeding, install by the app with probation) are in [HELTEC-V4.md](HELTEC-V4.md). All commands are typed in the repeater's CLI: the serial console,
 or the MeshCore phone app's remote-admin session after an admin login. Full command list: [COMMANDS.md](COMMANDS.md).
 
 ## 1. What a node needs
@@ -8,32 +9,34 @@ or the MeshCore phone app's remote-admin session after an admin login. Full comm
 | Piece | How to check | Needed for |
 |---|---|---|
 | LoRa-OTA bootloader, rev 8 recommended | `fw bl` -> `bootloader rev 8, 39000 B, crc E0BC335E` | applying LoRa pulls; rev 5+ for `fw pull-ble` |
-| LoRa-OTA app v1.17.28 | `ver` -> `v1.17.28-rc21 LoRa-OTA on v1.17.1@b7cc0e6d (Build: ...)` | everything below |
+| LoRa-OTA app v1.18.0 | `ver` -> `v1.18.0-rc25 LoRa-OTA on v1.18.0@743bb28f (Build: ... fw-318)` | everything below |
 | The circle passphrase | `fw passphrase` -> `circle set, fingerprint XXXXXXXX` | finding, serving and pulling |
 
 v1.17.28 does not talk LoRa-OTA with v1.17.27 or older (security v2 changed the protocol). Move such nodes by Bluetooth once.
 rc12 and newer cannot read the answers of rc11 and older: update older nodes by Bluetooth, or seed the new version on a node that keeps
-its old firmware (section 4).
+its old firmware (section 4). v1.18.0 (MeshCore 1.18 base) and v1.17.28-rc21/rc22 nodes pull from each other normally; `fw push`
+needs rc25 on the origin and on the nodes that should join (older nodes still fill from a holder's announces).
 
 Release files:
 
 | File | Use |
 |---|---|
-| `LoRa-OTA-app-<ver>-firmware.zip` | app for the nRF DFU phone app after `start ota` (installs it) |
-| `LoRa-OTA-app-<ver>-slot.zip` | for `fw pull-ble`: puts the image in the SLOT (served, not installed) |
+| `LoRa-OTA-RAK3401-app-<ver>-firmware.zip` | app for the nRF DFU phone app after `start ota` (installs it) |
+| `LoRa-OTA-RAK3401-app-<ver>-slot.zip` | for `fw pull-ble`: puts the image in the SLOT (served, not installed) |
 | `LoRa-OTA-RAK3401-app-<ver>.lota` | the LoRa-OTA image itself (what nodes serve from their slot) |
 | `LoRa-OTA-bootloader-rev8_s140_6.1.1-ONBOARD.zip` | bootloader by Bluetooth, from the stock OTAFIX bootloader |
 | `LoRa-OTA-bootloader-rev8-bootloader_only.zip` | bootloader by Bluetooth, from an older LoRa-OTA bootloader |
 
 ## 2. Getting started: onboarding a node (one Bluetooth visit)
 Use the nRF DFU phone app (or a Linux laptop with Bluetooth) and make two uploads, one right after the other:
-1. `start ota` on the node, then upload the bootloader zip to `3401_DFU`. The node comes back in Bluetooth DFU **without an app**.
+1. `start ota` on the node, then upload the bootloader zip to `3401_DFU` (`AdaDFU` with the factory RAK bootloader). The node comes back in Bluetooth DFU **without an app**.
    That's expected.
-2. Right away upload `LoRa-OTA-app-<ver>-firmware.zip` (the *firmware* zip, not the *slot* zip). The node restarts into the LoRa-OTA app.
+2. Right away upload `LoRa-OTA-RAK3401-app-<ver>-firmware.zip` (the *firmware* zip, not the *slot* zip). The node restarts into the LoRa-OTA app.
    It keeps its name, identity and settings. It is off the air between the two uploads.
 3. Join your circle (section 3), then check `ver` and `fw bl`.
-4. Check your radio settings and read each one back. A fresh rc21 install already starts with `powersaving on`, RX power saving
-   `balanced` and the receiver (AGC) reset at 60 s. Set TX power and `set af` for your site.
+4. Check your radio settings and read each one back. A fresh install starts with `powersaving on`, RX power saving `balanced`, the
+   receiver (AGC) reset at 60 s, the IoTThinks TX default and (rc22+) **`fw autoapply off`**: completed pulls wait in the slot for
+   `fw apply`. Set TX power and `set af` for your site; `fw autoapply on` if this node should install by itself.
 5. `clock sync` if the node has an RTC module (RAK12002). It then keeps time through power cuts.
 6. The slot starts empty. It fills with the next update, or right away with `fw pull-ble` + the `-slot.zip`.
 
@@ -59,21 +62,31 @@ fw passphrase                   -> "circle set, fingerprint XXXXXXXX" - the same
 On the node you want to update (remote-admin session):
 ```
 fw peers                scan, wait ~25 s
-fw list                 -> "#1 fw-304 x3 (0hop) | #2 bl-rev-8 x3 (0hop)" - versions, newest first, how many hold it, nearest hops
+fw list                 -> "#1 fw-318 x3 (0hop) | #2 bl-rev-8 x3 (0hop)" - versions, newest first, how many hold it, nearest hops
 fw pull #1              pull that version from the best holder
 fw pull-status          progress at any time; the pull runs unattended
+fw apply                install it once the pull is complete (not needed with 'fw autoapply on')
 ```
 * The pull picks the holder with the best expected speed (its free duty share, the airtime of its relays, the link, its battery). It
   remembers up to 4 holders and moves to the next if its holder goes silent, keeping every chunk.
-* When the image is complete and verified, the node installs it and restarts (`fw autoapply`, default on). It keeps its name, radio
+* When the image is complete and verified it waits in the slot (and is served) until `fw apply`; with `fw autoapply on` the node
+  installs it and restarts by itself. Default: off on new nodes since rc22, older circle members keep their setting. It keeps its name, radio
   settings, identity, passwords and passphrase, and serves that version to others from then on.
 * **If it already runs exactly that image**, the pull only fills its slot so it can serve it. No re-flash.
 * `fw pull <8-hex id>` pulls from that one node, and finds it by itself when it isn't listed.
-* **How long:** about 2 hours from a direct neighbour at `fw duty 1`, roughly 6 hours at the default 0.3, longer through relays
-  (section 8).
+* **How long:** about 5 hours from a direct neighbour at the default `fw duty 0.3` for a RAK3401 image (1457 chunks), about 1.8x as
+  long for a Heltec V4 image, longer through relays (section 8).
+
+### The whole circle: `fw push` (rc25)
+On a node that holds and offers the new version (`fw slot`, `fw serve`): **`fw push`**. Every circle node of the same board that runs
+something older fills its slot with it over the next 7 days: an invite (sent twice), one query by each node after it boots, about one
+reminder a day for the whole circle and the holders' own announces let late and far nodes join. A node behind stock relays that hears
+no holder starts its own pull. **Nothing installs by itself**: check a node with `fw slot` or `fw push-status`, then `fw apply` it.
+`fw push-status` on the origin counts complete / filling / stuck / refused nodes; `fw push-cancel` ends it (filled slots stay).
 
 ### The whole fleet (fleet fill)
-On one node that should install the new version: `fw peers`, `fw list`, then **`fw pull #1 fleet`**. That node installs as usual. Every
+On one node that should get the new version: `fw peers`, `fw list`, then **`fw pull #1 fleet`**. Since rc25 this starts the same
+7-day campaign as `fw push` once the node holds the image. Every
 other LoRa-OTA node that hears the transfer stores the new version in its slot and passes it to its own neighbours over the next hours
 (one hop at a time, quietly). **Nothing else installs by itself.** Check a node with `fw slot`, then `fw apply` it when you're ready.
 Without `fleet`, a pull still fills nodes with an EMPTY slot, but never replaces an older image. `fw pull-abort` on a fleet pull stops
@@ -87,7 +100,7 @@ airtime as one.
 ### Seeding the first node of a new version (Bluetooth into the slot)
 Someone has to hold the new image before anyone can pull it. With bootloader rev 5+:
 1. `fw pull-ble` - the node restarts into a Bluetooth upload mode that writes **into the slot** (`3401_DFU`).
-2. In the nRF DFU phone app, upload the release's **`-slot.zip`** (not the app zip).
+2. In the nRF DFU phone app, upload the release's **`-slot.zip`** (not the app zip). (Heltec V4: Wi-Fi instead, see [HELTEC-V4.md](HELTEC-V4.md).)
 3. The node returns to its old version with the new image in its slot and **serves it**. `fw apply` installs it on this node too.
 
 **Staged rollout (recommended):** seed the new version into the slot of the node closest to you, but don't install it there yet.
@@ -110,7 +123,7 @@ remote node. (A bootloader update by Bluetooth or USB *does* erase the app. See 
   the stock RAK3401 repeater). The node keeps its identity and settings. To come back: on the stock app `start ota`, upload the
   LoRa-OTA app zip. Even the passphrase is still there.
 * **Fully stock:** `start ota`, upload the stock OTAFIX bootloader package (`..._s140_6.1.1.zip`), then the stock app zip.
-* On 1 W boards without a GPS module use stock PowerSaving 17.1.4 or newer. Some builds from late August 2026 switch off the power
+* On 1 W boards without a GPS module use an IoTThinks PowerSaving build, 17.1.4 or newer. Some builds from late August 2026 switch off the power
   amplifier's supply when no GPS answers (MeshCore #3275). LoRa-OTA builds aren't affected (a release test guards it).
 * Stock firmware can't `fw pull`: later updates need a visit again.
 
@@ -136,7 +149,7 @@ behind mesh traffic and wait for 2 s of quiet before sending (up to 20 s).
 * Relays on solar pay for every repeated chunk. Prefer daytime pulls through them, or pause at night.
 
 ## 9. Which firmware, which time, why did it restart?
-* `ver` shows our version, the upstream base and the build time. `fw list` names images by an internal number (`fw-304`);
+* `ver` shows our version, the upstream base and the build time. `fw list` names images by an internal number (`fw-318`; `ver` shows it too);
   `fw serve` and `fw slot` show what this node offers and holds.
 * `fw wdt` - the hardware watchdog (10 min) and the reason of the last reset. Repeated watchdog resets point at power or a bug.
 * `fw time` - the time and where it came from. A node without an RTC asks a circle neighbour that has one, after every boot and every
@@ -171,6 +184,7 @@ The bootloader runs before the app, so a hung app never blocks it.
 ## Safety notes
 * A pull can be interrupted at any point before the install. The running app is only replaced by a fully verified image, and an
   install cut by a power failure is redone at the next boot.
-* There is no automatic rollback to the previous app. Try every new version on a node you can reach before rolling it out.
+* RAK3401: there is no automatic rollback to the previous app. Heltec V4: a new version that does not run 2 min and hear a packet within
+  3 h is replaced by the previous one automatically. Either way, try every new version on a node you can reach before rolling it out.
 * Images aren't signed (by decision, so nodes can always return to stock firmware). Anyone who knows your circle passphrase can
   serve your nodes an image. Treat the passphrase like an admin password. See [SECURITY.md](SECURITY.md).

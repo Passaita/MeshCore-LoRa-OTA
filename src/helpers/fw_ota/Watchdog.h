@@ -30,6 +30,59 @@
 
 #include <Arduino.h>
 #include <stdio.h>
+#if defined(ESP32)
+// (Heltec port) the ESP32 task watchdog on the main loop task, same timeout and the same interface as the nRF52 one below. It does not
+// survive a reset (the ESP-IDF bootloader resets it), so there is no other firmware's timeout to drain (C27 is nRF52 only). A trip ends in
+// a panic reset; esp_reset_reason() then says TASK_WDT. A reset while a new app is on probation returns to the previous app (rollback).
+#include <esp_task_wdt.h>
+#include <esp_system.h>
+#ifndef FW_OTA_WDT_SECS
+#define FW_OTA_WDT_SECS 600                   // 10 min (owner, rc9)
+#endif
+namespace fw_ota {
+class Watchdog {
+public:
+  void start() {
+    _reset_reason = (uint32_t)esp_reset_reason();
+    esp_task_wdt_init(FW_OTA_WDT_SECS, true);              // re-configures the one Arduino started (timeout, panic = reset)
+    esp_task_wdt_add(NULL);                                // the loop task (setup() runs in it)
+    _armed = true;
+  }
+  inline void feed() { if (_armed) esp_task_wdt_reset(); }
+  inline void feedAlways() { feed(); }
+  bool armed() const { return _armed; }
+  bool draining() const { return false; }
+  static uint32_t ourCrv() { return FW_OTA_WDT_SECS; }
+  uint32_t runningSecs() const { return FW_OTA_WDT_SECS; }
+  static const char* secsText(uint32_t secs, char* t) {
+    if (secs >= 7200) sprintf(t, "%u h", (unsigned)(secs / 3600));
+    else if (secs >= 120) sprintf(t, "%u min", (unsigned)(secs / 60));
+    else sprintf(t, "%u s", (unsigned)secs);
+    return t;
+  }
+  static const char* timeoutText() { static char t[12]; return secsText(FW_OTA_WDT_SECS, t); }
+  const char* runningText() const { return timeoutText(); }
+  bool lastResetWasWatchdog() const {
+    return _reset_reason == ESP_RST_TASK_WDT || _reset_reason == ESP_RST_INT_WDT || _reset_reason == ESP_RST_WDT;
+  }
+  const char* lastResetText() const {
+    switch (_reset_reason) {
+      case ESP_RST_TASK_WDT: case ESP_RST_INT_WDT: case ESP_RST_WDT: return "watchdog";
+      case ESP_RST_PANIC:     return "crash";
+      case ESP_RST_BROWNOUT:  return "brownout";
+      case ESP_RST_EXT:       return "reset pin";
+      case ESP_RST_SW:        return "soft reset";
+      case ESP_RST_DEEPSLEEP: return "wake from sleep";
+      default:                return "power on";
+    }
+  }
+private:
+  bool     _armed = false;
+  uint32_t _reset_reason = 0;
+};
+extern Watchdog g_wdt;
+}  // namespace fw_ota
+#else
 #include <nrf_wdt.h>
 
 #ifndef FW_OTA_WDT_SECS
@@ -86,3 +139,4 @@ private:
 extern Watchdog g_wdt;
 
 }  // namespace fw_ota
+#endif  // ESP32

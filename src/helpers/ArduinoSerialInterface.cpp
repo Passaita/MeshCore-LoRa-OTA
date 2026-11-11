@@ -17,6 +17,7 @@ bool ArduinoSerialInterface::isConnected() const {
   return true;   // no way of knowing, so assume yes
 }
 
+// PowerSaving variant
 bool ArduinoSerialInterface::isReadBusy() const {
   return false;
 }

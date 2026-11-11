@@ -1,0 +1,12 @@
+# LoRa-OTA flash layout for 16 MB ESP32-S3 boards (Heltec V4). nvs, otadata, spiffs (MeshCore files: identity, prefs, contacts) and
+# coredump keep the stock default_16MB offsets, so a USB install of this table keeps the node's identity and settings.
+# seeder = the Wi-Fi upload into the slot (`fw pull-wifi`, examples/lora_ota_seeder), written once by the USB install, never sent over LoRa.
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x5000
+otadata,    data, ota,     0xe000,   0x2000
+app0,       app,  ota_0,   0x10000,  0x300000
+app1,       app,  ota_1,   0x310000, 0x300000
+lotaslot,   data, 0x40,    0x610000, 0x200000
+seeder,     app,  factory, 0x810000, 0x200000
+spiffs,     data, spiffs,  0xc90000, 0x360000
+coredump,   data, coredump,0xff0000, 0x10000

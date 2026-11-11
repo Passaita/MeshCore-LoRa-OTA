@@ -33,7 +33,7 @@ static char ethernet_command[160];
 #endif
 
 // For power saving
-unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
+unsigned long POWERSAVING_FIRSTSLEEP_SECS = 300; // The first sleep (if enabled) from boot
 
 #if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
 static unsigned long userBtnDownAt = 0;
@@ -110,6 +110,7 @@ void setup() {
   ethernet_command[0] = 0;
 #endif
 
+  // PowerSaving variant
 #if ENV_INCLUDE_GPS == 1
   // Apply PowerSaving profile for GPS
   if (sensors.getLocationProvider() != NULL) {
@@ -124,6 +125,7 @@ void setup() {
   the_mesh.begin(fs);
 
 #ifdef DISPLAY_CLASS
+  // PowerSaving variant
   // Added board for battery display
   ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION, &board);
 #endif
@@ -148,6 +150,13 @@ void loop() {
 #endif
   // Handle Serial CLI
   int len = strlen(command);
+  // `command` must stay NUL-terminated within its bounds. If it ever isn't,
+  // strlen() above can return >= sizeof(command) and the loop below would then
+  // index past the buffer, so clamp defensively.
+  if (len >= (int)sizeof(command)) {
+    command[0] = 0;
+    len = 0;
+  }
   while (!fw_staging && Serial.available() && len < sizeof(command)-1) {
     char c = Serial.read();
     if (c != '\n') {
@@ -157,8 +166,9 @@ void loop() {
     }
     if (c == '\r') break;
   }
-  if (len == sizeof(command)-1) {  // command buffer full
-    command[sizeof(command)-1] = '\r';
+  if (len == sizeof(command)-1) {  // buffer full: treat as a completed line
+    command[sizeof(command)-2] = '\r';  // place end-of-line marker inside the buffer
+    command[sizeof(command)-1] = 0;     // keep the buffer NUL-terminated
   }
 
   if (len > 0 && command[len - 1] == '\r') {  // received complete line
@@ -168,12 +178,10 @@ void loop() {
     reply[0] = 0;
 #ifdef ETHERNET_ENABLED
     if (!ethernet_handle_command(command, reply)) {
-      // Outpath PR
-      the_mesh.handleCommand(0, NULL, command, reply);
+      the_mesh.handleCommand(0, command, reply);
     }
 #else
-    // Outpath PR
-    the_mesh.handleCommand(0, NULL, command, reply);  // NOTE: there is no sender_timestamp via serial!
+    the_mesh.handleCommand(0, command, reply);  // NOTE: there is no sender_timestamp via serial!
 #endif
     if (reply[0]) {
       Serial.print("  -> "); Serial.println(reply);
@@ -182,14 +190,15 @@ void loop() {
     command[0] = 0;  // reset command buffer
   }
 
+  board.loop();   // let the board feed its watchdog, run periodic housekeeping
+
 #ifdef ETHERNET_ENABLED
   ethernet_loop_maintain();
   if (ethernet_read_line(ethernet_command, sizeof(ethernet_command))) {
     char reply[160];
     reply[0] = 0;
     if (!ethernet_handle_command(ethernet_command, reply)) {
-      // Outpath PR
-      the_mesh.handleCommand(0, NULL, ethernet_command, reply);
+      the_mesh.handleCommand(0, ethernet_command, reply);
     }
     ethernet_send_reply(reply);
     ethernet_command[0] = 0;
@@ -238,6 +247,7 @@ void loop() {
 #endif
   }
 
+  // PowerSaving variant
   if (the_mesh.getNodePrefs()->reboot_interval > 0 &&
       the_mesh.millisHasNowPassed(the_mesh.getNodePrefs()->reboot_interval * 3600000)) {
     board.reboot();

@@ -32,8 +32,8 @@ namespace fw_ota {
 static inline bool cliHelp(const char* arg, char* reply) {
   while (*arg == ' ') arg++;
   if (*arg == 0) {
-    strcpy(reply, "fw help <cmd>: passphrase peers list pull pull-ble blupdate pull-status pull-pause pull-resume pull-abort route serve duty "
-                  "apply autoapply bl radio slot erase");
+    strcpy(reply, "fw help <cmd>: passphrase peers list pull push pull-ble blupdate pull-status/-pause/-resume/-abort route serve duty "
+                  "apply autoapply bl radio slot erase");   // (rc25) push-status / push-cancel: named in 'fw help push'
     return true;
   }
   if (!strcmp(arg, "peers")) {   // (rc17, C38, owner) 'fw peers' asks the peers; 'fw list' lists what they offer
@@ -43,7 +43,16 @@ static inline bool cliHelp(const char* arg, char* reply) {
     strcpy(reply, "fw list [n] - the circle's images of the last 'fw peers' scan, newest first: #n fw-X xHolders (hops). 'fw list hosts [n]' = per holder"); return true;
   }
   if (!strcmp(arg, "pull")) {
-    strcpy(reply, "fw pull <#n|fw-X|id> [duty x] [fleet] [pause Nh] - #n/fw-X: best holder + failover. fleet: hearers replace older slots. pause: start later"); return true;
+    strcpy(reply, "fw pull <#n|fw-X|id> [duty x] [fleet] [pause Nh|Nm] - #n/fw-X: best holder + failover. fleet: hearers replace older slots. pause: start later"); return true;
+  }
+  if (!strcmp(arg, "push")) {   // (rc25, C95)
+    strcpy(reply, "fw push - the circle fills this slot image 7 d (same board, older nodes, late ones too); slots only, install = fw apply. Also push-status, push-cancel"); return true;
+  }
+  if (!strcmp(arg, "push-status")) {
+    strcpy(reply, "fw push-status - origin: complete/filling/stuck/refused nodes; member: its part (filled, filling n%, waiting, stuck, refused)"); return true;
+  }
+  if (!strcmp(arg, "push-cancel")) {
+    strcpy(reply, "fw push-cancel - (origin) nobody joins the push any more; fills pause; filled slots stay; nothing installs"); return true;
   }
   if (!strcmp(arg, "blupdate")) {
     strcpy(reply, "fw blupdate [force] <id|#n> - pull a peer's BOOTLOADER (your circle); id AABB/AABBCC found by a scan (clash = refused); force = same/older rev too"); return true;
@@ -52,10 +61,10 @@ static inline bool cliHelp(const char* arg, char* reply) {
     strcpy(reply, "fw pull-status - progress of the current pull: chunks, rate, ETA, or the last result (COMPLETE/FAILED/idle)"); return true;
   }
   if (!strcmp(arg, "pull-pause")) {
-    strcpy(reply, "fw pull-pause [Nh] - stop sending (chunks kept, server share freed) until pull-resume, or N hours (1-168)"); return true;
+    strcpy(reply, "fw pull-pause [Nh|Nm|NhMm] - stop sending (chunks kept, server share freed) until pull-resume, or for 1 min..168 h"); return true;
   }
   if (!strcmp(arg, "pull-resume")) {
-    strcpy(reply, "fw pull-resume - continue a paused pull from the first missing chunk; a paused fill ('fw slot': partial) is finished from the nearest holder"); return true;
+    strcpy(reply, "fw pull-resume [duty x] - continue a paused pull (chunks kept) or a paused fill; duty x: this pull's share now, also while it runs"); return true;
   }
   if (!strcmp(arg, "pull-abort")) {
     strcpy(reply, "fw pull-abort - cancel a waiting/in-progress pull now and clear its saved state; a fleet pull also stops its listeners (repeated 30 min)"); return true;
@@ -76,10 +85,14 @@ static inline bool cliHelp(const char* arg, char* reply) {
     strcpy(reply, "fw pull-ble - restart into Bluetooth upload INTO THE SLOT (bootloader rev 5+): phone DFU app, the -slot.zip; then served. 5 min idle = back"); return true;
   }
   if (!strcmp(arg, "apply")) {
+#if defined(ESP32)
+    strcpy(reply, "fw apply - install the slot image on this node: marks it pending and restarts; it is installed at the start (= fw pending + reboot)"); return true;
+#else
     strcpy(reply, "fw apply - install the slot image on this node: marks it pending and restarts; the bootloader applies it (= fw pending + reboot)"); return true;
+#endif
   }
   if (!strcmp(arg, "autoapply")) {
-    strcpy(reply, "fw autoapply on|off - apply a completed, verified pull automatically (set pending + reboot); default on"); return true;
+    strcpy(reply, "fw autoapply on|off - install a completed, verified pull unattended (set pending + reboot); off on new nodes: 'fw apply'"); return true;
   }
   if (!strcmp(arg, "minbatt")) {
     strcpy(reply, "fw minbatt [mV|off] - below it this node is a LOW holder (pullers take it last); 150 mV below CRITICAL: it stops serving"); return true;
@@ -126,7 +139,7 @@ static inline bool cliHelp(const char* arg, char* reply) {
     strcpy(reply, "fw stage <args> - serial console only: host script writes a real image into the slot over USB (see tools/fw_ota_stage.py)"); return true;
   }
 #endif
-  snprintf(reply, 160, "fw help: no such command '%s' - 'fw help' lists them", arg);
+  snprintf(reply, 160, "ERR - no command '%s' (fw help)", arg);
   return true;
 }
 
@@ -145,6 +158,11 @@ static inline bool cliHandle(const char* command, char* reply, bool remote = fal
   memcpy(abuf, arg, al); abuf[al] = 0; arg = abuf;
 
   if (strcmp(arg, "geo") == 0) {
+#if defined(ESP32)
+    snprintf(reply, 160, "app @%06lX (running, %luK partitions) slot@%06lX %luK payload<=%luB ctrl@%06lX",   // (Heltec port)
+             (unsigned long)appRunAddr(), (unsigned long)(APP_MAX_SIZE / 1024), (unsigned long)SLOT_ADDR,
+             (unsigned long)(SLOT_SIZE / 1024), (unsigned long)SLOT_PAYLOAD_MAX, (unsigned long)CTRL_ADDR);
+#else
     snprintf(reply, 160,
              "app %06lX-%06lX(%luK) slot@%06lX %luK payload<=%luB ctrl@%06lX",
              (unsigned long)APP_REGION_START, (unsigned long)APP_REGION_END,
@@ -152,13 +170,14 @@ static inline bool cliHandle(const char* command, char* reply, bool remote = fal
              (unsigned long)SLOT_ADDR,
              (unsigned long)(SLOT_SIZE / 1024), (unsigned long)SLOT_PAYLOAD_MAX,
              (unsigned long)CTRL_ADDR);
+#endif
     return true;
   }
 
   if (strcmp(arg, "ctl") == 0) {
     CtrlBlock b;
-    if (!readCtrl(b)) { strcpy(reply, "ctrl: blank / no magic"); return true; }
-    snprintf(reply, 160, "ctrl state=%lu attempts=%lu fails=%lu last=%lu",
+    if (!readCtrl(b)) { strcpy(reply, "ctrl: blank"); return true; }
+    snprintf(reply, 160, "ctrl st=%lu tries=%lu fails=%lu last=%lu",
              (unsigned long)b.apply_state, (unsigned long)b.boot_attempts,
              (unsigned long)b.fail_count, (unsigned long)b.last_result);
     return true;
@@ -220,7 +239,7 @@ static inline bool cliHandle(const char* command, char* reply, bool remote = fal
     SlotHeader h;
     if (!readSlotHeader(h)) { strcpy(reply, "slot empty"); return true; }
     uint32_t c = crc32_flash(SLOT_ADDR + SLOT_PAYLOAD_OFFSET, h.payload_len);
-    snprintf(reply, 160, "hdr crc=%08lX  recomputed=%08lX  -> %s",
+    snprintf(reply, 160, "crc %08lX/%08lX %s",
             (unsigned long)h.payload_crc32, (unsigned long)c,
             (c == h.payload_crc32) ? "MATCH" : "MISMATCH");
     return true;
@@ -236,8 +255,15 @@ static inline bool cliHandle(const char* command, char* reply, bool remote = fal
   if (strcmp(arg, "erase") == 0) {
     // just wipe the header page -> slot reads as empty (fill/pull erase as they write). Serving stops by itself: every request re-checks the
     // slot header (imageStillServed). (rc7) Also in release builds - it clears the slot, e.g. for a swarm upload - but never under a pull.
-    if (g_xfer.slotInUse()) { strcpy(reply, "ERR - a pull/stage is using the slot ('fw pull-abort' first)"); return true; }
-    strcpy(reply, eraseSlotHeader() ? "OK - slot marked empty (serving only the bootloader now)" : "ERR - erase failed");
+    if (g_xfer.slotInUse()) { strcpy(reply, "ERR - slot busy (fw pull-abort)"); return true; }
+    // (C90, 2026-11-03) name only what is really still offered: the ESP32 has no LoRa-OTA bootloader, a RAK only offers it when it passes
+    // the bootloader checks (+ serve on, passphrase set)
+    if (!eraseSlotHeader()) { strcpy(reply, "ERR - erase failed"); return true; }
+#if defined(ESP32)
+    strcpy(reply, "OK - slot empty");
+#else
+    strcpy(reply, g_xfer.blServing() ? "OK - slot empty (serving the bootloader)" : "OK - slot empty");
+#endif
     return true;
   }
 
@@ -253,42 +279,46 @@ static inline bool cliHandle(const char* command, char* reply, bool remote = fal
   if (strncmp(arg, "route", 5) == 0)     return g_xfer.cmdRoute(arg + 5, reply);
   // (rc17, C38, owner) 'fw peers' = query the peers (the scan); 'fw list [n]' / 'fw list hosts [n]' = what the circle offers
   if (strcmp(arg, "peers") == 0)         return g_xfer.cmdList(reply);
-  if (strncmp(arg, "peers ", 6) == 0) { strcpy(reply, "'fw peers' scans (no argument); the images: 'fw list [n]', per holder: 'fw list hosts [n]'"); return true; }
+  if (strncmp(arg, "peers ", 6) == 0) { strcpy(reply, "usage: fw list [n|hosts [n]]"); return true; }
   if (strncmp(arg, "list", 4) == 0 && (arg[4] == 0 || arg[4] == ' ')) return g_xfer.cmdPeers(arg + 4, reply);
   if (strncmp(arg, "autoapply", 9) == 0) return g_xfer.cmdAutoApply(arg + 9, reply);
   if (strncmp(arg, "wdt", 3) == 0 && (arg[3] == 0 || arg[3] == ' ')) return g_xfer.cmdWdt(arg + 3, reply);   // (rc8, C23)
   if (strncmp(arg, "minbatt", 7) == 0 && (arg[7] == 0 || arg[7] == ' ')) return g_xfer.cmdMinBatt(arg + 7, reply);   // (swarm v1)
   if (strcmp(arg, "pull-status") == 0)   return g_xfer.cmdStatus(reply);
+  if (strcmp(arg, "push") == 0)          return g_xfer.cmdPush(reply);          // (rc25, C95)
+  if (strcmp(arg, "push-status") == 0)   return g_xfer.cmdPushStatus(reply);
+  if (strcmp(arg, "push-cancel") == 0)   return g_xfer.cmdPushCancel(reply);
   if (strcmp(arg, "pull-abort") == 0)    return g_xfer.cmdAbort(reply);
   if (strncmp(arg, "pull-pause", 10) == 0 && (arg[10] == 0 || arg[10] == ' ')) return g_xfer.cmdPause(arg + 10, reply);   // (v1.17.28, C8)
-  if (strcmp(arg, "pull-resume") == 0)   return g_xfer.cmdResume(reply);
+  if (strncmp(arg, "pull-resume", 11) == 0 && (arg[11] == 0 || arg[11] == ' ')) return g_xfer.cmdResume(arg + 11, reply);   // (rc22, C72) [duty x]
   if (strcmp(arg, "bl") == 0)            return g_xfer.cmdBlInfo(reply);
   if (strncmp(arg, "radio", 5) == 0 && (arg[5] == 0 || arg[5] == ' ')) return g_radiodiag.cmd(arg + 5, reply);
   if (strncmp(arg, "time", 4) == 0 && (arg[4] == 0 || arg[4] == ' ')) return g_xfer.cmdTime(arg + 4, reply);   // (rc21, C57)
   if (strncmp(arg, "duty", 4) == 0 && (arg[4] == 0 || arg[4] == ' ')) return g_xfer.cmdDuty(arg + 4, reply);
   if (strncmp(arg, "passphrase", 10) == 0 && (arg[10] == 0 || arg[10] == ' ')) return g_xfer.cmdPassphrase(arg + 10, reply);   // (v1.17.28)
-  if (strcmp(arg, "pull-ble") == 0)      return g_xfer.cmdPullBle(reply);   // (v1.17.28) before "pull": BLE upload into the slot
+  if (strcmp(arg, "pull-ble") == 0)      return g_xfer.cmdPullBle(reply);
+  if (strcmp(arg, "pull-wifi") == 0)     return g_xfer.cmdPullWifi(reply);   // (Heltec port) the seeder's Wi-Fi upload into the slot   // (v1.17.28) before "pull": BLE upload into the slot
   if (strcmp(arg, "apply") == 0)         return g_xfer.cmdApply(reply);     // (v1.17.28) install the slot image here
   // (v1.17.25) "fw pull|blupdate ... duty x": the duty for THIS pull (overrides the node's 'fw duty', the server's still caps it).
-  // (rc17) options after the id, in any order: duty x | fleet (nodes that hear the stream replace older slot images) | pause Nh (C37: the
+  // (rc17) options after the id, in any order: duty x | fleet (nodes that hear the stream replace older slot images) | pause Nh|Nm (C37: the
   // pull is set up and paused before its first offer). Other words are kept (an old habit: a password after the id is ignored later).
   char dbuf[160];
   if ((strncmp(arg, "pull", 4) == 0 && (arg[4] == ' ' || arg[4] == 0)) || strncmp(arg, "blupdate", 8) == 0) {   // not pull-status / pull-abort
     g_xfer.setNextPullDuty(0); g_xfer.setNextPullOpts(false, 0);
     const bool isbl = strncmp(arg, "blupdate", 8) == 0;
     char src[160]; strncpy(src, arg, sizeof(src) - 1); src[sizeof(src) - 1] = 0;
-    size_t o = 0; bool fleet = false; uint8_t ph = 0;
+    size_t o = 0; bool fleet = false; uint16_t ph = 0;
     for (char* t = strtok(src, " "); t; t = strtok(nullptr, " ")) {
       if (!strcmp(t, "duty")) {
         char* v = strtok(nullptr, " "); uint8_t p = v ? FwOtaTransfer::parseDuty(v) : 0;
-        if (!p) { strcpy(reply, "ERR - duty 0.1 .. 1.0 (e.g. 'fw pull #1 duty 0.5')"); return true; }
+        if (!p) { strcpy(reply, "ERR - duty 0.1-1.0"); return true; }
         g_xfer.setNextPullDuty(p); continue;
       }
       if (!isbl && !strcmp(t, "fleet")) { fleet = true; continue; }
       if (!isbl && !strcmp(t, "pause")) {
-        char* v = strtok(nullptr, " "); char* e = nullptr; long h = v ? strtol(v, &e, 10) : 0;
-        if (!v || e == v || (*e != 'h' && *e != 'H') || e[1] || h < 1 || h > 168) { strcpy(reply, "ERR - pause Nh, N = 1..168 hours (e.g. 'fw pull #1 pause 4h')"); return true; }
-        ph = (uint8_t)h; continue;
+        char* v = strtok(nullptr, " "); const int m = v ? FwOtaTransfer::parsePause(v) : 0;   // (rc22, C75) Nh, Nm or NhMm
+        if (m < 1) { strcpy(reply, "ERR - pause 1m-168h (4h, 2h15m)"); return true; }
+        ph = (uint16_t)m; continue;
       }
       o += (size_t)snprintf(dbuf + o, sizeof(dbuf) - o, "%s%s", o ? " " : "", t);
       if (o >= sizeof(dbuf)) o = sizeof(dbuf) - 1;
@@ -304,7 +334,7 @@ static inline bool cliHandle(const char* command, char* reply, bool remote = fal
     char name[32] = {0};
     uint32_t i = 0;
     while (*p && *p != ' ' && i < sizeof(name) - 1) name[i++] = *p++;
-    if (name[0] == 0) { strcpy(reply, "usage: fw pull <id|#n> [duty x] [fleet] [pause Nh]   (see 'fw list')"); return true; }
+    if (name[0] == 0) { strcpy(reply, "usage: fw pull <#n|fw-X|id> [duty x] [fleet] [pause Nh]"); return true; }
 #ifdef FW_OTA_DEV
     // dev form: '*' only. (rc16) 'fw-N' is the swarm version form here too - the dev form sent it UNTARGETED, and a neighbour serving
     // another image answered NAK and failed the pull (bench 2026-10-07: board 3 vs the twin serving fw-9300)
@@ -316,7 +346,7 @@ static inline bool cliHandle(const char* command, char* reply, bool remote = fal
   // ---- local staging over serial (host script writes a real image) ----
 #ifdef FW_OTA_DEV
   if (strncmp(arg, "stage", 5) == 0) {
-    if (remote) { strcpy(reply, "ERR - fw stage works on the serial console only"); return true; }
+    if (remote) { strcpy(reply, "ERR - USB console only"); return true; }
     return g_xfer.cmdStage(arg + 5, reply);
   }
 #endif
@@ -325,7 +355,7 @@ static inline bool cliHandle(const char* command, char* reply, bool remote = fal
 
   // Every reply must fit the 160-byte reply buffers (serial: char reply[160]; remote: 161 bytes in temp[166]). This usage line had grown to
   // 194 bytes (v1.17.15-19): an unknown or mistyped 'fw' command (e.g. "fw status") overran the buffer and froze the node - also remotely.
-  static const char USAGE[] = "fw: passphrase|peers|list|pull|pull-ble|blupdate|pull-status|pull-pause|pull-resume|pull-abort|route|serve|duty|apply|"
+  static const char USAGE[] = "fw: passphrase|peers|list|pull|push|pull-ble|blupdate|pull-status|pull-pause|pull-resume|pull-abort|route|serve|duty|apply|"
                               "autoapply|bl|slot - 'fw help'";
   static_assert(sizeof(USAGE) <= 160, "fw usage reply must fit the 160-byte reply buffer");
   strcpy(reply, USAGE);

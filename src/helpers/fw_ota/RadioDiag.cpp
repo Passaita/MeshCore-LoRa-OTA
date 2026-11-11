@@ -1,5 +1,11 @@
 #include "RadioDiag.h"
 
+// (rc22, C67, owner rule 2026-10-16) the record is written to flash (up to 2 writes per event) only in dev and rc builds; a final release
+// builds with -D FWOTA_DIAG_LOG=0 and keeps it in RAM ('fw radio' then shows this boot only). release.sh checks the flag per build type.
+#ifndef FWOTA_DIAG_LOG
+#define FWOTA_DIAG_LOG 1
+#endif
+
 namespace fw_ota {
 
 RadioDiag g_radiodiag;
@@ -12,7 +18,7 @@ static const uint32_t SILENT_MS    = 10UL * 60 * 1000;    // no packet received 
 void RadioDiag::begin(FILESYSTEM* fs, mesh::RTCClock* rtc) {
   _fs = fs; _rtc = rtc;
   memset(&_s, 0, sizeof(_s));
-  if (_fs && _fs->exists(RADIO_FILE)) {
+  if (FWOTA_DIAG_LOG && _fs && _fs->exists(RADIO_FILE)) {
     File f = _fs->open(RADIO_FILE);
     if (f) { if (f.read((uint8_t*)&_s, sizeof(_s)) != (int)sizeof(_s) || _s.magic != RADIO_MAGIC) memset(&_s, 0, sizeof(_s)); f.close(); }
   }
@@ -22,7 +28,7 @@ void RadioDiag::begin(FILESYSTEM* fs, mesh::RTCClock* rtc) {
 uint32_t RadioDiag::epoch() const { return _rtc ? _rtc->getCurrentTime() : 0; }
 
 void RadioDiag::save() {
-  if (!_fs) return;
+  if (!FWOTA_DIAG_LOG || !_fs) return;
   _fs->remove(RADIO_FILE);
   File f = _fs->open(RADIO_FILE, FILE_O_WRITE);
   if (f) { f.write((const uint8_t*)&_s, sizeof(_s)); f.close(); }
@@ -71,10 +77,11 @@ bool RadioDiag::cmd(const char* arg, char* reply) {
   char a1[16] = "-", a2[16] = "-";
   if (_s.nonrx_n && _s.nonrx_epoch && e >= _s.nonrx_epoch) snprintf(a1, sizeof(a1), "%lum ago", (unsigned long)((e - _s.nonrx_epoch) / 60));
   if (_s.silent_n && _s.silent_epoch && e >= _s.silent_epoch) snprintf(a2, sizeof(a2), "%lum ago", (unsigned long)((e - _s.silent_epoch) / 60));
-  snprintf(reply, 160, "radio: nonRX>8s x%u (max %lus, last %s) | silent>10m x%u (max %lum, last %s, %s, sent %u) | now: rx %lus ago%s",
+  snprintf(reply, 160, "radio: nonRX>8s x%u (max %lus, %s) | silent>10m x%u (max %lum, %s, %s, tx %u) | rx %lus ago%s",
            (unsigned)_s.nonrx_n, (unsigned long)(_s.nonrx_max_ms / 1000), a1,
            (unsigned)_s.silent_n, (unsigned long)(_s.silent_max_s / 60), a2, _s.silent_inrx ? "inRX" : "notRX", (unsigned)_s.silent_sent,
            (unsigned long)((now - _last_rx_ms) / 1000), _nonrx_start ? ", NOT in Rx" : "");
+  if (!FWOTA_DIAG_LOG) { const size_t l = strlen(reply); if (l + 18 < 160) strcpy(reply + l, " (this boot only)"); }
   return true;
 }
 

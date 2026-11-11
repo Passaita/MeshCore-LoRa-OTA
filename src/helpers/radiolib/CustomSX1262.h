@@ -2,6 +2,8 @@
 
 #include <RadioLib.h>
 #include "MeshCore.h"
+
+// PowerSaving variant
 #include "RXPowerSaving.h"   // MC_TCXO_DELAY_US
 
 class CustomSX1262 : public SX1262 {
@@ -11,12 +13,14 @@ class CustomSX1262 : public SX1262 {
   bool _headerSeen = false;
 
   public:
+    // PowerSaving variant
     // The sleep -> RX transition RadioLib subtracts from a duty-cycle sleep.
     // Protected in the RadioLib base, so the RXPS layer reads it through here.
     uint32_t getTcxoDelay() const { return tcxoDelay; }
 
     CustomSX1262(Module *mod) : SX1262(mod) { }
 
+    // PowerSaving variant
     // RadioLib's begin() installs its own 5000 us TCXO startup delay and
     // setTCXO() does not recalibrate, so MeshCore's value has to be written
     // afterwards and the RC calibrations redone against the new clock-gating
@@ -29,18 +33,21 @@ class CustomSX1262 : public SX1262 {
                   bool useRegulatorLDO = false) {
       int16_t state = SX1262::begin(freq, bw, sf, cr, syncWord, power, preambleLength,
                                     tcxoVoltage, useRegulatorLDO);
-      if (state == RADIOLIB_ERR_NONE) applyMeshCoreTcxoDelay();
+      if (state == RADIOLIB_ERR_NONE) state = applyMeshCoreTcxoDelay();
       return state;
     }
 
+    // PowerSaving variant
     // Read tcxoVoltage back from the chip object rather than from the argument:
     // begin() zeroes it when it falls back to an XTAL, and re-asserting a TCXO
     // supply on DIO3 for a board that has none would be worse than a long delay.
-    void applyMeshCoreTcxoDelay() {
-      if (tcxoVoltage <= 0.0f) return;
-      setTCXO(tcxoVoltage, MC_TCXO_DELAY_US);
-      calibrate(RADIOLIB_SX126X_CALIBRATE_ALL);
+    int16_t applyMeshCoreTcxoDelay() {
+      if (tcxoVoltage <= 0.0f) return RADIOLIB_ERR_NONE;
+      int16_t state = setTCXO(tcxoVoltage, MC_TCXO_DELAY_US);
+      RADIOLIB_ASSERT(state);
+      state = calibrate(RADIOLIB_SX126X_CALIBRATE_ALL);
       delay(50);
+      return state;
     }
 
   #ifdef RP2040_PLATFORM
@@ -136,6 +143,7 @@ class CustomSX1262 : public SX1262 {
       return SX1262::startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED), RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
     }
 
+    // PowerSaving variant
     int16_t startReceiveDutyCycle(uint32_t rxPeriod, uint32_t sleepPeriod,
                                   RadioLibIrqFlags_t irqFlags = RADIOLIB_IRQ_RX_DEFAULT_FLAGS,
                                   RadioLibIrqFlags_t irqMask = RADIOLIB_IRQ_RX_DEFAULT_MASK) {
@@ -149,6 +157,7 @@ class CustomSX1262 : public SX1262 {
       return state;
     }
 
+    // PowerSaving variant
     bool isChipBusy() {
       uint32_t busy = this->mod->getGpio();
       return busy != RADIOLIB_NC && this->mod->hal->digitalRead(busy);
@@ -197,6 +206,7 @@ class CustomSX1262 : public SX1262 {
       return false;
     }
 
+    // PowerSaving variant
     int16_t stopRTC() {
       uint8_t rtcStop = 0x00;
       int16_t state = writeRegister(RADIOLIB_SX126X_REG_RTC_CTRL, &rtcStop, 1);

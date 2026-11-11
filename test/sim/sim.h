@@ -49,6 +49,8 @@ struct Ms : public mesh::MillisecondClock { unsigned long getMillis() override {
 struct Rtc : public mesh::RTCClock {
   static const uint32_t T0 = 1791300000, FLOOR = 1772323200;   // the true time at g_sim_now 0; RTC_TIME_MIN (1 Mar 2026)
   bool chip = true; int32_t chip_off = 0;                       // an RTC chip (true time + chip_off)
+  bool unset = false;                                           // (C76) the chip answers but holds no valid time (new / lost power) until written
+  bool valid() const { return chip && !unset; }
   double drift_ppm = 0;                                         // the software clock's rate error
   uint32_t base = T0, at_ms = 0, frozen = 0; bool lost = false; // raw = base + (now - at_ms) * (1 + drift)
   fw_ota::ClockHold h{};
@@ -57,10 +59,11 @@ struct Rtc : public mesh::RTCClock {
   uint32_t raw() const { return base + (uint32_t)((double)(g_sim_now - at_ms) / 1000.0 * (1.0 + drift_ppm * 1e-6)); }
   void setRaw(uint32_t t) { base = t; at_ms = g_sim_now; }
   uint32_t getCurrentTime() override { uint32_t o = h.now(raw()); if (o < mono) went_back = true; mono = o; return o; }
-  void setCurrentTime(uint32_t t) override { if (t < mono) went_back = true; setRaw(t); h.restart(t, t); mono = t; if (chip) chip_off = (int32_t)(t - truth()); }
-  void discipline(uint32_t ref) { if (chip) return; if (h.toward(raw(), ref)) { setRaw(ref); h.restart(ref, ref); mono = ref; } }
+  void setCurrentTime(uint32_t t) override { if (t < mono) went_back = true; setRaw(t); h.restart(t, t); mono = t; if (chip) { chip_off = (int32_t)(t - truth()); unset = false; } }
+  void discipline(uint32_t ref) { if (valid()) return; if (h.toward(raw(), ref)) { setRaw(ref); h.restart(ref, ref); mono = ref; }
+                                 if (chip) { chip_off = (int32_t)(ref - truth()); unset = false; } }   // (C76) an unset chip is written
   void reset(bool power_loss) { frozen = h.now(raw()); lost = power_loss; }   // at the reset: what no-init RAM keeps
-  void boot() { setRaw(chip ? truth() + chip_off : lost ? FLOOR : frozen); h.restart(raw(), raw()); mono = raw(); }
+  void boot() { setRaw(valid() ? truth() + chip_off : lost ? FLOOR : frozen); h.restart(raw(), raw()); mono = raw(); }
   int32_t off() { return (int32_t)(getCurrentTime() - truth()); }
 };
 struct Rng : public mesh::RNG {
@@ -83,6 +86,7 @@ public:
     bool sharedSecret(uint8_t* out, const uint8_t* peer_pub) override { m->self_id.calcSharedSecret(out, peer_pub); return true; }
     uint8_t clockSource() override;                     // (rc21, C57)
     void clockDiscipline(uint32_t ref) override;
+    bool clockChipFound() override;                      // (C76)
   } host;
   SimMesh(Node* node, mesh::Radio& r, mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::PacketManager& mgr, mesh::MeshTables& t)
     : mesh::Mesh(r, ms, rng, rtc, mgr, t), n(node) { host.m = this; }
@@ -99,7 +103,8 @@ public:
   }
 };
 
-struct Stats { uint32_t tx = 0, tx_air = 0, tx_ota = 0, floods = 0, disc = 0, rx = 0, collisions = 0, lost = 0, resets = 0, wdt_resets = 0, erases = 0; };
+struct Stats { uint32_t tx = 0, tx_air = 0, tx_ota = 0, floods = 0, disc = 0, rx = 0, collisions = 0, lost = 0, resets = 0, wdt_resets = 0, erases = 0;
+                uint32_t hdr_valid = 0; };   // (rc22, C74) writes that made the slot header VALID
 // (study) a solar node: LiFePO4 cell, RX all the time, TX at the 1 W PA's current, a charger fed by the sun; empty = off (the BMS cuts)
 // until it charged back to on_pct
 struct Battery { bool on = false; double cap_mah = 7000, mah = 4200, idle_ma = 12, tx_ma = 1000, peak_chg_ma = 300, on_pct = 3;
@@ -107,6 +112,7 @@ struct Battery { bool on = false; double cap_mah = 7000, mah = 4200, idle_ma = 1
 
 struct Node {
   int idx = 0; std::string name; bool lota = true; bool relay = true; uint8_t flood_max = 64; uint16_t batt_mv = 4000;
+  fw_ota::FwTag tag{fw_ota::TAG_MAGIC, (uint16_t)fw_ota::TAG_VERSION, 0, {'R','A','K','3','4','0','1',0}};   // (Heltec) this node's board id
   std::vector<uint8_t> flash; Adafruit_LittleFS fs; SimNrfPower power{}; SimNrfUicr uicr{}; WdtRegs wdt{}; uint32_t wdt_fed = 0;
   mesh::LocalIdentity id; uint8_t hash_mode = 1; Rng rng; Radio radio; Ms ms; Rtc rtc;
   std::unique_ptr<StaticPoolPacketManager> mgr; std::unique_ptr<SimpleMeshTables> tables; std::unique_ptr<SimMesh> mesh;
@@ -116,6 +122,9 @@ struct Node {
   uint32_t app_fw = 0;          // the image running now (fw number), set by the simulated bootloader
   uint32_t audit_at = 0;
   uint32_t boot_ms = 0;
+  bool esp_sleep = false;       // (Heltec) IoTThinks power saving on an ESP32: light sleep (up to 30 s, woken by a received packet)
+  uint32_t asleep_until = 0;    //   asleep now (until then or the next packet); awake_ms = time spent awake
+  uint64_t awake_ms = 0;
   bool app_pending = false;     // the bootloader is installing: the app starts at down_until         // g_sim_now at its last boot (its millis() counts from here)        // next text audit (1 s after a boot, then every 15 s)
   Stats st;
   Battery bat;
@@ -139,7 +148,7 @@ struct World {
   double fadeLoss(int a, int b);
   void powerTick();                            // batteries, chargers, brownouts   // install time in the bootloader (hardware: ~40-90 s for a 260 KB image)
 
-  Node& add(const std::string& name, bool lota = true, bool relay = true);
+  Node& add(const std::string& name, bool lota = true, bool relay = true, const char* board = "RAK3401");   // (Heltec) board id
   void link(int a, int b, float snr = 10, double loss = 0.0, bool both = true);
   void unlink(int a, int b, bool both = true);
   Node& operator[](int i) { return *nodes[i]; }

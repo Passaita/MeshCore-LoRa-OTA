@@ -7,9 +7,9 @@
 # usage: test/fw_ota_slotfill_test.sh <some .lota app file>
 set -e
 cd "$(dirname "$0")/.."
-LOTA=${1:?usage: $0 <LoRa-OTA-RAK3401-app-....lota from a release>}
+LOTA=${1:-$(ls -t ~/Downloads/MeshCore/smb/project-handoff/RAK3401-firmwares/*/LoRa-OTA-RAK3401-app-*.lota | head -1)}
 W=$(mktemp -d)
-python3 tools/lota_slot_zip.py "$LOTA" "$W/slot.zip" > /dev/null
+~/.venvs/loraota/bin/python3 tools/lota_slot_zip.py "$LOTA" "$W/slot.zip" > /dev/null
 (cd "$W" && unzip -q slot.zip && mv slot.bin image.bin)
 python3 - "$W/t.cpp" <<'PY'
 import sys
@@ -28,6 +28,7 @@ HEAD = r"""#include <cstdio>
 #include <vector>
 #include <string>
 #include <SHA256.h>
+#define UPLOAD_NAME "BLE"                 // (Heltec port) the RAK upload name, as FwOtaTransfer.cpp defines it for nRF52
 static const uint32_t SLOT_ADDR = 0x96000, SLOT_SIZE = 0xEC000 - 0x96000, FLASH_PAGE_SIZE = 0x1000, SLOT_PAYLOAD_OFFSET = 0x1000;
 static const uint32_t SLOT_PAYLOAD_MAX = SLOT_SIZE - FLASH_PAGE_SIZE, APP_MAX_SIZE = 0x70000, SLOT_MAGIC = 0x4F544C46;
 static const uint8_t KIND_APP = 0; static const uint16_t COMP_LZMA = 2; static const uint32_t LOTA_HDR = 160;

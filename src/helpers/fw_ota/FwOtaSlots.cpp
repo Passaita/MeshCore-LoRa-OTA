@@ -1,3 +1,4 @@
+#if !defined(ESP32)   // (Heltec port) nRF52 only; the ESP32 version of the same interface is FwOtaSlotsEsp32.cpp
 #include "FwOtaSlots.h"
 #include <string.h>
 #include <Arduino.h>   // yield(), delay()
@@ -261,9 +262,19 @@ bool ctrlMarkPending() {
   b.boot_attempts = 0;
   b.fail_count = 0;
   b.requested_bl_version = ::bootloaderVersion;
-  return writeCtrl(b);
+  { SlotHeader h; memset(b.reserved, 0, 4); if (readSlotHeader(h)) memcpy(b.reserved, &h.payload_crc32, 4); }   // (C83) which image this
+  return writeCtrl(b);                                   //   request is about: the bootloader keeps reserved[] (read-modify-write)
+}
+
+// (C83, 2026-11-02) a FAILED record speaks only about the image it tried (its payload CRC-32 in reserved[0..3], stamped above). A record
+// without a stamp - written before rc23, or by the bootloader's self-heal after a blank control page - blocks whatever the slot holds.
+bool failedForSlot(const CtrlBlock& cb, const SlotHeader& h) {
+  if (cb.apply_state != APPLY_FAILED) return false;
+  uint32_t c; memcpy(&c, cb.reserved, 4);
+  return c == 0 || c == h.payload_crc32;
 }
 
 // (the firmware tag itself lives in FwTag.cpp so a build WITHOUT fw_ota can still carry it)
 
 }  // namespace fw_ota
+#endif  // !ESP32

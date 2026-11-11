@@ -61,13 +61,14 @@ manifest = block(hdr, "struct XferManifest {")
 phase = block(hdr, "enum XferPhase : uint8_t {")
 dsess = block(hdr, "struct DutySess {")
 peerinfo = re.search(r"static const uint8_t KIND_APP = 0, KIND_BOOTLOADER = 1;", hdr).group(0) + "\n" + block(hdr, "struct PeerInfo {") + "\n" + "\n".join(re.findall(r"static const uint8_t (?:MAX_PEERS|SWARM_BLK|KIND_SWARM|SWARM_HOLDERS)\s*=[^;]*;", hdr)) + "\n" + block(hdr, "struct ImgInfo {")
-consts = "\n".join(re.findall(r"static const uint\d+_t\s+(?:DUTY_MIN_PCT|DUTY_DEFAULT_PCT|DUTY_FULL_PCT|XFER_WINDOW|SERVE_ACTIVE_MS|DUTY_ACTIVE_MS|MAX_RETRIES|POWER_CRIT_MV|MAX_HOPS)\s*=[^;]*;", hdr + src))
+consts = "\n".join(re.findall(r"static const uint\d+_t\s+(?:DUTY_MIN_PCT|DUTY_DEFAULT_PCT|DUTY_FULL_PCT|XFER_WINDOW|SERVE_ACTIVE_MS|DUTY_ACTIVE_MS|MAX_RETRIES|POWER_CRIT_MV|MAX_HOPS|OVERHEARD_MAX_MS)\s*=[^;]*;", hdr + src))
 helpers = "\n".join(fn(src, s) for s in ("static void agoText(", "static bool serveActive(", "static uint32_t shareHoldMs(", "static uint8_t chanPct(", "static uint32_t holderRate(", "static uint8_t dutyParse("))
 members = [fn(src, s) for s in ("bool FwOtaTransfer::cmdStatus(", "bool FwOtaTransfer::cmdDuty(", "bool FwOtaTransfer::cmdWdt(",
                                 "FwOtaTransfer::Txt16 FwOtaTransfer::lastAnsText()", "bool FwOtaTransfer::sessActive(",
                                 "bool FwOtaTransfer::cmdMinBatt(", "uint8_t FwOtaTransfer::powerState()",
                                 "bool FwOtaTransfer::cmdPeers(", "bool FwOtaTransfer::cmdPeersHosts(", "int FwOtaTransfer::imageList(",
-                                "uint32_t FwOtaTransfer::holderScore(")]
+                                "uint32_t FwOtaTransfer::holderScore(", "bool FwOtaTransfer::statusLine(", "void FwOtaTransfer::appendServing(",
+                                "void FwOtaTransfer::pruneOverheard(", "uint32_t FwOtaTransfer::overheardAgeS(")]
 prog = r'''
 #include <Arduino.h>
 #include <string>
@@ -114,6 +115,11 @@ class FwOtaTransfer { public:
   int imageList(ImgInfo* out, int cap) const; uint32_t holderScore(const PeerInfo& p) const;
   Txt16 lastAnsText() const; bool sessActive(const DutySess& d, uint32_t now) const;
   bool cmdStatus(char* reply); bool cmdDuty(const char* arg, char* reply); bool cmdWdt(const char* arg, char* reply);
+  XferManifest _saved_man = {}; bool _img_set = false; uint32_t _img_ver = 0;
+  uint32_t pullVer() const { return _man.fw_version ? _man.fw_version : (_resuming && _saved_man.fw_version) ? _saved_man.fw_version : (_img_set ? _img_ver : 0); }
+  bool statusLine(char* reply); void appendServing(char* reply) const;                                               // (rc22, C73)
+  void pruneOverheard(uint32_t now); uint32_t overheardAgeS(uint32_t now) const;                                   // (rc22, C71)
+  bool scanCmd(char* r, bool) { strcpy(r, "no scan yet - scanning now (~25 s), then: fw list"); return true; }   // (rc22, C70)
 };
 ''' + "\n".join(members) + r'''
 
@@ -143,7 +149,7 @@ static void lint(const std::string& state, const char* reply) {
 static void must(const std::string& state, const char* reply, const char* want) { g_checks++; if (!strstr(reply, want)) { std::string m = std::string("must contain '") + want + "'"; bad(state, reply, m.c_str()); } }
 static void mustNot(const std::string& state, const char* reply, const char* no) { g_checks++; if (strstr(reply, no)) { std::string m = std::string("must not contain '") + no + "'"; bad(state, reply, m.c_str()); } }
 
-static FwOtaTransfer fresh() { FwOtaTransfer t; strcpy(t._serve_man.name, "fw-294"); t._serve_man.n_chunks = 1621; t._bl_man.n_chunks = 260; strcpy(t._man.name, "@3823F1DC"); t._man.n_chunks = 1621; t._cm.reset(1621); return t; }
+static FwOtaTransfer fresh() { FwOtaTransfer t; strcpy(t._serve_man.name, "fw-294"); t._serve_man.n_chunks = 1621; t._bl_man.n_chunks = 260; strcpy(t._man.name, "@4B5C6D7E"); t._man.n_chunks = 1621; t._cm.reset(1621); return t; }
 static FwOtaTransfer::DutySess sess(uint32_t id, uint16_t top, uint8_t pct, uint32_t ago_ms) { FwOtaTransfer::DutySess d = {}; d.sess = id; d.keyed = true; d.top = top; d.pct = pct; d.last_ms = g_now - ago_ms; d.ivl_ms = 20000; return d; }
 
 int main(int argc, char**) {
@@ -165,15 +171,23 @@ int main(int argc, char**) {
   { auto t = fresh(); t._phase = PH_OFFERING; t._attempts = 2; t.cmdStatus(r); lint("offering", r); }
   { auto t = fresh(); t._phase = PH_DOWNLOADING; t._fill = true; t._fill_paused = true; t._sess_set = false; t._man.fw_version = 9304;   // (rc19, C42)
     for (int i = 0; i < 1520; i++) t._cm.set(i); strcpy(t._last_err, "fleet pull cancelled by its requester"); t.cmdStatus(r);
-    lint("paused fill", r); must("paused fill", r, "PAUSED filling 'fw-9304'"); must("paused fill", r, "pull-resume"); }
+    lint("paused fill", r); must("paused fill", r, "PAUSED filling fw-9304"); must("paused fill", r, "pull-resume"); }
   { auto t = fresh(); t._phase = PH_DOWNLOADING; t._fill = true; t._fill_mode = 1; t._sess_set = false; t._man.fw_version = 9304;   // (rc20, C52)
     for (int i = 0; i < 700; i++) t._cm.set(i); t.cmdStatus(r); lint("passive fill", r); must("passive fill", r, "(passive, no install)"); }
   { auto t = fresh(); t._phase = PH_DOWNLOADING; t._paused = true; for (int i = 0; i < 149; i++) t._cm.set(i); t.cmdStatus(r); lint("paused", r); must("paused", r, "PAUSED");
     t._pause_until_ms = g_now + 3 * 3600000 + 5 * 60000; t.cmdStatus(r); lint("paused 3h", r); must("paused 3h", r, "resumes in 3h"); }
   { auto t = fresh(); t._phase = PH_COMPLETE; for (int i = 0; i < 1621; i++) t._cm.set(i); t._agreed_pct = 100; strcpy(t._last_err, "already installed: slot filled, served");
     t._serving = true; t.cmdStatus(r); lint("complete", r); must("complete", r, "COMPLETE"); }
-  { auto t = fresh(); t._phase = PH_FAILED; strcpy(t._res_msg, "no server offers @3823F1DC"); t.cmdStatus(r); lint("failed", r); }
+  { auto t = fresh(); t._phase = PH_FAILED; strcpy(t._res_msg, "no server offers @4B5C6D7E"); t.cmdStatus(r); lint("failed", r); }
   { auto t = fresh(); t._resolving = true; t._res_id[0] = 0x1F; t._res_id[1] = 0x2E; t._res_scans = 3; t._res_next_ms = g_now + 90000; t.cmdStatus(r); lint("resolving", r); }
+  // (rc22, C73) its own pull + the pull it serves: the serving part only when it fits whole
+  { auto t = fresh(); t._resolving = true; t._res_id[0] = 0x1F; t._res_id[1] = 0x2E; t._res_scans = 3; t._res_next_ms = g_now + 90000;
+    t._serving = true; t._serve_man.fw_version = 304; t._dsess[0] = sess(0x11, 812, 30, 5000); t.cmdStatus(r); lint("resolving + serving", r);
+    must("resolving + serving", r, " | serving fw-304 to 1: 812/1621 (50%)");
+    t._dsess[1] = sess(0x22, 400, 30, 5000); t.cmdStatus(r); lint("resolving + serving 2", r); must("resolving + serving 2", r, " | serving fw-304 to 2 pulls ('fw serve')"); }
+  { auto t = fresh(); t._phase = PH_DOWNLOADING; t._agreed_pct = 100; for (int i = 0; i < 433; i++) t._cm.set(i); t._rate_t0_ms = g_now - 1600000;
+    t._retries = 9; t._crc_bad = 12345; t._crc_bad_idx = 1500; t._mac_fail = 999; strcpy(t._last_err, "duty re-agreed 0.10 -> 1.00");
+    t._serving = true; t._serve_man.fw_version = 304; t._dsess[0] = sess(0x11, 812, 30, 5000); t.cmdStatus(r); lint("downloading + serving (longest)", r); }
   // ---- server side (C22) ----
   { auto t = fresh(); t._serving = true; t.cmdStatus(r); lint("serving, none since boot", r); must("serving, none since boot", r, "no active pull (none since boot)");
     t._serve_last_req_ms = g_now - 125000; t._serve_reqs = 462; t._serve_offer_reqs = 4; t.cmdStatus(r); lint("serving, idle 2 min", r); must("serving, idle 2 min", r, "(last request 2 min ago)");
@@ -209,11 +223,11 @@ int main(int argc, char**) {
   // ---- watchdog (C27) ----
   { memset(&g_wdt_regs, 0, sizeof g_wdt_regs); g_resetreas = POWER_RESETREAS_SREQ_Msk; g_wdt = Watchdog(); g_wdt.start(); auto t = fresh();
     t.cmdWdt("", r); lint("wdt armed", r); must("wdt armed", r, "armed, 10 min");
-    g_wdt_regs.CRV = 72000u * 32768u - 1u; g_wdt_regs.RUNSTATUS = 1; g_wdt = Watchdog(); g_wdt.start(); t.cmdWdt("", r); lint("wdt switching", r); must("wdt switching", r, "switching 20 h -> 10 min");
+    g_wdt_regs.CRV = 72000u * 32768u - 1u; g_wdt_regs.RUNSTATUS = 1; g_wdt = Watchdog(); g_wdt.start(); t.cmdWdt("", r); lint("wdt switching", r); must("wdt switching", r, "wdt 20 h->10 min");
     memset(&g_wdt_regs, 0, sizeof g_wdt_regs); g_resetreas = POWER_RESETREAS_DOG_Msk; g_wdt = Watchdog(); g_wdt.start(); t._wdt_planned = true; t.cmdWdt("", r); lint("wdt planned", r);
-    must("wdt planned", r, "last reset: watchdog (planned: timeout change)"); t._wdt_planned = false; t._wdt_resets = 3; t.cmdWdt("", r); lint("wdt 3 resets", r); t.cmdWdt("x", r); lint("wdt usage", r); }
+    must("wdt planned", r, "last reset watchdog (planned: timeout change)"); t._wdt_planned = false; t._wdt_resets = 3; t.cmdWdt("", r); lint("wdt 3 resets", r); t.cmdWdt("x", r); lint("wdt usage", r); }
   // ---- rc14: fw duty set - live on both sides ----
-  { auto t = fresh(); t.cmdDuty("0.6", r); lint("duty set idle", r); must("duty set idle", r, "re-split at their next window"); mustNot("duty set idle", r, "asks again");
+  { auto t = fresh(); t.cmdDuty("0.6", r); lint("duty set idle", r); must("duty set idle", r, "saved (<="); mustNot("duty set idle", r, "asks again");
     t._phase = PH_DOWNLOADING; t.cmdDuty("0.3", r); lint("duty set while pulling", r); must("duty set while pulling", r, "our pull asks again now");
     g_checks++; if (!t._reagree_at_ms || !t._reagree_why) bad("duty set while pulling", r, "the running pull must re-offer at once");
     auto u = fresh(); u._phase = PH_DOWNLOADING; u._pull_duty_pct = 50; u.cmdDuty("0.3", r); lint("duty set, pull has its own duty", r); mustNot("duty set, pull has its own duty", r, "asks again");
@@ -228,7 +242,7 @@ int main(int argc, char**) {
   for (int n = 0; n <= 8; n++) {
     auto t = fresh(); char st[32];
     for (int i = 0; i < n; i++) { PeerInfo& p = t._peers[i]; p.used = true; p.id[0] = (uint8_t)(0xA0 + i); p.id[1] = 0x68; p.id[2] = 0x3B; p.id[3] = 0x7E;
-      snprintf(p.name, 17, "Repeater-Node-%02d", i); p.kind = i >= 5 ? KIND_BOOTLOADER : KIND_APP; p.fw_version = i >= 5 ? 8 - (i - 5) : 297 - i; p.rssi = -40 - i; p.snr4 = 40 - 8 * i;
+      snprintf(p.name, 17, "Hilltown-Node-%02d", i); p.kind = i >= 5 ? KIND_BOOTLOADER : KIND_APP; p.fw_version = i >= 5 ? 8 - (i - 5) : 297 - i; p.rssi = -40 - i; p.snr4 = 40 - 8 * i;
       p.route_len = (uint8_t)(i % 3); p.swarm = true; p.sduty = 100; p.spulls = (uint8_t)(i % 2); p.spower = 1; memset(p.digest, 0x10 + i, 8); }
     snprintf(st, sizeof st, "fw peers, %d offers", n); t.cmdPeers("", r); lint(st, r);
     snprintf(st, sizeof st, "fw peers hosts, %d offers", n); t.cmdPeersHosts("", r); lint(st, r);

@@ -1,5 +1,5 @@
 #!/bin/bash
-# run_batch.sh OUTDIR SEEDS : the gap-fill study comparison (docs/GAPFILL-ALGO-STUDY-20261008.md) - 6 variants x T1..T4 x SEEDS seeds.
+# run_batch.sh OUTDIR SEEDS : the gap-fill study comparison (docs/protocol/GAPFILL-ALGO-STUDY-20261008.md) - 6 variants x T1..T4 x SEEDS seeds.
 # Builds the fast simulator (no sanitizers) once, runs the batch in parallel, prints the summary table (summ.py).
 # The rc18 defaults ARE variant G; "A0" = rc17 (algo A, no adopt/newq/spread).
 set -e -o pipefail

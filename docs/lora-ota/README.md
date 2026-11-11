@@ -1,4 +1,4 @@
-# LoRa-OTA for RAK3401 MeshCore repeaters
+# LoRa-OTA for RAK3401 and Heltec V4 MeshCore repeaters
 
 **Update your repeaters without going up the hill. New firmware travels over the mesh itself.**
 
@@ -6,8 +6,8 @@ LoRa-OTA lets a MeshCore repeater fetch a new firmware image from a neighbouring
 You don't need a site visit, a cable or Bluetooth range. Once a node has the new version it passes it on, so a whole chain of repeaters
 can be updated from your desk.
 
-> **Status: v1.17.28-rc21, public community test.** The firmware has been in daily use since September 2026 on a small fleet
-> (bench boards plus outdoor solar relays), and every release since rc18 was rolled out over LoRa without a site visit. It has
+> **Status: v1.18.0-rc25, public community test.** The firmware has been in daily use since September 2026 on a small fleet
+> (bench boards plus outdoor solar relays, RAK3401 and Heltec V4), and every RAK release since rc18 was rolled out over LoRa without a site visit. It has
 > **not** had an independent security review yet. Please read [SECURITY.md](SECURITY.md), start with a node you can reach, and
 > report what you find.
 
@@ -23,8 +23,8 @@ the mesh), and the repeater fetches the update by itself, slowly and politely, f
 
 ```
 fw peers        who around me has firmware?  (a ~25 s scan)
-fw list         -> #1 fw-304 x4 (0hop)        newest version first, held by 4 nodes
-fw pull #1      fetch it from the best holder; it installs and restarts by itself
+fw list         -> #1 fw-318 x4 (0hop)        newest version first, held by 4 nodes
+fw pull #1      fetch it from the best holder; then 'fw apply' (or 'fw autoapply on' to install by itself)
 ```
 
 ## Why you might like it
@@ -34,8 +34,9 @@ fw pull #1      fetch it from the best holder; it installs and restarts by itsel
   (`fw duty`) that counts the relays' repeats too.
 * **A swarm, not a single server.** Every node that holds a version serves it. A pull picks the best holder (link quality, relays,
   load, battery), and moves to another holder if its holder goes silent, keeping every chunk.
-* **Update a whole fleet with one command.** `fw pull #1 fleet` lets every LoRa-OTA node that hears the transfer store the new image
-  and pass it on hop by hop. Nothing installs by itself: you run `fw apply` on each node when you're ready.
+* **Push a version to the whole circle.** `fw push` (rc25) on a node that holds a new version: every circle node of the same board
+  that runs something older fills its slot with it over 7 days, late and far nodes included. `fw pull #1 fleet` starts the same. Nothing
+  installs by itself: you run `fw apply` on each node when you're ready.
 * **Ten nodes cost about as much airtime as one.** Nodes near a transfer of the same image listen along and only ask for what they
   missed.
 * **Patient on long, weak chains.** Pulls survive reboots, lost links and silent servers (for days). One-way radio links are
@@ -61,16 +62,18 @@ circle); anyone who needs an update within minutes (a transfer takes hours by de
   longer through relays. It runs unattended.
 * **A custom bootloader** (an OTAFIX fork, see the **LoRa-OTA-bootloader** repository) and this forked repeater app, installed by
   Bluetooth once per node.
-* **No automatic rollback** and **no signed images** (a deliberate choice, so that nodes can always return to stock firmware). The
-  circle passphrase is the trust boundary.
-* **One board so far:** RAK3401 (nRF52840 + SX1262 with the RAK13302 1 W booster). Other nRF52840 boards are possible in principle, but
-  untested.
+* **No signed images** (a deliberate choice, so that nodes can always return to stock firmware); the circle passphrase is the trust
+  boundary. **No automatic rollback on the RAK3401**; the Heltec V4 returns to the previous version by itself when a new one fails its
+  probation (2 min running and a packet heard within 3 h).
+* **Two boards:** RAK3401 (nRF52840 + SX1262 with the RAK13302 1 W booster) and Heltec V4 (ESP32-S3, 16 MB flash). A circle can mix
+  them; each board stores and installs only its own images. Other boards are possible in principle, but untested.
 
 ## Documents
 
 | Document | For |
 |---|---|
 | [USER-GUIDE.md](USER-GUIDE.md) | Operators: setup, updating, fleet rollout, onboarding, offboarding, recovery |
+| [HELTEC-V4.md](HELTEC-V4.md) | The Heltec V4: first install, Wi-Fi seeding, what differs from the RAK3401 |
 | [COMMANDS.md](COMMANDS.md) | Every `fw ...` command |
 | [HOW-IT-WORKS.md](HOW-IT-WORKS.md) | Image, discovery, pull, swarm, pacing, routes, bootloader |
 | [SECURITY.md](SECURITY.md) | Threat model, cryptography, known limitations, **what reviewers should look at** |
@@ -82,7 +85,7 @@ circle); anyone who needs an update within minutes (a transfer takes hours by de
 ## Credits and licence
 
 * **MeshCore** - Scott Powell / rippleradios.com and contributors (MIT).
-* **IoTThinks MeshCore fork, branch PowerSaving-v17** - the power-saving base this fork is built on (MIT).
+* **IoTThinks MeshCore fork, branch PowerSaving-v18** (`743bb28f`, MeshCore 1.18.0) - the power-saving base this fork is built on (MIT).
 * **OTAFIX bootloader** - oltaco, based on the Adafruit nRF52 bootloader (MIT); Nordic SDK components under Nordic's licence.
 * **LoRa-OTA additions** - LoRa-OTA contributors, MIT, like the code they extend.
 

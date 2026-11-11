@@ -126,14 +126,20 @@ int main(){
   // (v1.17.28, C2/C6/C7) how a server answers a discovery: bits 1 app, 2 bootloader, 4 flooded, 8 direct
   { assert(discAnswer("*", 0, true, true, true) == 0); checks++;                        // C2: a scan from a direct neighbour - its LIST_REQ gets it
     assert(discAnswer("*", 2, true, true, true) == (1|2|4)); checks++;                  // a scan through relays: both offers, flooded
-    assert(discAnswer("@1A2B3C4D", 2, true, true, true) == (1|4|8)); checks++;          // C6 + C7: a pull for the app - app only, flood AND direct
-    assert(discAnswer("@1A2B3C4D!", 1, true, true, true) == (2|4|8)); checks++;         // C7: a bootloader update - bootloader only
-    assert(discAnswer("@1A2B3C4D", 0, true, true, false) == (1|4|8)); checks++;         // a pull from a neighbour: still answered
-    assert(discAnswer("@1A2B3C4D!", 2, true, true, false) == 0 && discAnswer("*", 3, true, false, false) == 0); checks++;   // nothing to offer
+    assert(discAnswer("@1F2E3D4C", 2, true, true, true) == (1|4|8)); checks++;          // C6 + C7: a pull for the app - app only, flood AND direct
+    assert(discAnswer("@1F2E3D4C!", 1, true, true, true) == (2|4|8)); checks++;         // C7: a bootloader update - bootloader only
+    assert(discAnswer("@1F2E3D4C", 0, true, true, false) == (1|4|8)); checks++;         // a pull from a neighbour: still answered
+    assert(discAnswer("@1F2E3D4C!", 2, true, true, false) == 0 && discAnswer("*", 3, true, false, false) == 0); checks++;   // nothing to offer
     assert(discAnswer("*", 0, false, true, true) == (1|2|8)); checks++; }                // an old discovery without " F": direct, as before
   // (v1.17.28, C8) fw pull-pause [Nh]
-  { assert(pauseHours("") == 0 && pauseHours("  ") == 0 && pauseHours(" 3h") == 3 && pauseHours("168H") == 168); checks++;
-    assert(pauseHours("0h") == -1 && pauseHours("169h") == -1 && pauseHours("3") == -1 && pauseHours("3hx") == -1 && pauseHours("h") == -1 && pauseHours("30m") == -1); checks++; }
+  { assert(pauseMinutes("") == 0 && pauseMinutes("  ") == 0 && pauseMinutes(" 3h") == 180 && pauseMinutes("168H") == 10080); checks++;
+    assert(pauseMinutes("0h") == -1 && pauseMinutes("169h") == -1 && pauseMinutes("3") == -1 && pauseMinutes("3hx") == -1 && pauseMinutes("h") == -1); checks++;
+    // (rc22, C75) minutes: Nm, NhMm; 1 min .. 168 h; one unit each, hours first
+    assert(pauseMinutes("30m") == 30 && pauseMinutes("135M") == 135 && pauseMinutes("2h15m") == 135 && pauseMinutes("1m") == 1 && pauseMinutes("10080m") == 10080); checks++;
+    assert(pauseMinutes("0m") == -1 && pauseMinutes("10081m") == -1 && pauseMinutes("167h61m") == -1 && pauseMinutes("15m2h") == -1 && pauseMinutes("2h2h") == -1); checks++;
+    assert(pauseMinutes("-5m") == -1 && pauseMinutes("2h15") == -1 && pauseMinutes("m") == -1 && pauseMinutes("2h 15m") == -1 && pauseMinutes("99999999999m") == -1); checks++;
+    char t[20]; pauseText(t, sizeof(t), 240); assert(!strcmp(t, "4 h")); pauseText(t, sizeof(t), 45); assert(!strcmp(t, "45 min"));
+    pauseText(t, sizeof(t), 135); assert(!strcmp(t, "2 h 15 min")); checks++; }
   // (rc6, owner) duty rescale: the user's 1.0 = the old 0.3 (30 % of the channel model), 0.3 = 9 %; both ends pace by chanPct()
   { assert(chanPct(100) == 30 && chanPct(30) == 9 && chanPct(10) == 3 && chanPct(1) == 1 && chanPct(0) == 0); checks++;
     const uint32_t air = 611;                                          // a 160 B chunk at SF7/62.5 kHz
@@ -191,7 +197,7 @@ def fn(sig):
         elif src[k] == "}":
             d -= 1
             if d == 0: return src[i:k + 1]
-funcs = [fn(s) for s in ("static uint8_t dutyParse(", "static uint8_t dutyAgree(", "static bool dutyPaced(", "static uint32_t dutySpacingMs(", "static uint8_t dutyWinMax(", "static uint32_t batchGapMs(", "static uint8_t chanPct(", "static bool otaQuiet(", "static uint32_t dutyWinExtraMs(", "static uint32_t waitBackoffMs(", "static bool answerAllowed(", "static uint32_t scanResendAt(", "static uint8_t discAnswer(", "static int pauseHours(", "static uint32_t reagreeNextMs(", "static bool serveActive(", "static void agoText(", "static void dutyFair(", "static uint32_t shareHoldMs(", "static uint8_t paceFor(")]
+funcs = [fn(s) for s in ("static uint8_t dutyParse(", "static uint8_t dutyAgree(", "static bool dutyPaced(", "static uint32_t dutySpacingMs(", "static uint8_t dutyWinMax(", "static uint32_t batchGapMs(", "static uint8_t chanPct(", "static bool otaQuiet(", "static uint32_t dutyWinExtraMs(", "static uint32_t waitBackoffMs(", "static bool answerAllowed(", "static uint32_t scanResendAt(", "static uint8_t discAnswer(", "static int pauseMinutes(", "static void pauseText(", "static uint32_t reagreeNextMs(", "static bool serveActive(", "static void agoText(", "static void dutyFair(", "static uint32_t shareHoldMs(", "static uint8_t paceFor(")]
 open(sys.argv[1], "w").write(HEAD + "#include <vector>\n" + "\n".join(funcs) + "\n" + TAIL)
 PY
 g++ -std=c++11 -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -o "$W/duty_test" "$W/duty_test.cpp"

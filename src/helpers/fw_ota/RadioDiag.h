@@ -16,6 +16,9 @@
 #include <Arduino.h>
 #include <Mesh.h>
 #include <helpers/IdentityStore.h>   // FILESYSTEM / File
+#if defined(ESP32) && !defined(FILE_O_WRITE)
+#define FILE_O_WRITE "w"   // (Heltec port) ESP32 FS: "w" truncates; the nRF52 FILE_O_WRITE appends, so every write site removes the file first anyway
+#endif
 
 namespace fw_ota {
 

@@ -1,5 +1,10 @@
 # Porting LoRa firmware-pull to another MeshCore tree
 
+> **History note (rc25):** this page and `tools/port_fwpull.py` / `tools/fwpull_hooks.patch` were written for the PowerSaving-v17 base
+> and last updated in October 2026 (rc18). rc23 moved LoRa-OTA to PowerSaving-v18 (`743bb28f`, MeshCore 1.18.0) by re-applying the
+> changes by hand, and the Heltec V4 port added ESP32 hooks; the patch does not cover either. Use this repository's tree as the
+> reference for v18 (`git diff 743bb28f` shows every change), and the page below for the ideas and constraints.
+
 The feature is deliberately small at the seams: one self-contained directory, two linker scripts, and about 300 lines of hooks in six
 shared files. It has been carried from the IoTThinks/MeshCore `PowerSaving-v17` base (`ea8f182a`) onto that branch's current tip
 (`d9c42964`, 27 commits newer: RXPSv2, deep sleep, RAK3401 BSEC/WB_IO2 fixes) with **no conflicts**, and the result builds

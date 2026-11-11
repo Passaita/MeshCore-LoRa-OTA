@@ -206,6 +206,7 @@ public:
     return !enabled;
   }
   virtual RxPowerSavingStatus getRxPowerSavingStatus() const { return {}; }
+  virtual void setRxPowerSavingConfigError(bool invalid) { (void)invalid; }
   virtual bool isRxPowerSavingCalibrationActive() const { return false; }
 
   // Symbols of the sender's preamble consumed before a packet can be latched.
@@ -264,6 +265,11 @@ bool recalcRxPowerSavingFromLevel(uint8_t level, uint8_t sf, float bw, uint8_t p
                                   uint32_t* rx_us, uint32_t* sleep_us,
                                   float capture_cost_symbols = RX_POWERSAVING_CAPTURE_COST_SYMBOLS,
                                   uint32_t transition_us = RX_POWERSAVING_TRANSITION_US);
-void normalizeRxPowerSavingConfig(RxPowerSavingConfig* config, uint8_t sf, float bw,
+bool normalizeRxPowerSavingConfig(RxPowerSavingConfig* config, uint8_t sf, float bw,
                                   float capture_cost_symbols = RX_POWERSAVING_CAPTURE_COST_SYMBOLS,
                                   uint32_t transition_us = RX_POWERSAVING_TRANSITION_US);
+
+// The requested configuration survives a timing failure; only the radio falls back.
+bool applyRxPowerSavingConfig(RxPowerSavingConfig* config, uint8_t sf, float bw,
+                              RxPowerSavingControl* control);
+static constexpr int16_t RX_POWERSAVING_ERR_TIMING = -10001;

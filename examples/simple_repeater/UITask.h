@@ -17,6 +17,7 @@ class UITask {
 public:
   UITask(mesh::MainBoard& board, DisplayDriver& display) : _board(&board), _display(&display) { _next_read = _next_refresh = 0; }
 
+  // PowerSaving variant
   // Added board for battery display
   void begin(NodePrefs* node_prefs, const char* build_date, const char* firmware_version, mesh::MainBoard* board);
 

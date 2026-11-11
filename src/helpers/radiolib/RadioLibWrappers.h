@@ -2,6 +2,7 @@
 
 #include <Mesh.h>
 #include <RadioLib.h>
+// PowerSaving variant
 #include "RXPowerSaving.h"
 
 #ifdef USE_CC310_HW_CRYPTO
@@ -12,12 +13,16 @@ struct PacketMillis {
   uint32_t payloadMillis;   // header-valid   -> rx-done deadline
 };
 
+// PowerSaving variant
 class RadioLibWrapper : public mesh::Radio, public RxPowerSavingControl {
 protected:
   PhysicalLayer* _radio;
   mesh::MainBoard* _board;
   uint32_t n_recv, n_sent, n_recv_errors;
+  // PowerSaving variant
+  uint32_t _cad_busy_count = 0;
   int16_t _noise_floor, _threshold;
+  // PowerSaving variant
   float _last_rssi, _last_snr;
   bool _last_metrics_valid;
   bool _cad_enabled;
@@ -25,6 +30,9 @@ protected:
   int32_t _floor_sample_sum;
   uint8_t _preamble_sf;
 
+  // PowerSaving variant
+  bool _rx_ps_restart_pending = false;
+  bool _rx_ps_config_error = false;
   bool _rx_ps_enabled;
   bool _rx_ps_armed;
   uint32_t _rx_ps_rx_us;
@@ -42,6 +50,8 @@ protected:
 
   void idle();
   void startRecv();
+
+  // PowerSaving variant
   void requestRestartRecv();
   bool isPacketPendingOrReceiving();
   void prepareForRadioConfig();
@@ -63,13 +73,16 @@ protected:
     return RADIOLIB_ERR_UNSUPPORTED;
   }
   virtual int16_t stopDutyCycleHardware() { return _radio->standby(); }
+  virtual int16_t startContinuousReceive() { return _radio->startReceive(); }
   virtual bool isPacketReady();
   virtual bool isChipBusy() { return false; }
+
   float packetScoreInt(float snr, int sf, int packet_len);
   virtual bool isReceivingPacket() =0;
   virtual void doResetAGC();
 
 public:
+  // PowerSaving variant
   RadioLibWrapper(PhysicalLayer& radio, mesh::MainBoard& board)
       : _radio(&radio), _board(&board), _last_rssi(0), _last_snr(0), _last_metrics_valid(false),
         _preamble_sf(0), _rx_ps_enabled(false), _rx_ps_armed(false),
@@ -90,10 +103,15 @@ public:
   void onSendFinished() override;
   bool isInRecvMode() const override;
   bool isChannelActive();
+
+  // PowerSaving variant
   virtual bool supportsRxPowerSaving() const { return false; }
+  void setRxPowerSavingConfigError(bool invalid) override { _rx_ps_config_error = invalid; }
   bool setRxPowerSaving(bool enabled, uint32_t rx_us, uint32_t sleep_us) override;
   RxPowerSavingStatus getRxPowerSavingStatus() const override;
   bool isRxPowerSavingCalibrationActive() const override { return _nf_calib_active; }
+
+  bool hasPendingReceive() { return isPacketPendingOrReceiving(); }
 
   bool isReceiving() override {
     if (isReceivingPacket()) return true;
@@ -119,11 +137,17 @@ public:
 
   void loop() override;
 
+  // PowerSaving variant
+  uint32_t getCADBusyCount() const { return _cad_busy_count; }
+
   uint32_t getPacketsRecv() const { return n_recv; }
   uint32_t getPacketsRecvErrors() const { return n_recv_errors; }
   uint32_t getPacketsSent() const { return n_sent; }
+
+  // PowerSaving variant
   void resetStats() {
     n_recv = n_sent = n_recv_errors = n_rx_ps_arm_failures = 0;
+    _cad_busy_count = 0;
     // Clearing diagnostics also grants a fresh set of arm attempts. If they
     // fail again, the normal three-failure continuous-RX fallback applies.
     _rx_ps_arm_retry.reset();

@@ -49,6 +49,8 @@ identity, the group-channel lookup and receive path).
 * OFFER_REQ: duty, the session it replaces, the puller's public key and nonce, route back, name; MAC with the offer key.
 * OFFER_ACK: agreed duty, server public key and nonce, the image manifest (lengths, CRC-32, SHA-256); MAC with the session MAC key.
 * CHUNK_REQ / CHUNK / ABORT: session MAC key; chunk data encrypted.
+* MSG_CAMP (rc25, `fw push` campaigns: invite / query / answer / reminder / cancel / result): on the discovery channel (or direct to
+  the origin), MAC with the campaign key = HMAC(C, "lota2-camp")[0..15]. It only makes members fill their slot; it never installs.
 
 ## 4. Known limitations and open questions (please weigh in)
 1. **Offline guessing of the passphrase.** One captured discovery answer lets an attacker test passphrase guesses offline at the cost
@@ -56,10 +58,12 @@ identity, the group-channel lookup and receive path).
 2. **Fixed salt.** The PBKDF2 salt is the same for every circle, so a precomputed table of common phrases works against all circles.
    A per-circle salt would need to be distributed with the phrase - a usability trade-off.
 3. **Truncated 8-byte MACs.** Chosen for airtime; forgery needs ~2^64 attempts per packet over a slow radio channel. Comments welcome.
-4. **No anti-rollback.** A node installs whatever image it is told to pull, including an older one.
+4. **No anti-rollback.** A node installs whatever image it is told to pull, including an older one. (`fw push` only fills nodes that run
+   something older, but a manual pull can still fetch an older image.)
 5. **`fw pull-ble`** opens a 5-minute Bluetooth window (started by an admin command) in which anyone in Bluetooth range could upload a
    slot image. It is checked for internal consistency (board tag, kind, sizes, CRC-32, SHA-256) - not for origin - and is then **served
-   to the circle**. It is not installed without `fw apply`.
+   to the circle**. It is not installed without `fw apply`. The Heltec V4's Wi-Fi seeding (`fw pull-wifi`) has the same property: an
+   **open** access point for 5 minutes, started only by a logged-in admin.
 6. **The fingerprint** (4 bytes of SHA-256(C)) lets anyone who sees it check passphrase guesses offline. Do not post screenshots that show it.
 7. **Denial of service.** A jammer or a flood of forged packets can stall a transfer (forged packets cost only a MAC check). The pull
    waits and resumes; it never installs a partial or unverified image.

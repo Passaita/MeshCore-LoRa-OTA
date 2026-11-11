@@ -211,7 +211,7 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 
 **Set by build flag:** `LORA_FREQ`, `LORA_BW`, `LORA_SF`, `LORA_CR`
 
-**Default:** `869.525,250,11,5`
+**Default:** `869.618,62.5,8,5`
 
 **Note:** Requires reboot to apply
 
@@ -256,7 +256,7 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 **Parameters:**
 - `frequency`: Frequency in MHz
 
-**Default:** `869.525`
+**Default:** `869.618`
 
 **Note:** Requires reboot to apply
 **Serial Only:** `set freq <frequency>`
@@ -277,39 +277,6 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 
 ---
 
-#### View or change RX duty-cycle power saving
-**Usage:**
-- `get radio.rxps`
-- `set radio.rxps off`
-- `set radio.rxps on`
-- `set radio.rxps conservative`
-- `set radio.rxps balanced`
-- `set radio.rxps max`
-- `set radio.rxps max preamble <16|32>`
-- `set radio.rxps overdrive`
-- `set radio.rxps overdrive preamble <16|32>`
-- `set radio.rxps riskyWorkingMax`
-- `set radio.rxps riskyWorkingMax preamble <16|32>`
-- `set radio.rxps <1-10>`
-- `set radio.rxps level <1-10>`
-- `set radio.rxps level <1-10> preamble <16|32>`
-- `set radio.rxps <rx_us> <sleep_us>`
-
-**Parameters:**
-- `rx_us`, `sleep_us`: Receive and sleep durations in microseconds (`1000`-`30000000`).
-- `level`: `1`-`8`, expressed as **symbols of the sender's preamble the receiver catches** - how much of it lands inside an open RX window. Level `1` catches the most (15 symbols on the 16-symbol profile, 24 on the 32-symbol one) and costs the most power; level `8` catches 8 on both profiles and costs the least. Eight is the floor because that is what an LR11x0 needs to latch, so a level means the same geometry on either radio family. `9` (`overdrive`) and `10` (`riskyWorkingMax`) go below that floor and outside the datasheet timer condition; see below.
-- `preamble`: LoRa preamble length in symbols; `16` or `32`.
-- `state`: `on` or `off`.
-
-**Notes:**
-- `on` and `conservative` select level `3` (catches 13 symbols), `balanced` selects level `6` (catches 10), and `max` selects level `8` (catches 8); all three use a 16-symbol preamble.
-- Levels `1`-`8` satisfy the SX1261/2 duty-cycle timer condition; `max` is the top of that range. `overdrive` (level `9`) and `riskyWorkingMax` (level `10`) trade that guarantee for lower measured duty cycles; see the fuller entries below.
-- Like the other named profiles, `max`, `overdrive`, and `riskyWorkingMax` assume a 16-symbol sender preamble. At SF5-SF8 that is markedly less economical than the equivalent numeric level, which follows the SF onto the 32-symbol profile. Use the explicit `preamble 32` form to select the 32-symbol profile.
-- Level-based settings automatically recalculate their timings when the spreading factor or bandwidth changes. Custom `<rx_us> <sleep_us>` timings remain fixed.
-- The selected mode is applied immediately, persisted, and restored after reboot.
-
----
-
 #### View or change the LoRa FEM receive-path gain state on supported boards
 **Usage:**
 - `get radio.fem.rxgain`
@@ -318,9 +285,12 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 **Parameters:**
 - `state`: `on`|`off`
 
+**Default:** `off` for fresh installs; a build with `-D RADIO_FEM_RXGAIN=1` defaults to `on`. A saved setting wins.
+
 **Notes:**
 - This controls the external LoRa FEM receive-path LNA where the board supports it.
 - This is separate from `radio.rxgain`, which controls the radio chip receive gain mode.
+- Boards without a controllable LNA answer `Error: unsupported`.
 
 ---
 
@@ -339,135 +309,6 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
 - The setting is saved immediately, but on Station G3 the level is applied to the hardware at the start of the next transmit, so that the PA supply rail is never re-targeted while the PA is being driven. `get` reports the configured state, which may lead the hardware until the node next transmits.
 
 ---
-
-#### View or change RX power saving
-**Usage:**
-- `get radio.rxps`
-- `set radio.rxps off`
-- `set radio.rxps on`
-- `set radio.rxps conservative`
-- `set radio.rxps balanced`
-- `set radio.rxps max`
-- `set radio.rxps max preamble <symbols>`
-- `set radio.rxps overdrive`
-- `set radio.rxps overdrive preamble <symbols>`
-- `set radio.rxps riskyWorkingMax`
-- `set radio.rxps riskyWorkingMax preamble <symbols>`
-- `set radio.rxps <level>`
-- `set radio.rxps level <level>`
-- `set radio.rxps level <level> preamble <symbols>`
-- `set radio.rxps <rx_us> <sleep_us>`
-
-**Parameters:**
-- `level`: `1-10`. Levels `1`-`8` are the guarded scale and are expressed in **symbols of the sender's preamble caught**: 15, 14, 13, 12, 11, 10, 9, 8 on the 16-symbol profile and 24, 20, 16, 14, 12, 10, 9, 8 on the 32-symbol one. Level `8` is named `max`. `9` (`overdrive`) and `10` (`riskyWorkingMax`) drop below the 8-symbol floor and outside the datasheet timer condition; only `10` is expected to lose packets.
-- `symbols`: `16` or `32` preamble symbols.
-- `rx_us`: receive-window duration in microseconds, `1000-30000000`.
-- `sleep_us`: radio sleep duration in microseconds, `1000-30000000`.
-
-**Repeater default:** `off`
-
-**Profiles:**
-- `on` and `conservative`: level 3, catches 13 symbols, with a 16-symbol preamble.
-- `balanced`: level 6, catches 10 symbols, with a 16-symbol preamble.
-- `max`: level 8, catches the 8-symbol floor, the cheapest guarded setting that still works on both radio families, with a 16-symbol preamble.
-- `overdrive`: level 9, with a 16-symbol preamble. Outside the datasheet timer condition; see below.
-- `riskyWorkingMax`: level 10, with a 16-symbol preamble. The measured edge of what still works, and the only setting here that is expected to drop packets; see below.
-- Every named profile assumes a 16-symbol sender, which is the worst case a mixed network can present. At SF5-SF8 this is less economical than a numeric level, because a 32-symbol profile cannot catch a 16-symbol preamble. `max preamble 32`, `overdrive preamble 32`, and `riskyWorkingMax preamble 32` select the 32-symbol profile explicitly.
-- A numeric level, or `level <level>`, automatically uses 32 preamble symbols for SF5-SF8 and 16 for SF9-SF12.
-- `level <level> preamble <symbols>` explicitly fixes the preamble used in the calculation.
-- Explicit `rx_us sleep_us` values select manual timing (`level=0`).
-
-**How the timings are derived:**
-
-```text
-sleep  = (preamble - caught symbols) symbols
-listen = whatever the duty-cycle timer condition needs at that sleep
-```
-
-The capture cost - 6 symbols on SX126x, 8 on LR11x0, both measured on the bench -
-no longer enters this arithmetic; it is only a validation, since a level that
-catches fewer symbols than the radio needs to latch is rejected. That is why the
-same level produces the same periods on either family. The listen window is not
-a free parameter:
-it follows from the timer condition below. Three constraints are applied on top,
-all of them measured rather than assumed:
-
-- **Sleep floor.** The driver subtracts the sleep-to-RX transition (`tcxoDelay + 1000 us`) from the requested sleep before writing the register. Below that the arm call fails outright; just above it the SX1262 arms with no error and then detects no preambles at all. Levels whose own sleep falls under the floor are raised to it, and collapse onto the same timing as a result. If even the floor would break preamble capture - a short symbol leaves no room between the two - the level is rejected with `ERROR: RXPS does not fit this SF/BW with preamble <n>` rather than silently falling back to continuous RX.
-- **Timer condition.** Semtech requires `Tpreamble + Theader <= 2 * rxPeriod + sleepPeriod`, because the radio restarts its receive timer with that value when it detects a preamble. Guarded levels `1`-`8` satisfy it; `overdrive` and `riskyWorkingMax` deliberately do not. When it is broken, an SX1262 usually still receives normally, but isolated `rxPeriod` register values one tick wide lose most of the packets they have already latched, and nothing in the value predicts which. LR11x0 has always enforced an equivalent rule in its driver.
-- **Register granularity.** Both radio families program the duty cycle in 15.625 us ticks and truncate on the way in, so the reported periods are snapped to whole ticks and are the ones the hardware actually runs.
-
-**`overdrive` (level 9):**
-
-`overdrive` is the geometry that predates the timer condition being enforced: an
-8-symbol receive window with the sleep at the capture limit. It breaks the
-condition deliberately, in exchange for the lowest duty cycle available. The
-name is meant in the overclocking sense - measured to work, outside the vendor's
-stated envelope - rather than as a warning that it drops packets. It does not.
-
-| Assumed sender preamble | `overdrive` | Level 10 | Saving |
-|---|---|---|---|
-| 32 symbols | 23.5% | 27.5% (SF8) - 33.4% (SF6) | 4.0 - 9.9 pp |
-| 16 symbols | 44.4% | 49.7% (SF8) - 56.6% (SF6) | 5.3 - 12.2 pp |
-
-Both figures are dimensionless in symbols, so they hold at any spreading factor.
-The sleep floor and tick rounding still apply, and the receive window is moved
-one tick if it lands on a register value measured to misbehave. That list of
-values is not exhaustive, which is the whole of the residual risk: levels
-`1`-`8` are safe on any register value, `overdrive` is safe on every value that
-has been measured. It is a text-CLI setting only and is never selected by
-companion firmware.
-
-**`riskyWorkingMax` (level 10):**
-
-The end of the road: the profile extrapolated past `overdrive` until packet
-delivery started to fall, then stepped back to the last setting that still held. The
-sleep goes past the capture budget on purpose, so a preamble sometimes arrives
-while the radio is asleep - which is exactly why delivery falls. Measured at SF8
-with an LR1110 receiver witnessing every transmission on the same link:
-
-| Assumed sender preamble | Delivery | Sleep share | vs `overdrive` |
-|---|---|---|---|
-| 32 symbols | 196/200 (98.0%) | 79.3% | +2.8 pp sleep, -2.0 pp delivery |
-| 16 symbols | 197/200 (98.5%) | 56.4% | +0.9 pp sleep, -1.0 pp delivery |
-
-`overdrive` on the same link and in the same run read 200/200 and 199/200. So
-this level buys a little sleep and pays for it in packets, which is the whole
-trade and the reason the name is what it is. The command is case-sensitive and
-has no short form. On a mesh that relies on retries the cost may be acceptable;
-on a link that matters it is not.
-
-Level-based settings are recalculated after SF or bandwidth changes. Manual timings are not recalculated. Settings are persisted in `/prefs.json`. Companion firmware does not expose this text command and applies its fixed `balanced` profile (level 6, catches 10 symbols, preamble 16) at startup and after radio-parameter changes.
-
-`set radio.rxps` echoes the timings it applied, so the periods the radio really
-runs are visible immediately:
-
-```text
-OK - on,level=9(overdrive),preamble=16,rx=32782,sleep=40954
-OK - on,level=10,preamble=32,rx=40375,sleep=106500
-OK - on,level=5,preamble=16,rx=49485,sleep=22750
-```
-
-`get radio.rxps` reports:
-
-```text
-desired=<on|off>,effective=<armed|continuous>,supported=<yes|no>,
-level=<0-10>[(overdrive)|(riskyWorkingMax)][,catch=<symbols>],preamble=<0|16|32>,rx=<us>,sleep=<us>,
-err=<RadioLib error>,fail=<count>[,erx=<us>,eslp=<us>]
-```
-
-- `desired` is the saved user setting.
-- `level=9(overdrive)` and `level=10(riskyWorkingMax)` mark profiles that run outside the datasheet timer condition. Any other level is guarded.
-- `catch` is how many symbols of a sender's preamble the node actually catches, and appears only for guarded levels. It is not simply the number the level asks for: the sleep floor can shorten the sleep further, and at SF6 with a 16-symbol profile that collapses levels 1-6 onto the same point. Reporting the requested value there would be a lie, so the effective one is reported instead.
-- `effective=armed` means receive duty-cycle is active.
-- `effective=continuous` means RXPS is disabled, unsupported, or the last arm attempt fell back to continuous RX.
-- `fail` counts failed arm operations; each one falls back to continuous RX. `clear stats` resets both this total and the consecutive-failure backoff, granting three fresh arm attempts.
-- `erx` and `eslp` appear only when the driver had to clamp the requested periods, and report the effective periods after driver clamping. On LR1110 the RX window is stretched when `2*rx + sleep` would not cover the extended period Semtech requires, so the real duty cycle can be less economical than `rx`/`sleep` suggest.
-- RXPS is currently supported by the SX1262 and LR1110 wrappers. Other radios remain in continuous RX and reject attempts to enable RXPS.
-- There is intentionally no RXPS watchdog, watchdog command, or periodic recovery. Recovery is limited to the immediate continuous-RX fallback after an arm error. After 3 consecutive arm failures the node stops retrying on every RX restart and stays in continuous RX until the RXPS configuration is set again or `clear stats` grants a fresh set of attempts.
-- On boards with a host-controlled RXEN pin, the RF switch is held in receive mode for the whole duty cycle (otherwise the node would be deaf). An external LNA on that pin therefore stays biased during the sleep windows, so the real power saving is smaller than the `rx`/`sleep` ratio implies.
-
----
-
 
 ### System
 
@@ -607,7 +448,7 @@ err=<RadioLib error>,fail=<count>[,erx=<us>,eslp=<us>]
 
 ---
 
-#### View or change this node's power saving flag (Repeater Only)
+#### View or change this node's power saving flag (Repeater, room server, sensor and companion)
 **Usage:**
 - `powersaving`
 - `powersaving on`
@@ -617,9 +458,11 @@ err=<RadioLib error>,fail=<count>[,erx=<us>,eslp=<us>]
 - `on`: enable power saving
 - `off`: disable power saving
 
-**Default:** `off`
+**Default:** `on` for fresh installs
 
 **Note:** When enabled, device enters sleep mode between radio transmissions
+
+**Companion:** on ESP32 the flag switches automatic light sleep at once (no reboot). Light sleep stays off on USB-serial, hardware-serial, Ethernet and ESP-NOW builds, and while a WiFi network is configured; those builds still scale the CPU clock (80/40 MHz). ESP32-C6 uses the upstream Arduino 3.x core without power management, so it gets neither. nRF52 companions sleep between events regardless of the flag.
 
 ---
 
@@ -711,7 +554,7 @@ err=<RadioLib error>,fail=<count>[,erx=<us>,eslp=<us>]
 **Parameters:**
 - `value`: Direct transmit delay factor (0-2)
 
-**Default:** `0.2`
+**Default:** `0.3` (Repeater) - `0.2` (Room Server, Sensor)
 
 **Note:** Same collision-avoidance random window as `txdelay`, but applied to direct (non-flood, routed) traffic. The default is lower because direct packets are addressed to a specific next hop, so far fewer nodes compete to retransmit them.
 
@@ -802,7 +645,7 @@ err=<RadioLib error>,fail=<count>[,erx=<us>,eslp=<us>]
 - `set agc.reset.interval <value>`
 
 **Parameters:**
-- `value`: Interval in seconds rounded down to a multiple of 4 (17 becomes 16). 0 to disable.
+- `value`: Interval in seconds, 0-1020, rounded down to a multiple of 4 (17 becomes 16). 0 to disable.
 
 **Default:** `0.0`
 
@@ -828,7 +671,7 @@ err=<RadioLib error>,fail=<count>[,erx=<us>,eslp=<us>]
 **Parameters:**
 - `hours`: Interval in hours (3-168)
 
-**Default:** `12` (Repeater) - `0` (Sensor)
+**Default:** `47` (Repeater, Room Server) - `0`, disabled (Sensor)
 
 ---
 
@@ -840,7 +683,12 @@ err=<RadioLib error>,fail=<count>[,erx=<us>,eslp=<us>]
 **Parameters:**
 - `minutes`: Interval in minutes rounded down to the nearest multiple of 2 (61 becomes 60) (60-240)
 
-**Default:** `0`
+**Default:** `2` on a factory-fresh node, then `0` (disabled) once configured.
+
+**Note:** A new install ships with a 2 minute zero-hop advert interval. Saving
+any setting resets an interval below the 60 minute minimum to `0`, on the
+assumption that the node has now been deliberately configured. To keep zero-hop
+adverts running, set an explicit value in the 60-240 range.
 
 ---
 
@@ -992,27 +840,6 @@ err=<RadioLib error>,fail=<count>[,erx=<us>,eslp=<us>]
 
 **Parameters:**
 - `name`: Region name,  or <null> to reset/clear
-
----
-
-#### View or set the direct path override for the current remote client
-**Usage:**
-- `get outpath`
-- `set outpath <hop1_hex,hop2_hex,...>`
-- `set outpath direct`
-- `set outpath clear`
-- `set outpath flood`
-
-**Parameters:**
-- `hopN_hex`: Hop hash, `2`, `4`, or `6` hex characters. All hops must use the same width.
-
-**Notes:**
-- These commands require remote client context (they target the caller's ACL entry).
-- The path hash size is inferred from the hop hash width.
-- `outpath` overrides the primary direct route used for replies to the caller.
-- `direct` sets a zero-hop direct route for a caller reachable without repeaters.
-- `clear` forgets the current direct path and allows normal path discovery to repopulate it.
-- `flood` forces replies to use flood packets until the client logs in again.
 
 ---
 
@@ -1384,5 +1211,20 @@ Ethernet support is available on RAK4631 boards with a RAK13800 (W5100S) Etherne
 - The Ethernet interface obtains an IP address via DHCP automatically on boot.
 - A TCP server listens on port 23 (default) for CLI connections.
 - Connect with any TCP client (e.g. `nc`, PuTTY) to access the same CLI available over serial.
+
+---
+
+### RX power saving (RXPS)
+
+Repeater, Room Server, Sensor and Companion. SX1262 and LR1110 receive in a duty cycle; LR1121, LR2021 and SX127x stay in continuous RX (`supported=no`).
+
+- `get radio.rxps`: `desired` (saved on/off), `effective` (`armed` or `continuous`), `supported`, `err` (last error), `fail` (arm failures), `level`, `catch` (preamble symbols still caught), `preamble`, `rx`/`sleep` (µs). `erx`/`eslp` appear when the driver had to clamp the periods.
+- `set radio.rxps off|on|conservative|balanced|max|overdrive|riskyWorkingMax`: `on` = `conservative` = level 3; `balanced` = level 6; `max` = level 8; `overdrive` (9) and `riskyWorkingMax` (10) run outside the datasheet timing rule.
+- `set radio.rxps level <1-10> [preamble <16|32>]`, `set radio.rxps max|overdrive|riskyWorkingMax preamble <16|32>`
+- `set radio.rxps <rx_us> <sleep_us>`: manual periods, 1000–30000000 µs, kept across SF/BW changes.
+
+**Default:** Balanced (level 6, preamble 16) for fresh installs. A saved setting, including `off`, wins.
+
+**Errors:** a profile that does not fit the active SF/BW is rejected, or, after a radio change, leaves the node in continuous RX with `err=-10001` while the saved choice is kept. Other nonzero `err` values come from the radio driver; after three failed arm attempts the node stays in continuous RX until the setting changes. `set radio` takes effect at reboot; until then the windows of the running modulation stay in use.
 
 ---

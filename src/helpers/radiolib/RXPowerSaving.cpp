@@ -1,4 +1,5 @@
 #include "RXPowerSaving.h"
+#include <math.h>
 
 static uint32_t ceilRxPowerSavingValue(float value) {
   uint32_t rounded = (uint32_t)value;
@@ -81,12 +82,14 @@ bool calcRxPowerSavingLevel(uint8_t level, uint8_t sf, float bw, uint8_t preambl
                             float capture_cost_symbols, uint32_t transition_us) {
   if (rx_us == nullptr || sleep_us == nullptr || level < 1 ||
       level > RX_POWERSAVING_RISKY_WORKING_MAX_LEVEL || sf < 5 || sf > 12 ||
-      bw <= 0.0f || (preamble != 16 && preamble != 32)) {
+      !isfinite(bw) || bw <= 0.0f || !isfinite(capture_cost_symbols) ||
+      capture_cost_symbols <= 0 || capture_cost_symbols >= preamble || transition_us >= RX_POWERSAVING_MAX_PERIOD_US || (preamble != 16 && preamble != 32)) {
     return false;
   }
   const bool unguarded = isRxPowerSavingUnguardedLevel(level);
 
   const float symbol_us = (1000.0f * (float)(1UL << sf)) / bw;
+  if (!isfinite(symbol_us) || symbol_us * 64.0f > (float)(UINT32_MAX / 8)) return false;
   // Worst case a preamble starts the instant an RX window closes, so the part
   // that survives into the next window is `preamble - sleep`. The absolute
   // limit is therefore reached when that equals the chip's capture cost; the
@@ -206,19 +209,37 @@ bool recalcRxPowerSavingFromLevel(uint8_t level, uint8_t sf, float bw, uint8_t p
   return true;
 }
 
-void normalizeRxPowerSavingConfig(RxPowerSavingConfig* config, uint8_t sf, float bw,
+bool normalizeRxPowerSavingConfig(RxPowerSavingConfig* config, uint8_t sf, float bw,
                                   float capture_cost_symbols, uint32_t transition_us) {
-  if (config == nullptr) return;
+  if (config == nullptr || sf < 5 || sf > 12 || !isfinite(bw) || bw <= 0) return false;
+  RxPowerSavingConfig proposed = *config;
+  proposed.enabled = proposed.enabled ? 1 : 0;
+  if (proposed.level > RX_POWERSAVING_RISKY_WORKING_MAX_LEVEL) {
+    proposed.level = RX_POWERSAVING_BALANCED_LEVEL;
+  }
+  if (proposed.preamble != 0 && proposed.preamble != 16 && proposed.preamble != 32) {
+    proposed.preamble = RX_POWERSAVING_PROFILE_PREAMBLE;
+  }
+  if (proposed.level == 0) {
+    if (!isValidRxPowerSavingPeriod(proposed.rx_us) ||
+        !isValidRxPowerSavingPeriod(proposed.sleep_us)) return false;
+  } else if (!recalcRxPowerSavingFromLevel(proposed.level, sf, bw, proposed.preamble,
+                                         &proposed.rx_us, &proposed.sleep_us,
+                                         capture_cost_symbols, transition_us)) {
+    return false;
+  }
+  *config = proposed;
+  return true;
+}
 
-  config->enabled = config->enabled ? 1 : 0;
-  if (config->level > RX_POWERSAVING_RISKY_WORKING_MAX_LEVEL) {
-    config->level = RX_POWERSAVING_BALANCED_LEVEL;
-  }
-  if (config->preamble != 0 && config->preamble != 16 && config->preamble != 32) {
-    config->preamble = RX_POWERSAVING_PROFILE_PREAMBLE;
-  }
-  ensureRxPowerSavingDefaults(&config->rx_us, &config->sleep_us);
-  recalcRxPowerSavingFromLevel(config->level, sf, bw, config->preamble,
-                               &config->rx_us, &config->sleep_us, capture_cost_symbols,
-                               transition_us);
+bool applyRxPowerSavingConfig(RxPowerSavingConfig* config, uint8_t sf, float bw,
+                              RxPowerSavingControl* control) {
+  if (config == nullptr) return false;
+  const bool valid = !config->enabled || normalizeRxPowerSavingConfig(
+      config, sf, bw, rxPowerSavingCaptureCost(control), rxPowerSavingTransition(control));
+  if (control == nullptr) return !config->enabled;
+  const bool accepted = control->setRxPowerSaving(
+      config->enabled && valid, config->rx_us, config->sleep_us);
+  control->setRxPowerSavingConfigError(!valid);
+  return valid && accepted;
 }

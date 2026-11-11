@@ -24,6 +24,9 @@ public:
   void onSendFinished() override;
   bool isInRecvMode() const override;
 
+  // PowerSaving variant
+  uint32_t getCADBusyCount() const { return 0; }  // ESP-NOW has no LoRa CAD
+
   uint32_t getPacketsRecv() const { return n_recv; }
   uint32_t getPacketsSent() const { return n_sent; }
   uint32_t getPacketsRecvErrors() const { return n_recv_errors; }
@@ -38,7 +41,8 @@ public:
    * These two functions do nothing for ESP-NOW, but are needed for the
    * Radio interface.
    */
-  virtual bool setRxBoostedGainMode(bool) { }
+  // PowerSaving variant
+  virtual bool setRxBoostedGainMode(bool) { return false; }
   virtual bool getRxBoostedGainMode() const { return false; }
 
   uint32_t intID();

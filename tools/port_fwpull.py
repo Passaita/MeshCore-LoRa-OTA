@@ -16,7 +16,7 @@ import argparse, os, re, shutil, subprocess, sys, zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.dirname(HERE)
 COPY = ['src/helpers/fw_ota', 'boards/nrf52840_s140_v6_fwota.ld', 'boards/nrf52_common_fwota.ld',
-        'tools/fw_ota_stage.py', 'docs/lora-ota', 'test/fw_ota_chunkmap_test.cpp']
+        'tools/fw_ota_stage.py', 'docs/fw_pull.md', 'test/fw_ota_chunkmap_test.cpp']
 APP_MAX = 0x70000
 TAG = bytes.fromhex('4657504c01000000') + b'RAK3401'
 

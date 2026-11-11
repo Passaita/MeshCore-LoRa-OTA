@@ -2,6 +2,7 @@
 
 #include <Utils.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -153,8 +154,16 @@ bool RXPowerSavingCLI::set(const char* value, uint8_t sf, float bw,
     }
   }
 
+  if (proposed.enabled && (sf < 5 || sf > 12 || !isfinite(bw) || bw <= 0)) {
+    if (control) {
+      control->setRxPowerSaving(false, proposed.rx_us, proposed.sleep_us);
+      control->setRxPowerSavingConfigError(true);
+    }
+    snprintf(reply, reply_size, "ERROR: invalid SF/BW for RXPS");
+    return false;
+  }
   if (level_requested &&
-      !calcRxPowerSavingLevel(level, sf, bw, preamble,
+      !recalcRxPowerSavingFromLevel(level, sf, bw, preamble,
                               &proposed.rx_us, &proposed.sleep_us,
                               rxPowerSavingCaptureCost(control),
                               rxPowerSavingTransition(control))) {
@@ -163,6 +172,10 @@ bool RXPowerSavingCLI::set(const char* value, uint8_t sf, float bw,
     // preamble of this length be caught - i.e. the symbol is too short for RXPS
     // at this SF/BW. Saying "level range is 1-10" would send the user hunting
     // for the wrong thing.
+    if (control) {
+      control->setRxPowerSaving(false, proposed.rx_us, proposed.sleep_us);
+      control->setRxPowerSavingConfigError(true);
+    }
     snprintf(reply, reply_size, "ERROR: RXPS does not fit this SF/BW with preamble %lu",
              (unsigned long)preamble);
     return false;
@@ -182,6 +195,8 @@ bool RXPowerSavingCLI::set(const char* value, uint8_t sf, float bw,
     snprintf(reply, reply_size, "ERROR: RX powersaving unsupported");
     return false;
   }
+
+  if (control) control->setRxPowerSavingConfigError(false);
 
   if (level_requested) {
     proposed.level = level;
@@ -214,28 +229,32 @@ void RXPowerSavingCLI::get(const RxPowerSavingConfig* config,
   // point. Reporting the requested value there would be a lie.
   char margin[24];
   margin[0] = 0;
-  if (config->level >= 1 && config->level <= RX_POWERSAVING_GUARDED_LEVELS &&
-      sf >= 5 && sf <= 12 && bw > 0.0f) {
+  if (status.last_error == 0 && isValidRxPowerSavingPeriod(config->sleep_us) &&
+      config->level >= 1 && config->level <= RX_POWERSAVING_GUARDED_LEVELS &&
+      sf >= 5 && sf <= 12 && isfinite(bw) && bw > 0.0f) {
     const uint8_t preamble = config->preamble ? config->preamble : rxPowerSavingPreambleForSF(sf);
     const float symbol_us = (1000.0f * (float)(1UL << sf)) / bw;
     const float effective = (float)preamble - (float)config->sleep_us / symbol_us;
     // No %f on this platform's printf, and rounding the whole and fractional
     // parts separately overflows: 4.999 came out as "4.10".
-    const int tenths = (int)(effective * 10.0f + (effective < 0.0f ? -0.5f : 0.5f));
-    snprintf(margin, sizeof(margin), ",catch=%d.%d", tenths / 10,
-             tenths < 0 ? -(tenths % 10) : tenths % 10);
+    const float scaled = effective * 10.0f + (effective < 0.0f ? -0.5f : 0.5f);
+    if (isfinite(scaled) && scaled > (float)INT_MIN && scaled < (float)INT_MAX) {
+      const int tenths = (int)scaled;
+      snprintf(margin, sizeof(margin), ",catch=%d.%d", tenths / 10,
+               tenths < 0 ? -(tenths % 10) : tenths % 10);
+    }
   }
 
   // Overdrive has to be visible here, otherwise it reads as an ordinary level
   // and nobody remembers it runs outside the datasheet rule.
   int len = snprintf(reply, reply_size,
-           "> desired=%s,effective=%s,supported=%s,level=%lu%s%s,preamble=%lu,rx=%lu,sleep=%lu,err=%d,fail=%lu",
+           "> desired=%s,effective=%s,supported=%s,err=%d,fail=%lu,level=%lu%s%s,preamble=%lu,rx=%lu,sleep=%lu",
            config->enabled ? "on" : "off", status.armed ? "armed" : "continuous",
-           status.supported ? "yes" : "no", (unsigned long)config->level,
+           status.supported ? "yes" : "no", (int)status.last_error,
+           (unsigned long)status.arm_failures, (unsigned long)config->level,
            rxPowerSavingLevelTag(config->level), margin,
            (unsigned long)config->preamble, (unsigned long)config->rx_us,
-           (unsigned long)config->sleep_us, (int)status.last_error,
-           (unsigned long)status.arm_failures);
+           (unsigned long)config->sleep_us);
 
   // Only report the periods the hardware really runs with when a driver had to
   // clamp them - printing them always would not fit the 160 byte reply buffer.

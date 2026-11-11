@@ -7,7 +7,10 @@
 using namespace sim;
 
 static int g_fail = 0, g_pass = 0;
-#define CHECK(cond, ...) do { if (cond) g_pass++; else { g_fail++; printf("  FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+// (2026-11-03) SIM_STOP_ON_FAIL=1 (mutant runs): the first failed check ends the run - a mutant is caught by one failure, the rest is wasted time
+#include <unistd.h>
+#define CHECK(cond, ...) do { if (cond) g_pass++; else { g_fail++; printf("  FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); \
+  if (getenv("SIM_STOP_ON_FAIL")) { printf("simulator: %d checks passed, %d failed (stopped at the first failure)\n", g_pass, g_fail); fflush(stdout); _exit(1); } } } while (0)
 static bool has(const std::string& s, const char* sub) { return s.find(sub) != std::string::npos; }
 static uint32_t floodsAll(World& w) { uint32_t n = 0; for (auto& x : w.nodes) n += x->st.floods; return n; }
 static const fw_ota::FwOtaTransfer::SwarmStats& ss(World& w, int i) { return w[i].xfer->stats; }
@@ -16,7 +19,8 @@ static const char* PHRASE = "fw passphrase sim circle delta tango";
 
 static void circle(World& w, std::vector<int> ids) {
   for (int i : ids) w.cli(i, PHRASE);
-  w.run(120000, [&]() { for (int i : ids) if (!has(w.cli(i, "fw passphrase"), "fingerprint")) return false; return true; });
+  w.run(120000, [&]() { for (int i : ids) { std::string f = w.cli(i, "fw passphrase"); if (!has(f, "circle ") || has(f, "key")) return false; } return true; });
+  for (int i : ids) w.cli(i, "fw autoapply on");   // (rc22, C65) new nodes start with auto-apply OFF; the scenarios before rc22 install by themselves
 }
 
 // S0: two neighbours - a holder serves, the other scans, pulls by version and installs it (sanity of the simulator itself)
@@ -202,7 +206,11 @@ static void r_quiet() {
   w.run(3 * 3600000);
   uint32_t adv = 0, txs = 0; for (int i : {a, b, c, d}) adv += ss(w, i).adverts;
   for (auto& n : w.nodes) txs += n->st.disc;
-  CHECK(floodsAll(w) == f0, "no flood in 6 h (%u)", floodsAll(w) - f0);
+  // (rc25, C95) the newcomer query is one flood per boot (forwarded by every node: <= 5 boots x 5 nodes); nothing periodic: a further quiet
+  // 6 h without a boot carries no flood at all
+  CHECK(floodsAll(w) - f0 <= 25, "no flood in 6 h but the newcomer queries at the boots (%u transmissions)", floodsAll(w) - f0);
+  const uint32_t f1 = floodsAll(w); w.run(6 * 3600000);
+  CHECK(floodsAll(w) == f1, "no flood in a quiet 6 h without a boot (%u)", floodsAll(w) - f1);
   CHECK(adv <= 4, "only boot adverts, zero-hop (%u)", adv);
   printf("  6 h: %u floods, %u adverts (all zero-hop), %u discovery-channel transmissions in all (incl. the circle setup)\n", floodsAll(w) - f0, adv, txs);
 }
@@ -395,8 +403,8 @@ static uint64_t airAll(World& w) { uint64_t a = 0; for (auto& n : w.nodes) a += 
 static uint32_t pctOf(World& w, int i) { auto* x = w[i].xfer.get(); return x && x->_man.n_chunks ? 100u * x->_cm.have / x->_man.n_chunks : 0u; }
 static void powerCut(World& w, int i, uint32_t off_ms) { w[i].down_until = g_sim_now + off_ms; w[i].radio.rxq.clear(); w.boot(w[i], 0); }   // flash + files kept
 struct FleetNet { int s, r1, r2, r3, p, c1, c2, c3, b1; };
-// A field chain: S (server, fw-301) - R1 (LoRa-OTA, relays) - R2 (LoRa-OTA, relays) - R3 (stock relay) -
-// P (a remote node, pulls). Hearers off the path: C1 near R1 (empty slot), C2 near R2 (fw-300), C3 near R3 (empty). B1 hears only C2 (a branch).
+// The owner's chain (SWARM-DESIGN 9.2): S (board 1, fw-301) - R1 (field node, LoRa-OTA, relays) - R2 (field node, LoRa-OTA, relays) - R3 (stock relay) -
+// P (remote field node, pulls). Hearers off the path: C1 near R1 (empty slot), C2 near R2 (fw-300), C3 near R3 (empty). B1 hears only C2 (a branch).
 static FleetNet fleetNet(World& w, double loss) {
   FleetNet f;
   f.s = w.add("S").idx; f.r1 = w.add("R1").idx; f.r2 = w.add("R2").idx; f.r3 = w.add("R3", false).idx; f.p = w.add("P").idx;
@@ -443,7 +451,7 @@ static void f_mode1(double loss) {
   { const uint64_t sa = airAll(w); w.cli(f.p, "fw peers"); w.run(90000); std::string l = w.cli(f.p, "fw list");   // a scan here: measured, see F5
     printf("  one scan from P: %s (%.1f s of channel air)\n", l.c_str(), (airAll(w) - sa) / 1000.0); }
   const uint32_t t0 = g_sim_now; const uint64_t a0 = airAll(w); const uint32_t s0 = w[f.s].st.tx;
-  std::string r = w.cli(f.p, "fw pull " + idHex(w, f.s) + " duty 1");   // the owner's command: S by id (rc8 pulled a field relay this way)
+  std::string r = w.cli(f.p, "fw pull " + idHex(w, f.s) + " duty 1");   // the owner's command: S by id (rc8 pulled a field node this way)
   g_done.clear(); w.run(10 * 3600000, [&]() { return trackDone(w, {f.p, f.c1, f.c3}, f.p, t0); }); printDone(w);
   CHECK(w[f.p].app_fw == 301, "P installed fw-301: %s", w.cli(f.p, "fw pull-status").c_str());
   // (rc19, C42 owner) a plain pull's listeners only help while it pulls: C1 / C3 (no neighbour holds fw-301) keep >= 80 % paused - no path
@@ -642,14 +650,19 @@ static void f_cli() {
   w.seedImage(s, 301, 32000, 9, true); w.seedImage(p, 300, 30000, 1, true);
   circle(w, {s, p}); w.run(20000);
   std::string l0 = w.cli(p, "fw list");
-  CHECK(has(l0, "no scan yet") && w[p].st.tx == 0, "C38 'fw list' before a scan sends nothing: %s", l0.c_str());
+  w.run(5000);
+  CHECK(has(l0, "no scan yet - scanning now") && w[p].st.tx > 0, "C70 the first 'fw list' scans by itself: %s", l0.c_str());
+  w.run(30000);
+  CHECK(has(w.cli(p, "fw list"), "#1 fw-301 x1 (0hop)"), "C70 then 'fw list' shows: %s", w.cli(p, "fw list").c_str());
   w.cli(p, "fw peers"); w.run(35000);
   CHECK(has(w.cli(p, "fw list"), "#1 fw-301 x1 (0hop)"), "C38 'fw peers' scanned, 'fw list' shows: %s", w.cli(p, "fw list").c_str());
   CHECK(has(w.cli(p, "fw list hosts"), "#1 fw-301"), "C38 'fw list hosts': %s", w.cli(p, "fw list hosts").c_str());
   std::string sl = w.cli(s, "fw slot");
   CHECK(has(sl, "slot: app fw-301, 32000 B, crc ") && has(sl, "installed here, offered to neighbours"), "C39 fw slot: %s", sl.c_str());
   const uint32_t tx0 = w[p].st.tx;
-  std::string r = w.cli(p, "fw pull #1 duty 1 pause 2h");
+  std::string r = w.cli(p, "fw pull #1 duty 1 pause 30");
+  CHECK(has(r, "ERR - pause 1m-168h"), "C75 a pause without its unit is refused: %s", r.c_str());
+  r = w.cli(p, "fw pull #1 duty 1 pause 2h");
   CHECK(has(r, "paused") && has(r, "2 h"), "C37 one command: %s", r.c_str());
   w.run(30 * 60000);
   CHECK(w[p].st.tx == tx0 && has(w.cli(p, "fw pull-status"), "PAUSED"), "C37 nothing sent before the first offer (%u): %s", w[p].st.tx - tx0, w.cli(p, "fw pull-status").c_str());
@@ -969,7 +982,7 @@ static void h_benchD() {
   CHECK(lisTx(b) - lt <= 2 && ss(w, b.s).repairs == sr, "the paused listeners sent nothing for an hour (%u packets, S repairs +%u)", lisTx(b) - lt, ss(w, b.s).repairs - sr);
   CHECK(has(w.cli(b.s, "fw serve"), "fw-301"), "S still serves: %s", w.cli(b.s, "fw serve").c_str());
   std::string rs = w.cli(b.l2, "fw pull-resume");
-  CHECK(has(rs, "OK - finishing the fill at"), "L2 'fw pull-resume': %s", rs.c_str());
+  CHECK(has(rs, "OK - finishing the fill "), "L2 'fw pull-resume': %s", rs.c_str());
   benchRun(b, t0, 4 * 3600000, [&]() { return slotFw(w, b.l2) == 301; });
   CHECK(slotFw(w, b.l2) == 301 && w[b.l2].app_fw == 300, "L2 finished from S, not installed: %s | %s", w.cli(b.l2, "fw pull-status").c_str(), w.cli(b.l2, "fw slot").c_str());
   if (!b.shrt) CHECK(has(w.cli(b.l1, "fw pull-status"), "PAUSED"), "L1 still paused: %s", w.cli(b.l1, "fw pull-status").c_str());
@@ -986,7 +999,7 @@ static void h_benchE() {
   benchRun(b, t0, 4 * 3600000, [&]() { return pctOf(w, b.p) >= 25; });
   std::string pz = w.cli(b.p, "fw pull-pause");
   printf("  pause at P %u %%, L1 %u %%, L2 %u %%: %s\n", pctOf(w, b.p), pctOf(w, b.l1), pctOf(w, b.l2), pz.c_str());
-  CHECK(has(pz, "OK - paused at"), "P paused: %s", pz.c_str());
+  CHECK(has(pz, "OK - paused "), "P paused: %s", pz.c_str());
   const uint32_t g0 = lisSum(b, &fw_ota::FwOtaTransfer::SwarmStats::gap_reqs);
   benchRun(b, t0, 20 * 60000);
   for (int i : b.lis) CHECK(has(w.cli(i, "fw pull-status"), "PAUSED") && has(w.cli(i, "fw pull-status"), "passive fill paused"),
@@ -997,7 +1010,7 @@ static void h_benchE() {
         "silent for an hour: %u packets, gap requests +%u, path pulls %u", lisTx(b) - lt, lisSum(b, &fw_ota::FwOtaTransfer::SwarmStats::gap_reqs) - g0,
         lisSum(b, &fw_ota::FwOtaTransfer::SwarmStats::escalations));
   std::string rs = w.cli(b.p, "fw pull-resume");
-  CHECK(has(rs, "OK - resumed at"), "P 'fw pull-resume': %s", rs.c_str());
+  CHECK(has(rs, "OK - resumed "), "P 'fw pull-resume': %s", rs.c_str());
   benchRun(b, t0, 6 * 3600000, [&]() { return w[b.p].app_fw == 301 && lisDone(b, 301); });
   CHECK(w[b.p].app_fw == 301, "P finished and installed: %s", w.cli(b.p, "fw pull-status").c_str());
   for (int i : b.lis) CHECK(slotFw(w, i) == 301 && w[i].app_fw == 0, "%s finished from P's resumed stream, not installed: %s | %s",
@@ -1014,7 +1027,7 @@ static void h_benchF() {
   if (getenv("SIM_TRACE")) benchLine(b, t0);
   std::string pz = w.cli(b.p, "fw pull-pause");
   printf("  pause at P %u %%, L1 %u %%, L2 %u %%: %s\n", pctOf(w, b.p), pctOf(w, b.l1), pctOf(w, b.l2), pz.c_str());
-  CHECK(has(pz, "OK - paused at"), "P paused: %s", pz.c_str());
+  CHECK(has(pz, "OK - paused "), "P paused: %s", pz.c_str());
   benchRun(b, t0, 90 * 60000, [&]() { return lisDone(b, 301); });
   for (int i : b.lis) CHECK(slotFw(w, i) == 301 && w[i].app_fw == 0, "%s finished from S while P is paused, not installed: %s | %s",
                                    w[i].name.c_str(), w.cli(i, "fw pull-status").c_str(), w.cli(i, "fw slot").c_str());
@@ -1061,15 +1074,15 @@ static void h_storm() {
 
 // H3 (C44): test B on the bench - S (board 1) serves P (board 2) one stock relay away; L1, L2 (board 3, twin) sit next to S and collect the
 // fleet stream. rc18: the listeners asked S for chunks AHEAD of the stream (739 repairs for 1766 chunks); rc19: only behind it.
-static void h_behind() {
-  printf("H3 (C44) test B layout: gap requests only behind the stream\n");
-  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = 0;
-  World w; W = &w; g_sim_now = 0;
+// (rc23, C91) the seed + start offset: H3 runs seed 0 (or SIM_SEED / SIM_OFF_MS: the study), H25 the seeds that failed before C91
+static void h_behind_run(uint32_t seed, uint32_t off) {
+  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = seed;
+  World w; W = &w; g_sim_now = 0; if (g_seed) w.chance = Rng(12345 + 104729ULL * g_seed);
   int s = w.add("S").idx, r = w.add("R", false).idx, p = w.add("P").idx, l1 = w.add("L1").idx, l2 = w.add("L2").idx;
   w.link(s, r, 8, 0.1); w.link(r, p, 6, 0.25); w.link(s, l1, 9, 0.1); w.link(s, l2, 9, 0.1); w.link(l1, l2, 9, 0.1);
   w.seedImage(s, 301, 64000, 9, true); for (int i : {p, l1, l2}) w.seedImage(i, 300, 60000, 1, true);
   circle(w, {s, p, l1, l2}); for (int i : {s, p, l1, l2}) w.cli(i, "fw duty 1");
-  w.run(150000);
+  w.run(150000 + off);
   const uint32_t t0 = g_sim_now;
   w.cli(p, "fw pull " + idHex(w, s) + " duty 1 fleet");
   uint32_t ahead = 0;
@@ -1088,10 +1101,50 @@ static void h_behind() {
     for (int i : {l1, l2}) { auto* x = w[i].xfer.get(); if (x->_man.n_chunks && xp->_man.n_chunks && x->_cm.have > xp->_cm.have + 40) ahead++; }
     return w[p].app_fw == 301 && slotFw(w, l1) == 301 && slotFw(w, l2) == 301; });
   uint32_t reps = 0, gaps = 0; for (auto& n : w.nodes) if (n->xfer) { reps += n->xfer->stats.repairs; gaps += n->xfer->stats.gap_reqs; }
-  CHECK(w[p].app_fw == 301 && slotFw(w, l1) == 301 && slotFw(w, l2) == 301, "all three have fw-301 (P app %u, L1 %u, L2 %u)", w[p].app_fw, slotFw(w, l1), slotFw(w, l2));
-  CHECK(reps <= 160, "repairs %u for 400 chunks (<= 160; rc18 465: a holder's announce ended the listeners' stream)", reps);
-  CHECK(ahead == 0, "no listener got ahead of the puller by > 40 chunks (%u samples)", ahead);
-  printf("  done %.0f min; repairs %u, gap requests %u, S tx %u (%.2f/chunk)\n", (g_sim_now - t0) / 60000.0, reps, gaps, w[s].st.tx, w[s].st.tx / 400.0);
+  CHECK(w[p].app_fw == 301 && slotFw(w, l1) == 301 && slotFw(w, l2) == 301, "seed %u: all three have fw-301 (P app %u, L1 %u, L2 %u)", seed, w[p].app_fw, slotFw(w, l1), slotFw(w, l2));
+  CHECK(reps <= 160, "seed %u: repairs %u for 400 chunks (<= 160; rc18 465: a holder's announce ended the listeners' stream)", seed, reps);
+  CHECK(ahead == 0, "seed %u: no listener got ahead of the puller by > 40 chunks (%u samples)", seed, ahead);
+  CHECK(g_sim_now - t0 < 4 * 3600000u, "seed %u: done in %.0f min (< 4 h; seed 7 before C91: 501 min)", seed, (g_sim_now - t0) / 60000.0);
+  printf("  seed %u: done %.0f min; repairs %u, gap requests %u, S tx %u (%.2f/chunk)\n", seed, (g_sim_now - t0) / 60000.0, reps, gaps, w[s].st.tx, w[s].st.tx / 400.0);
+}
+static void h_behind() {
+  printf("H3 (C44) test B layout: gap requests only behind the stream\n");
+  h_behind_run(getenv("SIM_SEED") ? (uint32_t)atoi(getenv("SIM_SEED")) : 0, getenv("SIM_OFF_MS") ? (uint32_t)atoi(getenv("SIM_OFF_MS")) : 0);
+}
+// H25 (rc23, C91): H3 on the seeds where the listeners asked ahead of a running stream before C91 (the requester's announces reach them
+// only through the server's one zero-hop echo: 3 lost in a row; or the fill began from the source's holder announce). 100-run study: 31 % -> 7 %
+static void h_behind_seeds() {
+  printf("H25 (C91) test B layout, the seeds that failed: listeners stay behind a running stream\n");
+  for (uint32_t sd : {7u, 53u, 4u}) h_behind_run(sd, 0);   // 7: fails without FANN_ALIVE 5, 53: without the stream's sign of life, 4: with
+                                                            //    neither (the study's variants V7 / V8 / V6)
+}
+
+// H26 (rc23, deterministic G3): the source of a fleet pull gossips from the fleet OFFER alone, while every answer it sends is lost (rc18:
+// a fading tail never started). G3 (T4 seed 7) exercised this only by chance and H3 caught the mutant by a hair until C91 steadied H3.
+// The requester's fleet announce (it names S) also starts S's gossip, so the offer is the backup for a lost announce: S must spread at
+// the very moment it counts the first offer. Then S's link to R1 is cut in S's direction only (its answers lost) and S still gossips;
+// when the link is back, the image moves hop by hop to the branch B1.
+static void h_srcspread() {
+  printf("H26 the source of a fleet pull gossips from the offer, its answers lost\n");
+  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = 0;
+  World w; W = &w; g_sim_now = 0;
+  FleetNet f = fleetNet(w, 0.0);
+  auto* s = w[f.s].xfer.get();
+  w.cli(f.p, "fw pull " + idHex(w, f.s) + " duty 1 fleet");   // the route to S is found with the link up (discovery needs S's replies)
+  bool pre = false;                                        // S gossiped before the first offer (P's announce came first: no proof)
+  w.run(2 * 3600000, [&]() { if (!s->_serve_offer_reqs) pre = memcmp(s->_spread_tag, s->_serve_man.sha256, 4) == 0; return s->_serve_offer_reqs > 0; });
+  CHECK(s->_serve_offer_reqs > 0 && !pre, "S heard P's fleet offer (%u), not spreading before it", s->_serve_offer_reqs);
+  CHECK(memcmp(s->_spread_tag, s->_serve_man.sha256, 4) == 0, "S spreads from the moment of the fleet offer (not only after a holder's announce)");
+  w.links[{f.s, f.r1}].up = false;                         // at once, before S's (delayed) answer: S hears R1, R1 never hears S
+  const uint32_t a0 = s->stats.summs;
+  w.run(2 * 3600000, [&]() { return memcmp(s->_spread_tag, s->_serve_man.sha256, 4) == 0 && s->stats.summs > a0; });
+  CHECK(pctOf(w, f.p) == 0, "none of S's answers got out: P at %u %%", pctOf(w, f.p));
+  CHECK(memcmp(s->_spread_tag, s->_serve_man.sha256, 4) == 0, "S spreads its image from the fleet offer alone (no answer got through)");
+  CHECK(s->stats.summs > a0, "S sent holder announces while its answers were lost (%u)", s->stats.summs - a0);
+  w.links[{f.s, f.r1}].up = true;
+  w.run(12 * 3600000, [&]() { return w[f.p].app_fw == 301 && slotFw(w, f.b1) == 301; });
+  CHECK(w[f.p].app_fw == 301 && slotFw(w, f.b1) == 301, "link back: P installed, B1 got it hop by hop: P app %u, B1 slot %u",
+        w[f.p].app_fw, slotFw(w, f.b1));
 }
 
 // H11 (rc20, C48): a second holder T looks faster than S (a direct neighbour of P with a strong signal) but P's requests reach it badly (a
@@ -1158,10 +1211,10 @@ static void h_texts() {
   w.run(150000);
   w.cli(p, "fw autoapply off");
   std::string r = w.cli(p, "fw pull " + idHex(w, s) + " duty 1 fleet");
-  CHECK(has(r, "auto-apply is off") && !has(r, "applies itself"), "C45 fleet pull reply with autoapply off: %s", r.c_str());
+  CHECK(has(r, "auto-apply is off") && !has(r, "installs unattended"), "C45 fleet pull reply with autoapply off: %s", r.c_str());
   w.cli(p, "fw pull-abort"); w.cli(p, "fw autoapply on");
   r = w.cli(p, "fw pull " + idHex(w, s) + " duty 1");
-  CHECK(has(r, "applies itself"), "C45 with autoapply on: %s", r.c_str());
+  CHECK(has(r, "installs unattended"), "C45 with autoapply on: %s", r.c_str());
   // C47: P's pull resumes under a new session - the server's status keeps its position
   auto* xp = w[p].xfer.get();
   w.run(2 * 3600000, [&]() { return xp->_man.n_chunks && xp->_cm.have * 2 >= xp->_man.n_chunks; });
@@ -1171,18 +1224,26 @@ static void h_texts() {
   CHECK(!has(st, "starting") && has(st, "/400 ("), "C47 the server shows the resumed pull's position: %s", st.c_str());
   // (rc20, C55) a repeated pause / resume (its first reply lost over LoRa) says what is, not an error
   r = w.cli(p, "fw pull-pause"); std::string r2 = w.cli(p, "fw pull-pause");
-  CHECK(has(r2, "OK - already paused at") && has(r2, "until 'fw pull-resume'"), "C55 a second pause: %s", r2.c_str());
-  r2 = w.cli(p, "fw pull-pause 3h"); CHECK(has(r2, "OK - already paused at") && has(r2, "in 3 h"), "C55 a new pause timer: %s", r2.c_str());
+  CHECK(has(r2, "OK - already paused ") && !has(r2, "resumes in"), "C55 a second pause: %s", r2.c_str());
+  r2 = w.cli(p, "fw pull-pause 3h"); CHECK(has(r2, "OK - already paused ") && has(r2, "in 3 h"), "C55 a new pause timer: %s", r2.c_str());
+  // (rc22, C75) a pause in minutes: named in the reply, kept across a reboot (its timer restarts: no RTC needed), resumes by itself
+  r2 = w.cli(p, "fw pull-pause 45m"); CHECK(has(r2, "resumes in 45 min"), "C75 pause in minutes: %s", r2.c_str());
+  r2 = w.cli(p, "fw pull-pause 1h30m"); CHECK(has(r2, "resumes in 1 h 30 min"), "C75 hours + minutes: %s", r2.c_str());
+  r2 = w.cli(p, "fw pull-pause 45m");
+  w.boot(w[p], POWER_RESETREAS_SREQ_Msk); w.run(60000);
+  r2 = w.cli(p, "fw pull-status"); CHECK(has(r2, "PAUSED") && (has(r2, "resumes in 0h44m") || has(r2, "resumes in 0h43m")), "C75 45 min kept across a reboot: %s", r2.c_str());
+  w.run(40 * 60000); r2 = w.cli(p, "fw pull-status"); CHECK(has(r2, "PAUSED"), "C75 still paused after 41 min: %s", r2.c_str());
+  w.run(6 * 60000); r2 = w.cli(p, "fw pull-status"); CHECK(!has(r2, "PAUSED"), "C75 resumed by itself after 45 min: %s", r2.c_str());
   w.cli(p, "fw pull-resume"); r2 = w.cli(p, "fw pull-resume");
-  CHECK(has(r2, "OK - not paused: the pull runs at"), "C55 a second resume: %s", r2.c_str());
+  CHECK(has(r2, "OK - not paused"), "C55 a second resume: %s", r2.c_str());
   w.run(3 * 3600000, [&]() { return w[p].app_fw == 301; });
   // C46: 'fw pull-ble' on a weak battery without USB warns (and still goes ahead); with USB power: the plain reply
   auto* xs = w[s].xfer.get(); enter(w[s]); xs->_bl_probed = true; xs->_own_bl_rev = 8;
   xs->noteBattery(3310); w[s].power.USBREGSTATUS = 0;
   r = w.cli(s, "fw pull-ble"); xs->_reset_at_ms = 0;
-  CHECK(has(r, "OK - Bluetooth upload into the slot") && has(r, "3.31 V, no USB") && r.size() < 160, "C46 warning: %s", r.c_str());
+  CHECK(has(r, "OK - Bluetooth in 3 s") && has(r, "3.31 V, may restart") && r.size() < 160, "C46 warning: %s", r.c_str());
   w[s].power.USBREGSTATUS = 1; r = w.cli(s, "fw pull-ble"); xs->_reset_at_ms = 0;
-  CHECK(has(r, "OK - Bluetooth upload into the slot") && !has(r, "no USB"), "C46 on USB power: %s", r.c_str());
+  CHECK(has(r, "OK - Bluetooth in 3 s") && !has(r, "may restart"), "C46 on USB power: %s", r.c_str());
   xs->noteBattery(3900); w[s].power.USBREGSTATUS = 0; r = w.cli(s, "fw pull-ble"); xs->_reset_at_ms = 0;
   CHECK(!has(r, "no USB"), "C46 a full battery: %s", r.c_str());
 }
@@ -1210,7 +1271,7 @@ static void h_time() {
   CHECK(w[a].xfer->_tq_tries == 0 && w[b].xfer->_tq_tries == 0, "nodes with an RTC never ask");
   CHECK(w[x].rtc.off() < -3600 * 24 && has(w.cli(x, "fw time"), "no swarm time yet"), "X (no RTC neighbour) gets no time - R does not relay it: off %d s", w[x].rtc.off());
   CHECK(has(w.cli(a, "fw time"), "RTC chip: answers"), "A shows its RTC: %s", w.cli(a, "fw time").c_str());
-  // R's software clock runs ahead (5 min, like a field relay on 2026-10-14): the next answer HOLDS it, it never steps back
+  // R's software clock runs ahead (5 min, like a field node 2026-10-14): the next answer HOLDS it, it never steps back
   w[r].rtc.setRaw(w[r].rtc.raw() + 300); w.run(2000);
   CHECK(w[r].rtc.off() >= 298, "R is 5 min ahead now (%d s)", w[r].rtc.off());
   w.cli(r, "fw time ask"); w.run(30000);
@@ -1235,6 +1296,386 @@ static void h_time() {
   CHECK(abs(w[r].rtc.off()) <= 2, "R in step again after the apply (off %d s)", w[r].rtc.off());
   printf("  answers sent %u, dropped A %u B %u\n", tAns(w), w[a].xfer->_ta_supp, w[b].xfer->_ta_supp);
 }
+
+// H23 (C76, board 1's new RV-3028 2026-10-31): a FOUND but unset RTC chip (new, or it lost power) is not "no RTC": 'fw time' says so, the node
+// takes the swarm time like a node without a chip AND the time is written to the chip - also when the software clock was already in step
+// (rc22.1 only stepped the software clock, so the chip stayed unset until a manual 'clock sync'). After a power cut the chip has the time.
+static void h_rtc_unset() {
+  printf("H23 (C76) a found but unset RTC chip takes the swarm time and keeps it\n");
+  World w; W = &w; g_sim_now = 0;
+  int a = w.add("A").idx, u1 = w.add("U1").idx, u2 = w.add("U2").idx;          // A: valid chip; U1, U2: chip found, not set
+  w.link(a, u1, 10); w.link(a, u2, 10); w.link(u1, u2, 10);
+  w[u1].rtc.unset = true; w.boot(w[u1], 0);                                      // U1 powers up: clock at the build floor
+  w[u2].rtc.unset = true; w.boot(w[u2], POWER_RESETREAS_SREQ_Msk);               // U2: a soft reset, the software clock kept the time
+  CHECK(w[u1].rtc.off() < -3600 * 24 && abs(w[u2].rtc.off()) <= 1, "U1 at the build floor (off %d s), U2 in step (off %d s)", w[u1].rtc.off(), w[u2].rtc.off());
+  std::string t = w.cli(u1, "fw time");
+  CHECK(has(t, "RTC chip found, not set") && !has(t, "no RTC"), "U1 before a circle: %s", t.c_str());
+  circle(w, {a, u1, u2});
+  w.run(8 * 60000, [&]() { return w[u1].rtc.valid() && w[u2].rtc.valid(); });
+  CHECK(w[u1].rtc.valid() && abs(w[u1].rtc.off()) <= 2, "U1 took the swarm time and wrote its chip (valid %d, off %d s)", (int)w[u1].rtc.valid(), w[u1].rtc.off());
+  CHECK(w[u2].rtc.valid() && abs(w[u2].rtc.off()) <= 2, "U2 (already in step) wrote its chip too (valid %d, off %d s)", (int)w[u2].rtc.valid(), w[u2].rtc.off());
+  t = w.cli(u2, "fw time");
+  CHECK(has(t, "RTC chip: answers"), "U2 now answers as an RTC node: %s", t.c_str());
+  w.unlink(a, u1); w.unlink(a, u2); w.unlink(u1, u2);                            // alone, then a power cut: only the chip has the time
+  w.boot(w[u1], 0); w.boot(w[u2], 0); w.run(5000);
+  CHECK(abs(w[u1].rtc.off()) <= 3 && abs(w[u2].rtc.off()) <= 3, "after a power cut the chips kept the time (U1 %d s, U2 %d s)", w[u1].rtc.off(), w[u2].rtc.off());
+}
+
+// H16 (rc22): C65 auto-apply off on new nodes (a node that already belongs to a circle keeps it on), C74 the slot is VALID only after
+// CRC-32 AND SHA-256 and 'fw apply' waits for the check, C71 answers to another node's scan are kept with OUR route to the holder,
+// C72 'fw pull-resume duty x' changes a running pull's share (the server still caps it), C73 'fw pull-status' shows serving during an own pull
+static void joinCircle(World& w, std::vector<int> ids) {   // like circle(), but auto-apply stays as the node has it
+  for (int i : ids) w.cli(i, PHRASE);
+  w.run(120000, [&]() { for (int i : ids) { std::string f = w.cli(i, "fw passphrase"); if (!has(f, "circle ") || has(f, "key")) return false; } return true; });
+}
+static void h_rc22() {
+  printf("H16 (rc22) auto-apply default, VALID only after SHA-256, overheard scan answers, pull-resume duty, serving during an own pull\n");
+  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = 0;
+  {
+    World w; W = &w; g_sim_now = 0;
+    int a = w.add("A").idx, b = w.add("B").idx; w.link(a, b, 10);
+    w.seedImage(a, 301, 32000, 9, true); w.seedImage(b, 300, 30000, 1, true);
+    w.run(5000);
+    std::string r = w.cli(b, "fw autoapply");
+    CHECK(has(r, "OFF"), "C65 a new node starts with auto-apply off: %s", r.c_str());
+    joinCircle(w, {a, b});
+    // A: an rc21 node (a circle, no auto-apply file): after the update it keeps auto-apply on
+    w[a].fs.remove("/fwota.noapply"); w.boot(w[a], POWER_RESETREAS_SREQ_Msk); w.run(5000);
+    r = w.cli(a, "fw autoapply");
+    CHECK(has(r, "autoapply on"), "C65 a node that already had a circle keeps auto-apply on: %s", r.c_str());
+    w.boot(w[b], POWER_RESETREAS_SREQ_Msk); w.run(5000);
+    r = w.cli(b, "fw autoapply");
+    CHECK(has(r, "OFF"), "C65 joining a circle does not switch it on (after a reboot): %s", r.c_str());
+    w.cli(b, "fw autoapply on"); w.boot(w[b], POWER_RESETREAS_SREQ_Msk); w.run(5000);
+    CHECK(has(w.cli(b, "fw autoapply"), "autoapply on"), "C65 'fw autoapply on' survives a reboot: %s", w.cli(b, "fw autoapply").c_str());
+    w.cli(b, "fw autoapply off");
+    for (int i : {a, b}) w.cli(i, "fw duty 1");
+    w.run(60000);
+    // C74: B's manifest says another SHA-256 (CRC-32 still matches): the slot must never turn VALID for it; the retry fetches it again
+    auto* xb = w[b].xfer.get();
+    w.cli(b, "fw pull " + idHex(w, a) + " duty 1");
+    w.run(1800000, [&]() { return xb->_phase == fw_ota::PH_DOWNLOADING && xb->_man.n_chunks && xb->_cm.have > 3; });
+    enter(w[b]); xb->_man.sha256[5] ^= 1; const uint32_t h0 = w[b].st.hdr_valid;
+    bool shafail = false;
+    w.run(4 * 3600000, [&]() { shafail |= has(xb->_last_err, "SHA-256 mismatch"); return xb->_phase == fw_ota::PH_COMPLETE || xb->_phase == fw_ota::PH_FAILED; });
+    CHECK(shafail && xb->_phase == fw_ota::PH_COMPLETE, "C74 the SHA-256 mismatch was found and the retry completed: %s", w.cli(b, "fw pull-status").c_str());
+    CHECK(w[b].st.hdr_valid - h0 == 1, "C74 the slot turned VALID once, after the verified retry (%u VALID writes)", w[b].st.hdr_valid - h0);
+    // C74: 'fw apply' while the image is still being checked is refused; once COMPLETE it installs
+    enter(w[b]); xb->_phase = fw_ota::PH_VERIFYING; r = w.cli(b, "fw apply"); if (!has(r, "restarted")) { enter(w[b]); w[b].xfer->_phase = fw_ota::PH_COMPLETE; }
+    CHECK(has(r, "still checking"), "C74 'fw apply' waits for the check: %s", r.c_str());
+    CHECK(w[b].app_fw == 300, "C74 auto-apply off: B did not install by itself (fw-%u)", w[b].app_fw);
+    w.cli(b, "fw apply"); w.run(10 * 60000, [&]() { return w[b].app_fw == 301; });
+    CHECK(w[b].app_fw == 301, "C74 'fw apply' installs the verified image (fw-%u)", w[b].app_fw);
+  }
+  {
+    // C71: X scans; O (a holder search never ran there) hears S's flooded answer through R2. X's way to S is via R1, O's via R2.
+    World w; W = &w; g_sim_now = 0;
+    int s = w.add("S").idx, r1 = w.add("R1", false).idx, r2 = w.add("R2", false).idx, x = w.add("X").idx, o = w.add("O").idx;
+    w.link(x, r1, 9); w.link(r1, s, 9); w.link(s, r2, 9); w.link(r2, o, 9);
+    w.seedImage(s, 302, 32000, 9, true); w.seedImage(x, 300, 30000, 1, true); w.seedImage(o, 300, 30000, 1, true);
+    circle(w, {s, x, o}); for (int i : {s, x, o}) w.cli(i, "fw duty 1");
+    w.run(150000);
+    const uint32_t txo = w[o].st.tx;
+    w.cli(x, "fw peers"); w.run(40000);
+    std::string lx = w.cli(x, "fw list");
+    std::string lo = w.cli(o, "fw list");
+    CHECK(has(lx, "fw-302"), "X lists S: %s", lx.c_str());
+    CHECK(has(lo, "#1 fw-302 x1 (1hop)") && has(lo, "(heard "), "C71 O lists S from X's scan, with its age: %s", lo.c_str());
+    int pi = -1; for (int i = 0; i < fw_ota::MAX_PEERS; i++) if (w[o].xfer->_peers[i].used) pi = i;
+    const uint8_t hop = pi >= 0 ? w[o].xfer->_peers[pi].route[0] : 0;
+    CHECK(pi >= 0 && hop == w[r2].id.pub_key[0] && hop != w[r1].id.pub_key[0], "C71 O's route to S is its own (via R2 %02X, not X's R1 %02X): %02X",
+          w[r2].id.pub_key[0], w[r1].id.pub_key[0], hop);
+    CHECK(!w[o].xfer->_scanned && !w[o].xfer->_scan_active, "C71 O listed it without a scan of its own (relayed %u packets)", w[o].st.tx - txo);
+    w.cli(o, "fw pull #1");
+    w.run(4 * 3600000, [&]() { return w[o].app_fw == 302; });
+    CHECK(w[o].app_fw == 302, "C71 O pulled from the overheard entry: %s", w.cli(o, "fw pull-status").c_str());
+  }
+  {
+    // C72 + C73: S (duty 0.5) serves P's pull at 0.3; P raises this pull to 1.0 -> the server caps it at 0.5
+    World w; W = &w; g_sim_now = 0;
+    int s = w.add("S").idx, p = w.add("P").idx; w.link(s, p, 10);
+    w.seedImage(s, 301, 64000, 9, true); w.seedImage(p, 300, 60000, 1, true);
+    circle(w, {s, p}); w.cli(s, "fw duty 0.5");
+    w.run(60000);
+    auto* xp = w[p].xfer.get();
+    w.cli(p, "fw pull " + idHex(w, s) + " duty 0.3");
+    w.run(1800000, [&]() { return xp->_phase == fw_ota::PH_DOWNLOADING && xp->_agreed_pct && xp->_cm.have > 5; });
+    CHECK(has(w.cli(p, "fw duty"), "agreed 0.30"), "C72 the pull runs at 0.30: %s", w.cli(p, "fw duty").c_str());
+    std::string r = w.cli(p, "fw pull-resume duty 1");
+    CHECK(has(r, "OK - duty 1.00 at"), "C72 'fw pull-resume duty 1' while it runs: %s", r.c_str());
+    w.run(180000);
+    std::string d = w.cli(p, "fw duty");
+    CHECK(has(d, "pull asks 1.00 (this pull)") && has(d, "agreed 0.50"), "C72 the server's duty caps it: %s", d.c_str());
+    CHECK(xp->_cm.have > 5 && xp->_phase == fw_ota::PH_DOWNLOADING, "C72 chunks kept (%u)", xp->_cm.have);
+    // C73: S is looking for a server of its own while it serves P: both are shown
+    auto* xs = w[s].xfer.get(); enter(w[s]); xs->_resolving = true;
+    std::string st = w.cli(s, "fw pull-status"), sv = w.cli(s, "fw serve");
+    enter(w[s]); xs->_resolving = false;
+    CHECK(has(st, "looking for") && has(st, " | serving fw-301 to 1: "), "C73 own pull + serving: %s", st.c_str());
+    CHECK(has(sv, "| now to 1: "), "C73 'fw serve' names the pull it serves: %s", sv.c_str());
+    // C72: a paused pull resumes at the new duty
+    w.cli(p, "fw pull-pause"); r = w.cli(p, "fw pull-resume duty 0.4");
+    CHECK(has(r, "OK - resumed ") && has(r, "duty 0.40"), "C72 a paused pull resumes at the new duty: %s", r.c_str());
+    w.run(4 * 3600000, [&]() { return w[p].app_fw == 301; });
+    CHECK(w[p].app_fw == 301, "P finished: %s", w.cli(p, "fw pull-status").c_str());
+  }
+}
+
+// H17 (rc22, deterministic H5): R2 fleet-fills (mode 2) the image of P's fleet pull. A neighbour's own pull of the same image along its
+// path announces mode 1; R2 hears it and must stay a FLEET fill (rc19: the lower mode made it passive, and it paused for good when that
+// pull ended). H5 caught this only by chance (T4 seed 2; rc22's timing no longer produces it there), so here the announce is built by a
+// circle neighbour (C2, real MAC) and handed to R2 directly. A mode-2 announce afterwards proves the packet itself is accepted.
+static void h_demote() {
+  printf("H17 a neighbour's mode-1 announce does not demote a fleet fill\n");
+  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = 0;
+  World w; W = &w; g_sim_now = 0;
+  FleetNet f = fleetNet(w, 0.10);
+  w.cli(f.p, "fw pull " + idHex(w, f.s) + " duty 1 fleet");   // by id, as G4
+  w.run(4 * 3600000, [&]() { return pctOf(w, f.r2) >= 10; });
+  auto* r = w[f.r2].xfer.get(); auto* c = w[f.c2].xfer.get();
+  CHECK(r->_fill && r->_fill_mode == fw_ota::FLEET_REPLACE, "R2 fleet-fills: %s", w.cli(f.r2, "fw pull-status").substr(0, 80).c_str());
+  uint8_t pkt[128];                                       // (FANN_LEN = 89 + MAC, file-local in FwOtaTransfer.cpp)
+  uint32_t len = c->buildFann(pkt, r->_man, fw_ota::FLEET_FILL_EMPTY, w[f.s].id.pub_key, 50, c->_pub);
+  r->onFleetAnn(pkt, len);
+  CHECK(r->_fill && r->_fill_mode == fw_ota::FLEET_REPLACE, "R2 is still a fleet fill after C2's mode-1 announce (mode %u)", r->_fill_mode);
+  len = c->buildFann(pkt, r->_man, fw_ota::FLEET_REPLACE, w[f.s].id.pub_key, 50, c->_pub);
+  r->onFleetAnn(pkt, len);
+  CHECK(memcmp(r->_fann_req, c->_pub, 4) == 0, "the same announce at mode 2 is taken (requester C2): the mode-1 one was refused by the rule");
+  w.run(8 * 3600000, [&]() { return slotFw(w, f.r2) == 301; });
+  CHECK(slotFw(w, f.r2) == 301, "R2 finished its fleet fill: slot %u", slotFw(w, f.r2));
+}
+
+// H18 (rc22 bench 2026-10-31, C77): the ONLY puller must never take its own stream for another puller's ("saving shared stream")
+static void h_selfstream_run(const char* tag, int variant, uint32_t* lis_out, double* cpm_out) {
+  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = 0;
+  World w; W = &w; g_sim_now = 0;
+  int s = w.add("S").idx, r = w.add("Relay", false, true).idx, p = w.add("P").idx;
+  w.link(s, r, 8); w.link(r, p, 6);
+  if (variant == 1) w.link(s, p, -8, 0.5, false);        // P overhears S directly now and then (one-way, half lost): the route stays via the relay
+  if (variant == 2) w.link(s, p, -8, 0.5, true);
+  w.seedImage(s, 301, 64000, 9, true); w.seedImage(p, 300, 60000, 1, true);
+  circle(w, {s, p});
+  w.run(20000); w.cli(p, "fw peers"); w.run(60000);
+  w.cli(p, "fw pull " + idHex(w, s));
+  auto* x = w[p].xfer.get(); uint32_t lis = 0; bool was = false; const uint32_t t0 = g_sim_now;
+  w.run(6 * 3600000, [&]() { bool l = x->_listening; if (l && !was) lis++; was = l; return w[p].app_fw == 301; });
+  const double min = (g_sim_now - t0) / 60000.0;
+  printf("  %s: variant %d: P listened %u times, %s after %.0f min (%.1f c/m)\n", tag, variant, lis, w[p].app_fw == 301 ? "installed" : "NOT done", min, nChunks(64000) / min);
+  CHECK(w[p].app_fw == 301, "%s variant %d: P installed fw-301: %s", tag, variant, w.cli(p, "fw pull-status").c_str());
+  if (lis_out) *lis_out = lis; if (cpm_out) *cpm_out = nChunks(64000) / min;
+}
+static void h_selfstream() {
+  printf("H18 the only puller never listens to its own stream (C77)\n");
+  uint32_t l[3]; double c[3];
+  for (int v = 0; v <= 2; v++) h_selfstream_run("H18", v, &l[v], &c[v]);
+  for (int v = 1; v <= 2; v++) {
+    CHECK(l[v] == 0, "variant %d: the only puller never listened to its own late chunk copies (%u times)", v, l[v]);
+    CHECK(c[v] >= 0.85 * c[0], "variant %d: overhearing the server costs no speed (%.1f vs %.1f c/m without)", v, c[v], c[0]);
+  }
+}
+
+// H19 (Heltec port, owner 2026-11-01: "We don't want RAK boards pull Heltec firmware") a circle with RAK3401 and HELTECV4 nodes. Both boards
+// offer an image with the SAME fw number (301, different content): every node lists, listens to, stores and installs only its own board's
+// image; a pull by id aimed at the other board is refused before anything is downloaded; both fleet pulls finish through a shared relay.
+static uint32_t slotCrc(World& w, int i) {      // payload CRC-32 in the node's slot header (0 = no valid slot)
+  fw_ota::SlotHeader h; memcpy(&h, w[i].flash.data() + fw_ota::SLOT_ADDR, sizeof h);
+  return h.magic == fw_ota::SLOT_MAGIC ? h.payload_crc32 : 0;
+}
+static void h_mixed() {
+  printf("H19 mixed circle: RAK3401 and HELTECV4 nodes, the same fw number on both boards\n");
+  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = 0;
+  World w; W = &w; g_sim_now = 0;
+  int ra = w.add("RAK-S").idx, ha = w.add("HEL-S", true, true, "HELTECV4").idx;          // the two holders
+  int x = w.add("RAK-X").idx;                                                           // a RAK relay both streams pass through
+  int rb = w.add("RAK-P").idx, hb = w.add("HEL-P", true, true, "HELTECV4").idx;          // the two fleet pullers
+  int rc = w.add("RAK-L").idx, hc = w.add("HEL-L", true, true, "HELTECV4").idx;          // listeners that hear both streams
+  for (int i : {ra, ha}) w.link(i, x, 8);
+  for (int i : {rb, hb}) w.link(x, i, 7);
+  w.link(rb, hb, 6);
+  for (int i : {rc, hc}) { w.link(x, i, 6); w.link(rb, i, 6); w.link(hb, i, 6); }
+  w.seedImage(ra, 301, 48000, 9, true); w.seedImage(ha, 301, 48000, 21, true);          // same number, same size, different images
+  for (int i : {x, rb, rc}) w.seedImage(i, 300, 44000, 1, true);
+  for (int i : {hb, hc}) w.seedImage(i, 300, 44000, 2, true);
+  const uint32_t rak = slotCrc(w, ra), hel = slotCrc(w, ha);
+  CHECK(rak && hel && rak != hel, "two different fw-301 images (%08X / %08X)", rak, hel);
+  circle(w, {ra, ha, x, rb, hb, rc, hc});
+  for (int i : {ra, ha, x, rb, hb, rc, hc}) w.cli(i, "fw duty 1");
+  w.run(20000);
+  // a pull by id at the other board's holder: refused before any chunk
+  std::string r = w.cli(hb, "fw pull " + idHex(w, ra) + " duty 1");
+  w.run(10 * 60000, [&]() { return has(w.cli(hb, "fw pull-status"), "another board"); });
+  std::string st = w.cli(hb, "fw pull-status");
+  CHECK(has(st, "FAILED") && has(st, "another board (RAK3401)") && slotCrc(w, hb) != rak && w[hb].xfer->_cm.have == 0,
+        "a Heltec pull by id from a RAK holder stops with the reason, nothing downloaded: %s | %s", r.c_str(), st.c_str());
+  w.cli(hb, "fw pull-abort");
+  // scans list only the own board's image
+  w.cli(rb, "fw peers"); w.cli(hb, "fw peers"); w.run(90000);   // both at once (sequential gave the same result)
+  if (getenv("SIM_DBG")) for (auto& n : w.nodes) if (n->xfer) printf("    %s: ans sent %u supp %u, rx %u lost %u coll %u\n", n->name.c_str(),
+      n->xfer->stats.answers_sent, n->xfer->stats.answers_suppressed, n->st.rx, n->st.lost, n->st.collisions);
+  // a mixed circle has half the holder redundancy per board: an answer lost to a collision costs a rescan (counted, C82). (2026-11-03) The
+  // same rule for BOTH pullers: the RAK puller had only one scan, and a timing shift elsewhere (T9: a pull's first request 2.5 s later)
+  // made the RAK holder's single answer collide - '#1' was then the relay's old fw-300
+  int scans = 1, rscans = 1;
+  while (scans < 5 && !has(w.cli(hb, "fw list hosts"), idHex(w, ha).c_str())) { w.cli(hb, "fw peers"); w.run(90000); scans++; }
+  while (rscans < 5 && !has(w.cli(rb, "fw list hosts"), idHex(w, ra).c_str())) { w.cli(rb, "fw peers"); w.run(90000); rscans++; }
+  printf("  Heltec puller listed its holder after %d scan(s), RAK puller after %d\n", scans, rscans);
+  CHECK(scans <= 3 && rscans <= 3, "each puller lists its board's holder within 3 scans (Heltec %d, RAK %d)", scans, rscans);
+  std::string lr = w.cli(rb, "fw list hosts"), lh = w.cli(hb, "fw list hosts");
+  CHECK(has(lr, "fw-301") && has(lr, idHex(w, ra).c_str()) && !has(lr, idHex(w, ha).c_str()), "RAK list: only the RAK holder: %s", lr.c_str());
+  CHECK(has(lh, "fw-301") && has(lh, idHex(w, ha).c_str()) && !has(lh, idHex(w, ra).c_str()), "Heltec list: only the Heltec holder: %s", lh.c_str());
+  // both fleet pulls at once, through the shared relay
+  w.cli(rb, "fw pull #1 fleet"); w.cli(hb, "fw pull #1 fleet");
+  w.run(12 * 3600000, [&]() { return w[rb].app_fw == 301 && w[hb].app_fw == 301 && slotCrc(w, rc) && slotCrc(w, hc) && slotCrc(w, x) == rak; });
+  CHECK(w[rb].app_fw == 301 && w[hb].app_fw == 301, "both fleet pulls installed fw-301 (RAK %u, Heltec %u): %s | %s", w[rb].app_fw, w[hb].app_fw,
+        w.cli(rb, "fw pull-status").c_str(), w.cli(hb, "fw pull-status").c_str());
+  for (int i : {ra, x, rb, rc}) { uint32_t c = slotCrc(w, i); CHECK(c != hel, "%s (RAK) never stored the Heltec image (slot %08X)", w[i].name.c_str(), c); }
+  for (int i : {ha, hb, hc}) { uint32_t c = slotCrc(w, i); CHECK(c != rak, "%s (Heltec) never stored the RAK image (slot %08X)", w[i].name.c_str(), c); }
+  CHECK(slotCrc(w, rb) == rak && slotCrc(w, rc) == rak && slotCrc(w, x) == rak, "the RAK nodes hold the RAK fw-301 (P %08X L %08X X %08X)", slotCrc(w, rb), slotCrc(w, rc), slotCrc(w, x));
+  CHECK(slotCrc(w, hb) == hel && slotCrc(w, hc) == hel, "the Heltec nodes hold the Heltec fw-301 (P %08X L %08X)", slotCrc(w, hb), slotCrc(w, hc));
+  CHECK(fw_ota::crc32(w[rb].flash.data() + fw_ota::APP_REGION_START, 48000) == rak && fw_ota::crc32(w[hb].flash.data() + fw_ota::APP_REGION_START, 48000) == hel,
+        "each puller runs its own board's image");
+  printf("  done at %.0f min\n", g_sim_now / 60000.0);
+}
+
+// H21 (C83, 2026-11-02, RAK3401): a FAILED install record speaks only about the image it tried. A node whose bootloader refused fw-301
+// (1) does not serve fw-301, (2) DOES serve a NEW image (fw-302) pulled into its slot afterwards - rc22.1 kept blocking it until the next
+// 'fw apply' -, (3) does not serve a Bluetooth-filled fw-301 its bootloader refused - rc22.1 served it -, and (4) a FAILED record that names
+// no image (blank-page self-heal: reserved bytes zero) stays conservative: the slot image is not served.
+static void refuseSlot(World& w, int a, bool stamp) {   // as the app's 'fw apply' + a bootloader that refused the slot image
+  enter(w[a]);
+  if (stamp) fw_ota::ctrlMarkPending();
+  else { fw_ota::CtrlBlock z; memset(&z, 0, sizeof z); fw_ota::writeCtrl(z); }
+  fw_ota::CtrlBlock c; fw_ota::readCtrl(c);
+  c.apply_state = fw_ota::APPLY_FAILED; c.last_result = 5; c.fail_count = 1;
+  fw_ota::writeCtrl(c);
+  w.boot(w[a], POWER_RESETREAS_SREQ_Msk); w.run(60000);
+}
+static void h_failed_image() {
+  printf("H21 a FAILED install record blocks serving only the image it tried (C83, RAK)\n");
+  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = 0;
+  World w; W = &w; g_sim_now = 0;
+  int s = w.add("S").idx, a = w.add("A").idx; w.link(s, a, 10);
+  w.seedImage(s, 302, 40000, 11, true);
+  w.seedImage(a, 300, 36000, 3, true); w.seedImage(a, 301, 38000, 5, false);   // A runs fw-300, its slot holds fw-301 (not installed)
+  circle(w, {s, a}); w.cli(a, "fw autoapply off");
+  refuseSlot(w, a, true);
+  CHECK(w[a].app_fw == 300 && slotFw(w, a) == 301, "A runs fw-300 with the refused fw-301 in its slot (app %u slot %u)", w[a].app_fw, slotFw(w, a));
+  CHECK(!has(w.cli(a, "fw serve"), "fw-301"), "(1) the refused fw-301 is not served: %s", w.cli(a, "fw serve").c_str());
+  w.run(20000); w.cli(a, "fw peers"); w.run(60000);
+  w.cli(a, "fw pull fw-302");
+  w.run(6 * 3600000, [&]() { return has(w.cli(a, "fw pull-status"), "COMPLETE"); });
+  CHECK(slotFw(w, a) == 302 && w[a].app_fw == 300, "A holds fw-302 in its slot, not installed (slot %u app %u): %s", slotFw(w, a), w[a].app_fw,
+        w.cli(a, "fw pull-status").c_str());
+  w.run(5 * 60000);
+  CHECK(has(w.cli(a, "fw serve"), "fw-302"), "(2) the NEW image fw-302 is served although fw-301 was refused: %s", w.cli(a, "fw serve").c_str());
+  // (3) a Bluetooth-filled fw-301 that the bootloader refused
+  w.seedImage(a, 301, 38000, 5, false);
+  { enter(w[a]); uint32_t crc = slotCrc(w, a); File f = w[a].fs.open("/fwota.blefill", FILE_O_WRITE); if (f) { f.write((const uint8_t*)&crc, 4); f.close(); } }
+  refuseSlot(w, a, true);
+  CHECK(!has(w.cli(a, "fw serve"), "fw-301"), "(3) a Bluetooth-filled fw-301 the bootloader refused is not served: %s", w.cli(a, "fw serve").c_str());
+  // (4) a FAILED record that names no image (self-heal after a blank page) blocks the slot image
+  w[a].fs.remove("/fwota.blefill"); w.seedImage(a, 301, 38000, 5, false);
+  refuseSlot(w, a, false);
+  CHECK(!has(w.cli(a, "fw serve"), "fw-301"), "(4) a FAILED record without an image stamp still blocks: %s", w.cli(a, "fw serve").c_str());
+}
+
+// H22 (T9, owner 2026-11-03, a Heltec bench node from the phone): 'fw pull fw-313' over remote admin got no reply although the pull had started - the
+// pull sent its first offer request at once, the server a metre away answered, and the CLI reply (sent 600 ms after the command) met that
+// traffic. A new pull - by image, by id, by #n - sends nothing for 3 s (like a scan), then starts and completes as before.
+static void h_pull_quiet() {
+  printf("H22 a new pull keeps quiet 3 s so the command's reply leaves first (T9)\n");
+  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = 0;
+  World w; W = &w; g_sim_now = 0;
+  int s = w.add("S").idx, p = w.add("P").idx; w.link(s, p, 10);
+  w.seedImage(s, 301, 30000, 7, true); w.seedImage(p, 300, 28000, 3, true);
+  circle(w, {s, p}); w.cli(p, "fw autoapply off");
+  w.run(20000); w.cli(p, "fw peers"); w.run(60000);
+  for (const char* how : {"fw pull fw-301", "fw pull #1", "id"}) {
+    const std::string cmd = std::string(how) == "id" ? "fw pull " + idHex(w, s) : how;
+    const uint32_t tx0 = w[p].st.tx_ota;
+    const std::string r = w.cli(p, cmd);
+    w.run(2000);
+    const uint32_t quiet = w[p].st.tx_ota - tx0;
+    w.run(60000);
+    const std::string again = w.cli(p, cmd);             // (C55) the phone retries after a lost reply: an OK naming the running pull
+    CHECK(has(again, "downloading ") || has(again, "offering "), "'%s' repeated during the pull: %s", cmd.c_str(), again.c_str());
+    const std::string st = w.cli(p, "fw pull-status");
+    CHECK(has(r, "OK - pulling") && quiet == 0 && w[p].st.tx_ota > tx0 && has(st, "downloading"),
+          "'%s': OK reply, nothing sent in the first 2 s (%u), then the pull runs: %s | %s", cmd.c_str(), quiet, r.c_str(), st.c_str());
+    w.cli(p, "fw pull-abort"); w.run(30000);
+  }
+  w.cli(p, "fw pull fw-301");
+  w.run(6 * 3600000, [&]() { return has(w.cli(p, "fw pull-status"), "COMPLETE"); });
+  CHECK(slotFw(w, p) == 301, "the delayed pull completes (slot fw-%u): %s", slotFw(w, p), w.cli(p, "fw pull-status").c_str());
+}
+
+// H24 (owner 2026-11-04) mid-pull of fw-301 the user types 'fw pull fw-302' (a newer image, listed or not, by version, #n or holder id):
+// the reply is the running pull's status naming its version, and NOTHING changes - the pull keeps its server and its route (the route
+// was replaced by the other holder's before the version check refused it) and completes fw-301
+static void h_pull_other() {
+  printf("H24 'fw pull' of another image during a pull: status line with the version, the pull unchanged\n");
+  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = 0;
+  World w; W = &w; g_sim_now = 0;
+  int s = w.add("S").idx, p = w.add("P").idx, r = w.add("R").idx, t = w.add("T").idx;
+  w.link(s, p, 10); w.link(p, r, 10); w.link(r, t, 10);   // T (fw-302) only through the relay R
+  w.seedImage(s, 301, 30000, 7, true); w.seedImage(p, 300, 28000, 3, true); w.seedImage(r, 300, 28000, 3, true); w.seedImage(t, 302, 30000, 9, true);
+  circle(w, {s, p, r, t}); for (int i : {p, r}) w.cli(i, "fw autoapply off");
+  w.run(20000);
+  for (int k = 0; k < 3 && !(has(w.cli(p, "fw list"), "fw-302") && has(w.cli(p, "fw list"), "fw-301")); k++) { w.cli(p, "fw peers"); w.run(90000); }
+  CHECK(has(w.cli(p, "fw list"), "fw-302") && has(w.cli(p, "fw list"), "fw-301"), "P lists fw-301 (S) and fw-302 (T via R): %s", w.cli(p, "fw list").c_str());
+  const std::string r1 = w.cli(p, "fw pull fw-301");
+  w.run(120000);
+  CHECK(has(w.cli(p, "fw pull-status"), "downloading fw-301 '@"), "the status names the version: %s", w.cli(p, "fw pull-status").c_str());
+  const int n302 = has(w.cli(p, "fw list"), "#1 fw-302") ? 1 : 2;
+  for (const std::string& cmd : {std::string("fw pull fw-302"), std::string("fw pull fw-999"), "fw pull #" + std::to_string(n302), "fw pull " + idHex(w, t)}) {
+    auto& x = *w[p].xfer;
+    const uint8_t rl0 = x._route_len; const std::string name0 = x._man.name; const uint32_t have0 = x._cm.have;
+    const std::string a = w.cli(p, cmd);
+    CHECK(has(a, "downloading fw-301 '@") && !has(a, "ERR"), "'%s' mid-pull answers the running pull's status: %s", cmd.c_str(), a.c_str());
+    CHECK(x._route_len == rl0 && name0 == x._man.name && x._cm.have >= have0, "'%s' changes nothing (route len %u -> %u, server %s -> %s)",
+          cmd.c_str(), rl0, x._route_len, name0.c_str(), x._man.name);
+    w.run(20000);
+  }
+  w.run(6 * 3600000, [&]() { return has(w.cli(p, "fw pull-status"), "COMPLETE"); });
+  CHECK(slotFw(w, p) == 301, "the fw-301 pull completes from S (slot fw-%u): %s", slotFw(w, p), w.cli(p, "fw pull-status").c_str());
+}
+
+// H20 (Heltec bench 2026-11-01) ESP32 light sleep (IoTThinks power saving): a node sleeps up to 30 s when nothing is pending and wakes on a
+// received packet. A pull between two sleeping Heltecs must run about as fast as with power saving off (the timers of the puller and the
+// server's paced window must not wait out a sleep), and a circle neighbour that only overhears the transfer must keep sleeping - it was
+// kept awake 60 s after every LoRa-OTA packet it heard, i.e. for the whole transfer.
+static uint32_t h_sleep_run(bool sleep, double* by_awake, double* idle_awake) {
+  fw_ota::g_tune = fw_ota::SwarmTune(); g_seed = 0;
+  World w; W = &w; g_sim_now = 0;
+  int s = w.add("HEL-S", true, true, "HELTECV4").idx, p = w.add("HEL-P", true, true, "HELTECV4").idx, b = w.add("HEL-B", true, true, "HELTECV4").idx;
+  w.link(s, p, 8); w.link(s, b, 8); w.link(p, b, 8);
+  w.seedImage(s, 301, 48000, 21, true); w.seedImage(p, 300, 44000, 2, true); w.seedImage(b, 300, 44000, 2, true);
+  circle(w, {s, p, b});
+  for (int i : {s, p, b}) { w.cli(i, "fw duty 1"); w.cli(i, "fw autoapply off"); w[i].esp_sleep = sleep; }
+  w.run(5 * 60000);                                      // past the first-sleep delay (120 s): everybody idle
+  w.cli(p, "fw pull " + idHex(w, s) + " duty 1");
+  const uint32_t t0 = g_sim_now; const uint64_t b0 = w[b].awake_ms;
+  w.run(6 * 3600000, [&]() { return has(w.cli(p, "fw pull-status"), "COMPLETE"); });
+  const uint32_t took = g_sim_now - t0;
+  CHECK(has(w.cli(p, "fw pull-status"), "COMPLETE"), "%s: the pull completed (%s)", sleep ? "power saving" : "no power saving", w.cli(p, "fw pull-status").c_str());
+  *by_awake = (double)(w[b].awake_ms - b0) / (took ? took : 1);
+  w.run(10 * 60000);                                     // after the pull: the holder and the puller go back to sleep
+  uint64_t a0 = w[s].awake_ms + w[p].awake_ms; w.run(30 * 60000);
+  *idle_awake = (double)(w[s].awake_ms + w[p].awake_ms - a0) / (2.0 * 30 * 60000);
+  return took;
+}
+static void h_sleep() {
+  printf("H20 ESP32 light sleep: a pull between sleeping Heltecs, a bystander that only overhears it\n");
+  double ba0, ia0, ba1, ia1;
+  const uint32_t t_off = h_sleep_run(false, &ba0, &ia0), t_on = h_sleep_run(true, &ba1, &ia1);
+  printf("  pull %.1f min without power saving, %.1f min with it; bystander awake %.0f%% of the pull; holder+puller awake %.0f%% when idle\n",
+         t_off / 60000.0, t_on / 60000.0, ba1 * 100, ia1 * 100);
+  CHECK(t_on <= t_off + t_off / 4 + 120000, "with power saving the pull takes at most 25%% + 2 min longer (%.1f vs %.1f min)", t_on / 60000.0, t_off / 60000.0);
+  CHECK(ba1 < 0.25, "the bystander sleeps through the transfer it only overhears (awake %.0f%%)", ba1 * 100);
+  CHECK(ia1 < 0.25, "holder and puller sleep again once the pull is over (awake %.0f%%)", ia1 * 100);
+}
+
+#include "scen_push.inc"                                     // (rc25, C95) fw push / campaign: P1-P10
 
 int main(int argc, char** argv) {
   if (argc > 1 && std::string(argv[1]) == "STUDY") return study(argc, argv);
@@ -1270,6 +1711,15 @@ int main(int argc, char** argv) {
   if (want("H11")) h_move();                                        // (rc20, C48)
   if (want("H13")) h_abtrep();                                      // (rc20, C49)
   if (want("H15")) h_time();                                        // (rc21, C57/C58)
+  if (want("H23")) h_rtc_unset();                                  // (C76) a found but unset RTC chip takes the swarm time and keeps it
+  if (want("H16")) h_rc22();                                        // (rc22, C65/C71-C74)
+  if (want("H17")) h_demote();                                      // (rc22) H5 deterministic: a mode-1 announce never demotes a fleet fill
+  if (want("H18")) h_selfstream();                                 // (rc22, C77) the only puller never listens to its own stream
+  if (want("H19")) h_mixed();
+  if (want("H22")) h_pull_quiet();                                 // (T9) a new pull is quiet 2.5 s: the CLI reply leaves first
+  if (want("H24")) h_pull_other();                                 // (owner 2026-11-04) fw pull of another image mid-pull: status, no change
+  if (want("H21")) h_failed_image();                              // (C83) a FAILED record blocks only the image it tried
+  if (want("H20")) h_sleep();                                      // (Heltec) ESP32 light sleep: pulls keep their pace, bystanders sleep                                      // (Heltec) RAK + Heltec in one circle, the same fw number
   if (want("H6")) h_benchD();
   if (want("H7")) h_benchE();
   if (want("H8")) h_benchF();
@@ -1278,11 +1728,28 @@ int main(int argc, char** argv) {
   if (want("H1")) h_cancel();
   if (want("H2")) h_passive();
   if (want("H3")) h_behind();
+  if (want("H25")) h_behind_seeds();                               // (rc23, C91)
+  if (want("H26")) h_srcspread();                                  // (rc23) deterministic G3: the source gossips from the fleet offer
   if (want("H4")) h_texts();
+  if (want("P1")) p_chain();                                      // (rc25, C95) fw push
+  if (want("P2")) p_tree();
+  if (want("P3")) p_island();
+  if (want("P4")) p_disturb();
+  if (want("P5")) p_stuck();
+  if (want("P6")) p_newcomer();
+  if (want("P7")) p_reminder();
+  if (want("P9")) p_cancel();
+  if (want("P10")) p_fleetcamp();
+  if (only == "P3X") p_island_plain();                            // (rc25 debug) a plain 5-hop pull through 2 stock relays
   if (only == "F0") f_baseline(0.10);                               // measurements on request (long)
   if (only == "F5") f_alone(0.10);
   if (only == "F5L30") f_alone(0.30);
   if (only == "FLOSS") { for (double l : {0.0, 0.2, 0.3}) f_mode2(l, false); }
+  if (getenv("SIM_PART")) {                                         // (T8) one part of a parallel run: the runner sums the parts and checks the audit once
+    printf("SIM_PART audit %d %d\n", sim::g_audit_fail, sim::g_audit_texts);
+    printf("simulator: %d checks passed, %d failed\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
+  }
   CHECK(sim::g_audit_fail == 0, "text audit: %d of %d status texts contradict the node's state (see AUDIT FAIL)", sim::g_audit_fail, sim::g_audit_texts);
   printf("  text audit: %d status texts read and compared with the node state\n", sim::g_audit_texts);
   printf("simulator: %d checks passed, %d failed\n", g_pass, g_fail);

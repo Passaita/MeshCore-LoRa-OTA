@@ -10,6 +10,7 @@
 
 class CustomSX1262Wrapper : public RadioLibWrapper {
 public:
+  // PowerSaving variant
   // Ask the radio rather than assume RadioLib's 5000 us default: startReceive-
   // DutyCycle subtracts tcxoDelay + 1000 from the sleep and the register
   // underflows below that, so the floor is a property of this board's TCXO. A
@@ -22,6 +23,7 @@ public:
   CustomSX1262Wrapper(CustomSX1262& radio, mesh::MainBoard& board) : RadioLibWrapper(radio, board) { }
 
   void setParams(float freq, float bw, uint8_t sf, uint8_t cr) override {
+    // PowerSaving variant
     prepareForRadioConfig();
     ((CustomSX1262 *)_radio)->setFrequency(freq);
     ((CustomSX1262 *)_radio)->setSpreadingFactor(sf);
@@ -34,6 +36,7 @@ public:
   }
 
   bool isReceivingPacket() override {
+    // PowerSaving variant
     // While duty-cycling, BUSY marks the sleep phase: probing IRQ flags over
     // SPI there could wake the chip and break the cycle. Only skip the probe
     // in that case - outside RXPS this must stay a real channel check, since
@@ -41,6 +44,7 @@ public:
     if (_rx_ps_armed && ((CustomSX1262 *)_radio)->isChipBusy()) return false;
     return ((CustomSX1262 *)_radio)->isReceiving();
   }
+  // PowerSaving variant
   bool isChipBusy() override {
     return ((CustomSX1262 *)_radio)->isChipBusy();
   }
@@ -54,13 +58,16 @@ public:
   }
   uint8_t getSpreadingFactor() const override { return ((CustomSX1262 *)_radio)->spreadingFactor; }
   virtual void powerOff() override {
+    // PowerSaving variant
     if (_rx_ps_armed) stopReceiveDutyCycle();
     ((CustomSX1262 *)_radio)->sleep(false);
   }
 
+  // PowerSaving variant
   bool supportsRxPowerSaving() const override { return true; }
 
 protected:
+  // PowerSaving variant
   int16_t armDutyCycle(RadioLibIrqFlags_t irq_flags, RadioLibIrqFlags_t irq_mask,
                        uint32_t* eff_rx_us, uint32_t* eff_sleep_us) override {
     // RadioLib programs the SX126x with exactly what we ask for (it only
@@ -71,6 +78,7 @@ protected:
         _rx_ps_rx_us, _rx_ps_sleep_us, irq_flags, irq_mask);
   }
 
+  // PowerSaving variant
   int16_t stopDutyCycleHardware() override {
     int16_t standby_err = _radio->standby();
     int16_t rtc_err = ((CustomSX1262 *)_radio)->stopRTC();
@@ -79,6 +87,7 @@ protected:
 
 public:
   bool setRxBoostedGainMode(bool en) override {
+    // PowerSaving variant
     prepareForRadioConfig();
     return ((CustomSX1262 *)_radio)->setRxBoostedGainMode(en) == RADIOLIB_ERR_NONE;
   }

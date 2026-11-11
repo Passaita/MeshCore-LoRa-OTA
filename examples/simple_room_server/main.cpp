@@ -26,6 +26,7 @@ static char command[MAX_POST_TEXT_LEN+1];
 static char ethernet_command[MAX_POST_TEXT_LEN+1];
 #endif
 
+// PowerSaving variant
 // For power saving
 unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
 
@@ -86,6 +87,7 @@ void setup() {
   ethernet_command[0] = 0;
 #endif
 
+  // PowerSaving variant
 #if ENV_INCLUDE_GPS == 1
   // Apply PowerSaving profile for GPS
   if (sensors.getLocationProvider() != NULL) {
@@ -117,6 +119,13 @@ void setup() {
 
 void loop() {
   int len = strlen(command);
+  // `command` must stay NUL-terminated within its bounds. If it ever isn't,
+  // strlen() above can return >= sizeof(command) and the loop below would then
+  // index past the buffer, so clamp defensively.
+  if (len >= (int)sizeof(command)) {
+    command[0] = 0;
+    len = 0;
+  }
   while (Serial.available() && len < sizeof(command)-1) {
     char c = Serial.read();
     if (c != '\n') {
@@ -125,8 +134,9 @@ void loop() {
     }
     Serial.print(c);
   }
-  if (len == sizeof(command)-1) {  // command buffer full
-    command[sizeof(command)-1] = '\r';
+  if (len == sizeof(command)-1) {  // buffer full: treat as a completed line
+    command[sizeof(command)-2] = '\r';  // place end-of-line marker inside the buffer
+    command[sizeof(command)-1] = 0;     // keep the buffer NUL-terminated
   }
 
   if (len > 0 && command[len - 1] == '\r') {  // received complete line
@@ -166,16 +176,18 @@ void loop() {
   ui_task.loop();
 #endif
   rtc_clock.tick();
+  board.loop();
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.loop();
 #endif
 
+  // PowerSaving variant
   if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)
     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
 #else
     if (the_mesh.millisHasNowPassed(POWERSAVING_FIRSTSLEEP_SECS * 1000)) { // To check if it is time to sleep
-      board.sleep(30); // Sleep. Wake up after a while or when receiving a LoRa packet
+      board.sleep(5); // Sleep. Wake up after a while or when receiving a LoRa packet
     }
 #endif
   }

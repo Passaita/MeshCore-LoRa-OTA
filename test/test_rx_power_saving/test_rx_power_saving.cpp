@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <limits>
 
 #include "helpers/radiolib/RXPowerSaving.h"
 #include "helpers/radiolib/RXPowerSavingCLI.h"
@@ -512,7 +513,8 @@ TEST(RxPowerSavingCLI, ReportsWhenNoLevelCanDutyCycleAtThisRadioSetting) {
   EXPECT_FALSE(RXPowerSavingCLI::set("level 5 preamble 16", 6, 250.0f, &config, &control,
                                      reply, sizeof(reply)));
   EXPECT_NE(strstr(reply, "SF/BW"), nullptr);
-  EXPECT_FALSE(control.set_called);
+  EXPECT_TRUE(control.set_called);
+  EXPECT_FALSE(control.requested_enabled);
   EXPECT_EQ(config.enabled, 0);
 }
 
@@ -795,6 +797,98 @@ TEST(RxPowerSaving, ALevelMeansTheSameGeometryOnBothRadioFamilies) {
                                          RX_POWERSAVING_CAPTURE_COST_SYMBOLS_LR11X0));
       EXPECT_EQ(sleep_sx, sleep_lr) << "level " << (int)level << " P" << (int)preamble;
       EXPECT_EQ(rx_sx, rx_lr) << "level " << (int)level << " P" << (int)preamble;
+    }
+  }
+}
+
+TEST(RxPowerSaving, FailedNormalizationCannotAcceptStalePeriods) {
+  RxPowerSavingConfig config;
+  config.enabled = 1;
+  const auto before = config;
+  EXPECT_FALSE(normalizeRxPowerSavingConfig(&config, 6, 250));
+  EXPECT_EQ(before.rx_us, config.rx_us);
+  EXPECT_EQ(before.sleep_us, config.sleep_us);
+  EXPECT_EQ(1, config.enabled);
+}
+TEST(RxPowerSaving, RejectsNonFiniteAndExtremeBandwidthBeforeIntegerConversion) {
+  RxPowerSavingConfig config;
+  for (float bw : {0.0f, -1.0f, 1.0e-30f, std::numeric_limits<float>::infinity(),
+                   std::numeric_limits<float>::quiet_NaN()}) {
+    EXPECT_FALSE(normalizeRxPowerSavingConfig(&config, 8, bw));
+  }
+  EXPECT_FALSE(normalizeRxPowerSavingConfig(&config, 4, 62.5f));
+  EXPECT_FALSE(normalizeRxPowerSavingConfig(&config, 13, 62.5f));
+}
+TEST(RxPowerSaving, NormalizePreservesManualTimingsAcrossRadioChanges) {
+  RxPowerSavingConfig config;
+  config.enabled = 1; config.level = 0; config.rx_us = 12345; config.sleep_us = 23456;
+  for (uint8_t sf : {6, 8, 12}) {
+    ASSERT_TRUE(normalizeRxPowerSavingConfig(&config, sf, 250));
+    EXPECT_EQ(12345U, config.rx_us); EXPECT_EQ(23456U, config.sleep_us);
+  }
+  config.rx_us = 0;
+  EXPECT_FALSE(normalizeRxPowerSavingConfig(&config, 8, 250));
+  EXPECT_EQ(0U, config.rx_us);
+}
+TEST(RxPowerSaving, InvalidTimingFallsBackThenRecoversWithoutLosingIntent) {
+  RxPowerSavingConfig config;
+  FakeRxPowerSavingControl control;
+  config.enabled = 1;
+  ASSERT_TRUE(applyRxPowerSavingConfig(&config, 8, 62.5, &control));
+  EXPECT_TRUE(control.requested_enabled);
+  ASSERT_FALSE(applyRxPowerSavingConfig(&config, 6, 250, &control));
+  EXPECT_FALSE(control.requested_enabled);
+  EXPECT_EQ(1, config.enabled); EXPECT_EQ(6, config.level);
+  ASSERT_TRUE(applyRxPowerSavingConfig(&config, 8, 62.5, &control));
+  EXPECT_TRUE(control.requested_enabled);
+  config.enabled = 0;
+  ASSERT_TRUE(applyRxPowerSavingConfig(&config, 6, 250, &control));
+  EXPECT_FALSE(control.requested_enabled);
+}
+
+TEST(RxPowerSaving, NarrowBandwidthIsNotRejectedByAnOverconservativeOverflowGuard) {
+  RxPowerSavingConfig config;
+  config.enabled = 1;
+  for (uint8_t level = 1; level <= 10; ++level) {
+    config.level = level;
+    ASSERT_TRUE(normalizeRxPowerSavingConfig(&config, 12, 7.8f));
+    EXPECT_TRUE(isValidRxPowerSavingPeriod(config.rx_us));
+    EXPECT_TRUE(isValidRxPowerSavingPeriod(config.sleep_us));
+  }
+}
+
+TEST(RxPowerSaving, ManualCLIRejectsInvalidRadioAndOffRemainsAvailable) {
+  RxPowerSavingConfig config;config.enabled=1;
+  FakeRxPowerSavingControl control;char reply[160];
+  for(float bw:{0.0f, -1.0f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+    EXPECT_FALSE(RXPowerSavingCLI::set("12345 23456",8,bw,&config,&control,reply,sizeof(reply)));
+    EXPECT_FALSE(control.requested_enabled);EXPECT_EQ(1,config.enabled);
+  }
+  EXPECT_FALSE(RXPowerSavingCLI::set("12345 23456",4,125,&config,&control,reply,sizeof(reply)));
+  EXPECT_TRUE(RXPowerSavingCLI::set("off",4,0,&config,&control,reply,sizeof(reply)));
+  EXPECT_EQ(0,config.enabled);
+}
+TEST(RxPowerSaving, DiagnosticRetainsIntentStateAndErrorForExtremeInputs) {
+  RxPowerSavingConfig config;config.enabled=1;config.level=RX_POWERSAVING_RISKY_WORKING_MAX_LEVEL;
+  config.rx_us=RX_POWERSAVING_MAX_PERIOD_US;config.sleep_us=RX_POWERSAVING_MAX_PERIOD_US;
+  FakeRxPowerSavingControl control;control.status.last_error=-10001;control.status.arm_failures=UINT32_MAX;
+  char reply[160];
+  for(float bw:{std::numeric_limits<float>::infinity(),std::numeric_limits<float>::quiet_NaN(),1.0e30f,62.5f}) {
+    RXPowerSavingCLI::get(&config,&control,8,bw,reply,sizeof(reply));
+    EXPECT_NE(nullptr,strstr(reply,"desired=on"));EXPECT_NE(nullptr,strstr(reply,"effective=continuous"));
+    EXPECT_NE(nullptr,strstr(reply,"err=-10001"));EXPECT_NE(nullptr,strstr(reply,"fail=4294967295"));
+  }
+  config.level=6;
+  RXPowerSavingCLI::get(&config,&control,8,1.0e30f,reply,sizeof(reply));
+  EXPECT_EQ(nullptr,strstr(reply,"catch="));
+}
+
+TEST(RxPowerSaving, RejectsImpossibleCaptureCostBeforeConvertingPeriods) {
+  for(float cost:{16.0f,32.0f,1.0e30f,std::numeric_limits<float>::infinity(),std::numeric_limits<float>::quiet_NaN()}) {
+    for(uint8_t level=1;level<=10;level++) {
+      uint32_t rx=12345,sleep=23456;
+      EXPECT_FALSE(calcRxPowerSavingLevel(level,8,62.5f,16,&rx,&sleep,cost,2600));
+      EXPECT_EQ(12345u,rx);EXPECT_EQ(23456u,sleep);
     }
   }
 }

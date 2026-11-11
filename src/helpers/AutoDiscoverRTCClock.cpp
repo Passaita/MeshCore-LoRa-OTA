@@ -9,6 +9,7 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() { return _fallback->getCurrentTi
 void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) { _fallback->setCurrentTime(time); }
 bool AutoDiscoverRTCClock::i2c_probe(TwoWire& wire, uint8_t addr) { (void)wire; (void)addr; return false; }
 bool AutoDiscoverRTCClock::chipValid() const { return false; }
+bool AutoDiscoverRTCClock::chipFound() const { return false; }
 void AutoDiscoverRTCClock::discipline(uint32_t ref) { if (ref > _fallback->getCurrentTime()) _fallback->setCurrentTime(ref); }
 #elif defined(RTC_RV3028_ONLY)
 #pragma GCC optimize ("Os")   // (rc21, size) clock bookkeeping, called a few times a second: size over speed (the framework builds -Ofast)
@@ -74,16 +75,26 @@ uint32_t AutoDiscoverRTCClock::getCurrentTime() {
 }
 
 bool AutoDiscoverRTCClock::chipValid() const { return rv3028_success && rv_chip_ok; }
+bool AutoDiscoverRTCClock::chipFound() const { return rv3028_success; }
+
+static void rv3028_write(uint32_t time);
 
 void AutoDiscoverRTCClock::discipline(uint32_t ref) {
   if (chipValid()) return;                          // the chip is this node's reference
   rv_step(_fallback, ref);
+  // (C76) a found but unset chip (new, or it lost power) is written with the swarm time: it keeps it across power cuts and the node
+  // answers time requests from then on (rc22.1 left the chip unset until a manual 'clock sync')
+  if (rv3028_success && ref >= RV3028_MIN_VALID) rv3028_write(ref);
 }
 
 void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) {
   _fallback->setCurrentTime(time);
   rv_h.restart(_fallback->getCurrentTime(), time);
   if (!rv3028_success) return;
+  rv3028_write(time);
+}
+
+static void rv3028_write(uint32_t time) {
   rv_chip_ok = time >= RV3028_MIN_VALID;            // 'clkreboot' writes 2024: the chip counts as unset until the next real set
   DateTime dt(time);
   uint8_t weekday = (dt.day() + (uint16_t)((2.6 * dt.month()) - 0.2) - (2 * (dt.year() / 100)) + dt.year() + (uint16_t)(dt.year() / 4) + (uint16_t)(dt.year() / 400)) % 7;
@@ -192,5 +203,6 @@ void AutoDiscoverRTCClock::setCurrentTime(uint32_t time) {
 }
 
 bool AutoDiscoverRTCClock::chipValid() const { return false; }   // (rc21, C57) only the RV-3028 build answers time requests
+bool AutoDiscoverRTCClock::chipFound() const { return false; }
 void AutoDiscoverRTCClock::discipline(uint32_t ref) { if (ref > getCurrentTime()) setCurrentTime(ref); }
 #endif // NO_EXTERNAL_RTC

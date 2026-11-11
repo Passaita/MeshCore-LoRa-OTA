@@ -15,6 +15,7 @@ uint8_t*     sim_cur_flash = nullptr;            // FwOtaSlots.cpp (sim copy) re
 // g_wdt / g_xfer: compiled as -Dg_wdt=(*sim_cur_wdt) -Dg_xfer=(*sim_cur_xfer), so FwOtaTransfer.cpp's own definitions become the POINTERS
 // fw_ota::sim_cur_wdt / fw_ota::sim_cur_xfer (they live in namespace fw_ota) - enter() points them at the node it runs
 
+namespace fw_ota { const FwTag* sim_cur_tag = nullptr; }   // (Heltec) g_fwpull_tag of the node that runs (-Dg_fwpull_tag)
 namespace sim {
 World* W = nullptr;
 uint32_t g_seed = 0;
@@ -22,7 +23,7 @@ static Node* cur = nullptr;
 
 void enter(Node& n) {
   cur = &n; g_sim_boot = n.boot_ms; sim_cur_power = &n.power; sim_cur_uicr = &n.uicr; sim_cur_wdt_regs = &n.wdt; sim_cur_flash = n.flash.data();
-  fw_ota::sim_cur_wdt = n.wdog.get(); fw_ota::sim_cur_xfer = n.xfer.get();
+  fw_ota::sim_cur_wdt = n.wdog.get(); fw_ota::sim_cur_xfer = n.xfer.get(); fw_ota::sim_cur_tag = &n.tag;
 }
 }  // namespace sim
 
@@ -42,7 +43,9 @@ extern "C" {
 void flash_nrf5x_flush(void) {}
 bool flash_nrf5x_erase(uint32_t addr) { memset(sim_cur_flash + (addr & ~0xFFFu), 0xFF, 4096); if (sim::cur) sim::cur->st.erases++; return true; }
 int flash_nrf5x_write(uint32_t dst, void const* src, uint32_t len) {
-  const uint8_t* s = (const uint8_t*)src; for (uint32_t i = 0; i < len; i++) sim_cur_flash[dst + i] &= s[i]; return (int)len; }
+  const uint8_t* s = (const uint8_t*)src;
+  if (dst == fw_ota::SLOT_ADDR && len >= 4 && sim::cur && memcmp(s, &fw_ota::SLOT_MAGIC, 4) == 0) sim::cur->st.hdr_valid++;   // (rc22, C74)
+  for (uint32_t i = 0; i < len; i++) sim_cur_flash[dst + i] &= s[i]; return (int)len; }
 int flash_nrf5x_read(void* dst, uint32_t src, uint32_t len) { memcpy(dst, sim_cur_flash + src, len); return (int)len; }
 }
 const uint8_t* sim_flash_ptr(uint32_t addr) { return sim_cur_flash + addr; }
@@ -115,7 +118,8 @@ static void deliver() {                              // transmissions that end n
 // ---- the mesh glue = MyMesh's LoRa-OTA hooks ----
 bool SimMesh::Host::sendOta(mesh::Packet* p, const uint8_t* path, uint8_t path_len, uint32_t d) { m->sendOtaPacket(p, path, path_len, d); m->n->st.tx_ota++; return true; }
 uint32_t SimMesh::Host::airtimeMs(uint32_t len) { return m->n->radio.getEstAirtimeFor((int)len); }
-uint8_t SimMesh::Host::clockSource() { return m->n->rtc.chip ? 1 : 0; }
+uint8_t SimMesh::Host::clockSource() { return m->n->rtc.valid() ? 1 : 0; }
+bool SimMesh::Host::clockChipFound() { return m->n->rtc.chip; }
 void SimMesh::Host::clockDiscipline(uint32_t ref) { m->n->rtc.discipline(ref); }
 bool SimMesh::allowPacketForward(const mesh::Packet* p) { return n->relay && p->getPathHashCount() < n->flood_max; }
 void SimMesh::onRawDataRecv(mesh::Packet* p) { if (n->xfer) { n->xfer->noteRssi(n->radio.getLastRSSI()); n->xfer->onPacket(p); } }
@@ -126,8 +130,9 @@ void SimMesh::onGroupDataRecv(mesh::Packet* p, uint8_t type, const mesh::GroupCh
 void SimMesh::logRx(mesh::Packet* p, int, float) { if (n->xfer) n->xfer->noteRx(p->getPayloadType(), p->payload, p->payload_len, (int8_t)p->_snr); }
 
 // ---- nodes ----
-Node& World::add(const std::string& name, bool lota, bool relay) {
+Node& World::add(const std::string& name, bool lota, bool relay, const char* board) {
   nodes.emplace_back(new Node()); Node& n = *nodes.back();
+  memset(n.tag.board, 0, sizeof(n.tag.board)); strncpy(n.tag.board, board, sizeof(n.tag.board));
   n.idx = (int)nodes.size() - 1; n.name = name; n.lota = lota; n.relay = relay;
   n.rng = Rng(1000 + n.idx + 7919ULL * g_seed); n.flash.assign(FLASH_SIZE, 0xFF); n.radio.n = &n;
   n.id = mesh::LocalIdentity(&n.rng);
@@ -234,6 +239,10 @@ void World::run(uint32_t ms, std::function<bool()> stop) {
         n.st.wdt_resets++; n.wdt = WdtRegs{}; log(n.name + ": WATCHDOG reset"); boot(n, POWER_RESETREAS_DOG_Msk); continue;
       }
       if (n.hung) continue;
+      if (n.asleep_until) {                         // (Heltec) light sleep: the LoRa packet interrupt (DIO1) or the 30 s timer wakes it
+        if (n.radio.rxq.empty() && (int32_t)(g_sim_now - n.asleep_until) < 0) continue;
+        n.asleep_until = 0;
+      }
       enter(n);
       try {
         n.mesh->loop();
@@ -242,6 +251,11 @@ void World::run(uint32_t ms, std::function<bool()> stop) {
         log(n.name + ": restart (soft reset)");
         boot(n, POWER_RESETREAS_SREQ_Msk);
         continue;
+      }
+      if (n.esp_sleep && n.xfer) {                  // simple_repeater main.cpp: powersaving && !hasPendingWork() -> board.sleep(30) after 120 s
+        n.awake_ms += step_ms;
+        if (g_sim_now - n.boot_ms >= 120000 && !n.xfer->needsAwake() && n.mgr->getOutboundTotal() == 0 && n.radio.tx_idx < 0)
+          n.asleep_until = g_sim_now + 30000;
       }
       if (n.xfer && (int32_t)(g_sim_now - n.audit_at) >= 0) { n.audit_at = g_sim_now + 15000; audit(n); }
     }

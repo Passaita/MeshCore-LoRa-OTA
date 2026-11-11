@@ -122,7 +122,7 @@ void HWTSensorManager::loop() {
 
   if ((int32_t)(millis() - next_gps_update) >= 0) {
     if ((!_location->isPowerSavingEnabled() && gps_active) || (_location->isPowerSavingEnabled() && gps_wake)) {
-      if (_location->isValid()) {
+      if (gps_active && _location->isValid()) {
         node_lat = ((double)_location->getLatitude()) / 1000000.;
         node_lon = ((double)_location->getLongitude()) / 1000000.;
         node_altitude = ((double)_location->getAltitude()) / 1000.0;

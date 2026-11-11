@@ -62,10 +62,6 @@ struct RepeaterStats {
   uint32_t n_recv_errors;
 };
 
-#ifndef MAX_CLIENTS
-  #define MAX_CLIENTS           32
-#endif
-
 struct NeighbourInfo {
   mesh::Identity id;
   uint32_t advert_timestamp;
@@ -78,7 +74,7 @@ struct NeighbourInfo {
 #endif
 
 #ifndef FIRMWARE_VERSION
-  #define FIRMWARE_VERSION   "v1.17.1"
+  #define FIRMWARE_VERSION   "v1.18.0"
 #endif
 
 #define FIRMWARE_ROLE "repeater"
@@ -193,11 +189,26 @@ public:
   void begin(FILESYSTEM* fs);
   void sendNodeDiscoverReq();
   const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
+#if defined(FW_OTA) && defined(FW_OTA_FWNUM)
+  // (rc22, C66, owner 2026-10-16) 'ver' names the image number, so it can be compared with 'fw slot' / 'fw list': "(Build: Oct.29 fw-305)".
+  // The date is the build date (reproducible: SOURCE_DATE_EPOCH), the number the release's (release.sh checks it matches the packed image).
+  const char* getBuildDate() override {
+    static char b[24];
+    if (!b[0]) { const char* d = __DATE__;   // "Oct 29 2026" / "Oct  5 2026"
+      const bool one = d[4] == ' ';
+      snprintf(b, sizeof(b), "%.3s.%.*s fw-%u", d, one ? 1 : 2, d + (one ? 5 : 4), (unsigned)FW_OTA_FWNUM); }
+    return b;
+  }
+#else
   const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
+#endif
   const char* getRole() override { return FIRMWARE_ROLE; }
   const char* getNodeName() { return _prefs.node_name; }
   NodePrefs* getNodePrefs() {
     return &_prefs;
+  }
+  bool isHiddenNode() const {
+    return _prefs.advert_interval == 0 && _prefs.flood_advert_interval == 0;
   }
 
   void savePrefs() override {
@@ -247,8 +258,7 @@ public:
   void saveIdentity(const mesh::LocalIdentity& new_id) override;
   void clearStats() override;
 
-  // Outpath PR
-  void handleCommand(uint32_t sender_timestamp, ClientInfo* sender, char* command, char* reply);
+  void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
   void loop();
 
 #if defined(WITH_BRIDGE)

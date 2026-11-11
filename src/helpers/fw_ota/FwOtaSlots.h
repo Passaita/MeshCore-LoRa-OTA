@@ -25,6 +25,28 @@ namespace fw_ota {
 // ---------------------------------------------------------------------------
 static const uint32_t FLASH_PAGE_SIZE  = 4096;
 
+#if defined(ESP32)
+// (Heltec port) ESP32-S3 16 MB, partition table boards/lora_ota_esp32s3_16MB.csv: two 3 MiB app partitions (the running app and the
+// install target, ESP-IDF OTA) and the 2 MiB "lotaslot" data partition = the slot (same header + LZMA payload format as the RAK) with
+// the control record in its last sector. No LoRa-OTA bootloader: the app itself installs at the start of the next boot
+// (FwOtaInstallEsp32.cpp), the ESP-IDF bootloader then boots the new app on probation (rollback). Only the slot range is ever written
+// by fw_ota's flash functions (FwOtaSlotsEsp32.cpp refuses anything else).
+static const uint32_t APP_MAX_SIZE     = 0x300000;                 // one app partition (3 MiB)
+static const uint32_t SLOT_PART_ADDR   = 0x610000;                 // "lotaslot"
+static const uint32_t SLOT_PART_SIZE   = 0x200000;
+static const uint32_t CTRL_SIZE        = FLASH_PAGE_SIZE;
+// the control record in TWO alternating sectors at the partition's end (a sequence number picks the newer valid one): a power cut
+// between a rewrite's erase and write loses only that rewrite, never the state before it (host test: a cut at every flash operation)
+static const uint32_t CTRL_ADDR        = SLOT_PART_ADDR + SLOT_PART_SIZE - 2 * CTRL_SIZE;
+static const uint32_t SLOT_ADDR        = SLOT_PART_ADDR;
+static const uint32_t SLOT_SIZE        = CTRL_ADDR - SLOT_ADDR;   // 2 MiB - 4 KiB
+uint32_t appRunAddr();                                             // flash address of the running app partition
+bool slotPartitionOk();                                            // our partition table is on the flash ("lotaslot" where it belongs)
+struct CtrlBlock; struct SlotHeader;
+bool failedForSlot(const CtrlBlock& cb, const SlotHeader& h);      // the FAILED record is about THIS slot image
+#else
+struct CtrlBlock; struct SlotHeader;
+bool failedForSlot(const CtrlBlock& cb, const SlotHeader& h);      // (C83) the FAILED record is about THIS slot image (unstamped: any)
 static const uint32_t APP_REGION_START = 0x26000;
 static const uint32_t APP_REGION_END   = 0x96000;   // linker FLASH end == slot start (448 KiB app)
 
@@ -34,6 +56,8 @@ static const uint32_t SLOT_ADDR        = 0x96000;
 static const uint32_t SLOT_SIZE        = CTRL_ADDR - SLOT_ADDR;   // 344 KiB, single slot
 
 static const uint32_t APP_MAX_SIZE     = APP_REGION_END - APP_REGION_START;  // 0x70000
+inline uint32_t appRunAddr() { return APP_REGION_START; }         // (Heltec port) the app always runs from the same place here
+#endif
 
 // ---------------------------------------------------------------------------
 // Slot header - first bytes of a slot, followed immediately by the payload
@@ -74,7 +98,11 @@ static const uint32_t SLOT_PAYLOAD_MAX    = SLOT_SIZE - FLASH_PAGE_SIZE;
 // ---------------------------------------------------------------------------
 static const uint32_t TAG_MAGIC   = 0x4C505746;   // bytes 'F','W','P','L'
 static const uint32_t TAG_VERSION = 1;
+#if defined(HELTEC_LORA_V4)
+#define FW_OTA_TAG_BOARD "HELTECV4"   // (Heltec port) exactly 8 bytes: no NUL inside the field (compared with memcmp over 8 bytes)
+#else
 #define FW_OTA_TAG_BOARD "RAK3401"
+#endif
 
 struct FwTag {
   uint32_t magic;       // TAG_MAGIC

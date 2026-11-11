@@ -8,7 +8,11 @@
 namespace fw_ota {
 
 struct ChunkMap {
+#if defined(ESP32)
+  static const uint16_t MAX_CHUNKS = 4096;          // (Heltec port) 655,360 B payload: the slim ESP32-S3 image is ~2,200 chunks
+#else
   static const uint16_t MAX_CHUNKS = 2176;          // SLOT_PAYLOAD_MAX (348,160 B) / 160 B chunks
+#endif
   uint8_t  bits[MAX_CHUNKS / 8];
   uint16_t n = 0;                                   // chunks in the image
   uint16_t have = 0;                                // chunks present

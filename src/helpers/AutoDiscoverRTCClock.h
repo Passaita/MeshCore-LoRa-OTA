@@ -16,6 +16,7 @@ public:
   void setCurrentTime(uint32_t time) override;
   // (rc21, C57) LoRa-OTA time from a swarm member
   bool chipValid() const;               // an RTC chip holds a plausible time (it answers the swarm's time requests)
+  bool chipFound() const;               // (C76) an RTC chip answers on I2C (valid time or not)
   void discipline(uint32_t ref);        // a better time from a trusted peer: behind -> step forward, ahead -> hold (never back)
 
   void tick() override {

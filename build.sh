@@ -140,7 +140,6 @@ build_firmware() {
 
   # set firmware version string
   # e.g: v1.0.0-abcdef
-  # FIRMWARE_VERSION_STRING="${FIRMWARE_VERSION}-${COMMIT_HASH}"
   FIRMWARE_VERSION_STRING="${FIRMWARE_VERSION}"
 
   # craft filename
