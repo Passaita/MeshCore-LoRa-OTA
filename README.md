@@ -62,6 +62,10 @@ neighbours.
 * **The same power saving as the regular firmware.** LoRa-OTA is built on the IoTThinks PowerSaving firmware, so it keeps CPU sleep,
   RX power saving and the AGC reset.
 
+## Progress log
+What we did and where the project stands, with dates: [progress/LOG.md](progress/LOG.md) (a visual version:
+[progress/index.html](progress/index.html) - open it in a browser, or via GitHub Pages).
+
 ## Does it really work?
 
 * The firmware has been in daily use since September 2026 on a small test fleet: bench boards plus outdoor solar relays, RAK3401 and

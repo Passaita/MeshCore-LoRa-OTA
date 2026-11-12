@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoRa-OTA Project Log</title>
+<meta name="description" content="Dated public log of LoRa-OTA: firmware updates over LoRa for MeshCore repeaters (RAK3401, Heltec V4).">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f6f4ee; --surface:#ffffff; --surface-2:#efece3; --ink:#1b2027; --ink-2:#4a5260; --muted:#7a8290;
+  --line:#dcd7ca; --accent:#0f8a6f; --accent-soft:#d6efe7; --accent-2:#c2571a; --accent-2-soft:#f7e2d4;
+  --blue:#2f5fb3; --blue-soft:#dde6f7; --violet:#7048b5; --violet-soft:#e8e0f5; --gold:#a07800; --gold-soft:#f3ead0;
+  --shadow:0 1px 2px rgba(20,25,35,.05),0 6px 20px rgba(20,25,35,.06);
+  --radius:14px;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1317; --surface:#161b21; --surface-2:#1d242c; --ink:#e8ecef; --ink-2:#b4bcc6; --muted:#8a939e;
+    --line:#2a323b; --accent:#3fc9a5; --accent-soft:#143a32; --accent-2:#f08a4b; --accent-2-soft:#3a2518;
+    --blue:#7ea6f0; --blue-soft:#1b2a45; --violet:#b294ec; --violet-soft:#2a2140; --gold:#e0b84a; --gold-soft:#352c12;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.25);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1317; --surface:#161b21; --surface-2:#1d242c; --ink:#e8ecef; --ink-2:#b4bcc6; --muted:#8a939e;
+  --line:#2a323b; --accent:#3fc9a5; --accent-soft:#143a32; --accent-2:#f08a4b; --accent-2-soft:#3a2518;
+  --blue:#7ea6f0; --blue-soft:#1b2a45; --violet:#b294ec; --violet-soft:#2a2140; --gold:#e0b84a; --gold-soft:#352c12;
+  --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.25);
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow-x:hidden}
+.wrap{max-width:980px;margin:0 auto;padding:0 16px}
+a{color:var(--accent)}
+.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+
+/* hero */
+header.hero{padding:56px 0 32px;position:relative}
+.eyebrow{font-family:"IBM Plex Mono",monospace;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);margin:0 0 10px}
+h1{font-size:clamp(34px,6vw,54px);line-height:1.05;margin:0 0 14px;letter-spacing:-.02em}
+h1 .dash{color:var(--accent-2)}
+.lede{font-size:clamp(17px,2.2vw,19px);color:var(--ink-2);max-width:640px;margin:0}
+.updated{margin-top:18px;font-size:14px;color:var(--muted)}
+.waves{position:absolute;right:0;top:40px;width:220px;height:160px;opacity:.9;pointer-events:none}
+@media (max-width:760px){.waves{display:none}}
+
+section{padding:28px 0}
+h2{font-size:24px;margin:0 0 16px;letter-spacing:-.01em;display:flex;align-items:center;gap:10px}
+h2::before{content:"";width:10px;height:10px;border-radius:3px;background:var(--accent);display:inline-block}
+p{margin:0 0 12px}
+
+/* intro */
+.intro{display:grid;grid-template-columns:1.2fr 1fr;gap:20px;align-items:start}
+@media (max-width:760px){.intro{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:20px}
+.steps{list-style:none;margin:0;padding:0;counter-reset:s}
+.steps li{counter-increment:s;padding:8px 0 8px 40px;position:relative;border-bottom:1px dashed var(--line)}
+.steps li:last-child{border-bottom:0}
+.steps li::before{content:counter(s);position:absolute;left:0;top:8px;width:26px;height:26px;border-radius:50%;background:var(--accent-soft);color:var(--accent);font:600 13px/26px "IBM Plex Mono",monospace;text-align:center}
+.hw{font-size:14px;color:var(--ink-2);margin-top:12px}
+
+/* status */
+.status{background:linear-gradient(135deg,var(--accent-soft),var(--surface) 70%);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:var(--shadow)}
+.status-top{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;align-items:baseline;margin-bottom:14px}
+.status-top h2{margin:0}
+.pill{font:500 12px "IBM Plex Mono",monospace;padding:4px 10px;border-radius:99px;background:var(--surface);border:1px solid var(--line);color:var(--ink-2)}
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+@media (max-width:760px){.tiles{grid-template-columns:repeat(2,1fr)}}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px;min-width:0}
+.tile .k{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.tile .v{font-size:20px;font-weight:700;margin:4px 0 2px;line-height:1.2}
+.tile .s{font-size:13px;color:var(--ink-2)}
+.tile.ok .v{color:var(--accent)}
+.tile.wip .v{color:var(--accent-2)}
+.status ul{margin:14px 0 0;padding-left:20px;color:var(--ink-2)}
+.status li{margin:4px 0}
+
+/* concepts */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px}
+.concept{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow);min-width:0}
+.concept .ico{width:40px;height:40px;border-radius:10px;display:grid;place-items:center;margin-bottom:10px}
+.concept h3{margin:0 0 6px;font-size:17px}
+.concept p{margin:0;font-size:15px;color:var(--ink-2)}
+.c-green .ico{background:var(--accent-soft);color:var(--accent)}
+.c-orange .ico{background:var(--accent-2-soft);color:var(--accent-2)}
+.c-blue .ico{background:var(--blue-soft);color:var(--blue)}
+.c-violet .ico{background:var(--violet-soft);color:var(--violet)}
+.c-gold .ico{background:var(--gold-soft);color:var(--gold)}
+
+/* diagrams */
+.diagrams{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+@media (max-width:760px){.diagrams{grid-template-columns:1fr}}
+.diagram{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
+.diagram h3{margin:0 0 8px;font-size:15px}
+.diagram svg{width:100%;height:auto;display:block}
+.diagram .cap{font-size:13px;color:var(--muted);margin-top:8px}
+svg text{font-family:Inter,system-ui,sans-serif}
+
+/* filters */
+.filters{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}
+.chip{font:500 13px Inter,system-ui,sans-serif;border:1px solid var(--line);background:var(--surface);color:var(--ink-2);padding:6px 12px;border-radius:99px;cursor:pointer}
+.chip[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.chip:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* timeline */
+.month{margin:8px 0 6px}
+.month-h{display:flex;align-items:baseline;gap:12px;margin:18px 0 10px}
+.month-h h3{margin:0;font-size:20px}
+.month-h .n{font:500 12px "IBM Plex Mono",monospace;color:var(--muted)}
+.tl{list-style:none;margin:0;padding:0 0 0 28px;position:relative}
+.tl::before{content:"";position:absolute;left:9px;top:6px;bottom:6px;width:2px;background:var(--line);border-radius:2px}
+.ev{position:relative;margin:0 0 12px}
+.ev::before{content:"";position:absolute;left:-25px;top:18px;width:12px;height:12px;border-radius:50%;background:var(--surface);border:3px solid var(--dot,var(--accent))}
+.ev.big::before{width:16px;height:16px;left:-27px;top:16px;background:var(--dot,var(--accent))}
+.ev-card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px 14px;min-width:0}
+.ev-top{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:2px}
+.date{font:500 13px "IBM Plex Mono",monospace;color:var(--ink-2);background:var(--surface-2);padding:2px 8px;border-radius:6px}
+.tag{font:600 11px Inter,sans-serif;text-transform:uppercase;letter-spacing:.06em;padding:2px 8px;border-radius:99px;background:var(--tagbg);color:var(--tagfg)}
+.ev h4{margin:4px 0 2px;font-size:16px}
+.ev p{margin:0;font-size:15px;color:var(--ink-2)}
+.ev.hidden{display:none}
+.t-transfer{--dot:var(--accent);--tagbg:var(--accent-soft);--tagfg:var(--accent)}
+.t-boot{--dot:var(--accent-2);--tagbg:var(--accent-2-soft);--tagfg:var(--accent-2)}
+.t-security{--dot:var(--violet);--tagbg:var(--violet-soft);--tagfg:var(--violet)}
+.t-swarm{--dot:var(--blue);--tagbg:var(--blue-soft);--tagfg:var(--blue)}
+.t-release{--dot:var(--gold);--tagbg:var(--gold-soft);--tagfg:var(--gold)}
+.t-heltec{--dot:var(--ink-2);--tagbg:var(--surface-2);--tagfg:var(--ink-2)}
+
+/* next */
+.next{counter-reset:n;list-style:none;margin:0;padding:0;display:grid;gap:10px}
+.next li{counter-increment:n;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px 14px 12px 52px;position:relative}
+.next li::before{content:counter(n);position:absolute;left:14px;top:12px;width:26px;height:26px;border-radius:8px;background:var(--accent-2-soft);color:var(--accent-2);font:600 13px/26px "IBM Plex Mono",monospace;text-align:center}
+
+footer{padding:32px 0 48px;color:var(--muted);font-size:14px;border-top:1px solid var(--line);margin-top:24px}
+.theme-btn{position:fixed;right:16px;bottom:16px;border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:99px;padding:8px 12px;font:500 13px Inter,sans-serif;box-shadow:var(--shadow);cursor:pointer}
+@media print{.theme-btn,.filters{display:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <svg class="waves" viewBox="0 0 220 160" aria-hidden="true">
+    <g style="stroke:var(--accent)" fill="none" stroke-width="2" stroke-linecap="round">
+      <path d="M160 60 a28 28 0 0 1 0 40" opacity=".9"/>
+      <path d="M172 44 a48 48 0 0 1 0 72" opacity=".6"/>
+      <path d="M186 28 a70 70 0 0 1 0 104" opacity=".35"/>
+    </g>
+    <rect style="fill:var(--accent)" x="118" y="66" width="28" height="28" rx="6"/>
+    <line style="stroke:var(--ink-2)" x1="132" y1="66" x2="132" y2="40" stroke-width="2"/>
+    <circle style="fill:var(--accent-2)" cx="132" cy="38" r="3"/>
+    <g style="fill:var(--line)"><circle cx="40" cy="120" r="7"/><circle cx="76" cy="96" r="7"/><circle cx="30" cy="70" r="7"/></g>
+    <g style="stroke:var(--line)" stroke-width="2" stroke-dasharray="3 4"><line x1="40" y1="120" x2="76" y2="96"/><line x1="76" y1="96" x2="118" y2="82"/><line x1="30" y1="70" x2="76" y2="96"/></g>
+  </svg>
+  <p class="eyebrow">Project log &middot; public record</p>
+  <h1>LoRa<span class="dash">-</span>OTA</h1>
+  <p class="lede">Firmware updates over LoRa for MeshCore repeaters. A dated record of what the project designed, built and tested, and where it stands.</p>
+  <p class="updated mono">Last updated 12 Nov 2026 &middot; RAK3401 &middot; Heltec V4</p>
+</header>
+
+<section id="what">
+  <h2>What this project is</h2>
+  <div class="intro">
+    <div>
+      <p>Solar repeaters sit on roofs, masts and hills. Updating their firmware usually means a trip, a cable or a phone close by.</p>
+      <p><strong>LoRa-OTA lets a MeshCore repeater fetch a new firmware over the LoRa mesh itself</strong>, check it, and install it. No site visit.</p>
+      <p>Mesh traffic always goes first. An update uses only a small, fixed share of airtime and waits for quiet air.</p>
+      <p class="hw">Hardware: RAK3401 (nRF52840 + SX1262, 1 W booster) and Heltec V4 (ESP32-S3 + SX1262). Built on MeshCore, with its power-saving features kept.</p>
+    </div>
+    <div class="card">
+      <ol class="steps">
+        <li><strong>Find</strong> - a node asks its circle who holds a version.</li>
+        <li><strong>Pull</strong> - it fetches the image chunk by chunk, encrypted.</li>
+        <li><strong>Check</strong> - CRC and SHA-256 over the whole image.</li>
+        <li><strong>Install</strong> - the bootloader installs it at the next start.</li>
+        <li><strong>Serve</strong> - the node now offers it to its neighbours.</li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<section id="now">
+  <div class="status">
+    <div class="status-top">
+      <h2>Where we stand now</h2>
+      <span class="pill">as of 12 Nov 2026</span>
+    </div>
+    <div class="tiles">
+      <div class="tile ok"><div class="k">Released</div><div class="v">v1.18.0-rc25</div><div class="s">RAK3401 + Heltec V4, one source. Canary passed 11 Nov.</div></div>
+      <div class="tile ok"><div class="k">Test fleet</div><div class="v">rc25 + rev 9</div><div class="s">Bootloader with boot-loop recovery.</div></div>
+      <div class="tile wip"><div class="k">In progress</div><div class="v">A/B slots</div><div class="s">Trial boot + automatic rollback, proven on hardware 12 Nov.</div></div>
+      <div class="tile wip"><div class="k">Next</div><div class="v">Delta updates</div><div class="s">Decoder done. Transfer next.</div></div>
+    </div>
+    <ul>
+      <li>App about <strong>57 KB smaller</strong> from build settings alone (measured).</li>
+      <li>A transition build (rc26) runs on the canary board and is travelling over LoRa to the next one.</li>
+      <li>On the Heltec V4, delta updates are priority 1: its images are about twice as large.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="concepts">
+  <h2>Concepts</h2>
+  <div class="grid">
+    <div class="concept c-blue">
+      <div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="6" r="2"/><circle cx="20" cy="6" r="2"/><circle cx="4" cy="18" r="2"/><circle cx="20" cy="18" r="2"/><path d="M6 7l4 3M18 7l-4 3M6 17l4-3M18 17l-4-3"/></svg></div>
+      <h3>Swarm: pull a version, not a host</h3>
+      <p>A node asks for a version and fetches it from the best holder in reach. If that holder goes quiet, the pull continues from another one. Pullers of the same image share one stream.</p>
+    </div>
+    <div class="concept c-violet">
+      <div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><rect x="8.5" y="11" width="7" height="6" rx="1"/><path d="M10 11V9a2 2 0 0 1 4 0v2"/></svg></div>
+      <h3>Circle encryption</h3>
+      <p>Nodes of one owner share a passphrase. Outsiders do not see the service. Each pull gets its own session key; every chunk is encrypted. No admin password on air.</p>
+    </div>
+    <div class="concept c-green">
+      <div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h3l2-5 3 10 2-6 2 3h6"/></svg></div>
+      <h3>Fair airtime</h3>
+      <p>LoRa-OTA uses only a set share of airtime. Relays are counted, so a pull through several repeaters slows down on purpose. Mesh traffic always goes first.</p>
+    </div>
+    <div class="concept c-gold">
+      <div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 19h16"/></svg></div>
+      <h3>Fleet fill and push</h3>
+      <p>A pull also fills empty slots of nodes that overhear it. A push asks the circle to fetch a new version over several days. Filling and installing stay separate steps.</p>
+    </div>
+    <div class="concept c-orange">
+      <div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="8" height="14" rx="2"/><rect x="13" y="5" width="8" height="14" rx="2"/><path d="M7 9v6M17 12h0"/></svg></div>
+      <h3>One slot, then A/B</h3>
+      <p>The first design used one staging slot. Next: two app slots. The new app starts on trial; after 3 failed trial boots the previous one returns by itself.</p>
+    </div>
+    <div class="concept c-green">
+      <div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h10M4 12h6M4 17h10"/><path d="M17 9l3 3-3 3"/></svg></div>
+      <h3>Delta updates</h3>
+      <p>Most of a new version equals the old one. Patches measured about 8-35 KB against about 233 KB for a whole image. Less airtime, faster updates.</p>
+    </div>
+    <div class="concept c-blue">
+      <div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="4" width="14" height="16" rx="2"/><path d="M9 14l3 3 3-3M12 8v9"/></svg></div>
+      <h3>Size</h3>
+      <p>A smaller app means fewer chunks per update and room for two slots. Build settings alone saved about 57 KB (16 %).</p>
+    </div>
+    <div class="concept c-violet">
+      <div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M9 12l2 2 4-4"/></svg></div>
+      <h3>Safety net</h3>
+      <p>A hardware watchdog restarts a hung node. A node stuck in a boot loop opens Bluetooth recovery by itself. Bluetooth and USB recovery always stay available.</p>
+    </div>
+  </div>
+
+  <div class="diagrams">
+    <figure class="diagram" style="margin:0">
+      <h3>Swarm: holders and failover</h3>
+      <svg viewBox="0 0 320 170" role="img" aria-label="A puller fetches from the nearest holder; when it goes quiet, it continues from another holder of the same image">
+        <g style="stroke:var(--line)" stroke-width="2"><line x1="60" y1="85" x2="160" y2="40"/><line x1="60" y1="85" x2="160" y2="130"/><line x1="160" y1="40" x2="260" y2="85"/><line x1="160" y1="130" x2="260" y2="85"/></g>
+        <line style="stroke:var(--muted)" x1="160" y1="40" x2="260" y2="85" stroke-width="3" stroke-dasharray="4 6"/>
+        <line style="stroke:var(--blue)" x1="160" y1="130" x2="260" y2="85" stroke-width="3"/>
+        <circle style="fill:var(--surface-2);stroke:var(--muted)" cx="160" cy="40" r="20" stroke-width="2"/>
+        <text style="fill:var(--muted)" x="160" y="44" text-anchor="middle" font-size="11">gone</text>
+        <circle style="fill:var(--blue-soft);stroke:var(--blue)" cx="160" cy="130" r="22" stroke-width="2"/>
+        <text style="fill:var(--blue)" x="160" y="134" text-anchor="middle" font-size="10">holder</text>
+        <circle style="fill:var(--blue-soft);stroke:var(--blue)" cx="60" cy="85" r="22" stroke-width="2"/>
+        <text style="fill:var(--blue)" x="60" y="89" text-anchor="middle" font-size="10">holder</text>
+        <circle style="fill:var(--accent-soft);stroke:var(--accent)" cx="260" cy="85" r="22" stroke-width="2"/>
+        <text style="fill:var(--accent)" x="260" y="89" text-anchor="middle" font-size="10">puller</text>
+        <text style="fill:var(--ink-2)" x="228" y="140" text-anchor="middle" font-size="11">continues here</text>
+        <text style="fill:var(--muted)" x="226" y="36" text-anchor="middle" font-size="11">went quiet</text>
+      </svg>
+      <p class="cap">The puller asks for a version. When a holder goes quiet, the pull carries on from another holder of the same image.</p>
+    </figure>
+    <figure class="diagram" style="margin:0">
+      <h3>Single slot &rarr; A/B with trial boot</h3>
+      <svg viewBox="0 0 320 170" role="img" aria-label="Single slot design compared with two app slots, trial boot and automatic rollback">
+        <text style="fill:var(--muted)" x="10" y="18" font-size="11">Sept 2026: one staging slot</text>
+        <rect style="fill:var(--surface-2);stroke:var(--line)" x="10" y="26" width="140" height="34" rx="6"/><text style="fill:var(--ink)" x="80" y="47" text-anchor="middle" font-size="11">running app</text>
+        <rect style="fill:var(--gold-soft);stroke:var(--gold)" x="170" y="26" width="140" height="34" rx="6"/><text style="fill:var(--gold)" x="240" y="47" text-anchor="middle" font-size="11">staging slot</text>
+        <path style="stroke:var(--gold)" d="M170 52 C150 66 130 66 120 60" fill="none" stroke-width="2" marker-end="url(#ar)"/>
+        <text style="fill:var(--muted)" x="10" y="92" font-size="11">Nov 2026: two app slots</text>
+        <rect style="fill:var(--accent-soft);stroke:var(--accent)" x="10" y="100" width="140" height="34" rx="6"/><text style="fill:var(--accent)" x="80" y="121" text-anchor="middle" font-size="11">slot A: confirmed</text>
+        <rect style="fill:var(--accent-2-soft);stroke:var(--accent-2)" x="170" y="100" width="140" height="34" rx="6"/><text style="fill:var(--accent-2)" x="240" y="121" text-anchor="middle" font-size="11">slot B: on trial</text>
+        <path style="stroke:var(--accent-2)" d="M200 136 C190 160 110 160 90 138" fill="none" stroke-width="2" stroke-dasharray="4 4" marker-end="url(#ar2)"/>
+        <text style="fill:var(--ink-2)" x="160" y="166" text-anchor="middle" font-size="10">3 failed trial boots &rarr; back to A</text>
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path style="fill:var(--gold)" d="M0 0L10 5L0 10z"/></marker>
+          <marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path style="fill:var(--accent-2)" d="M0 0L10 5L0 10z"/></marker>
+        </defs>
+      </svg>
+      <p class="cap">Before: the bootloader unpacks the staging slot over the app. Next: the new app runs from the free slot and must confirm itself.</p>
+    </figure>
+  </div>
+</section>
+
+<section id="timeline">
+  <h2>Timeline</h2>
+  <div class="filters" role="group" aria-label="Filter milestones">
+    <button class="chip" data-f="all" aria-pressed="true">All</button>
+    <button class="chip" data-f="transfer" aria-pressed="false">Transfer</button>
+    <button class="chip" data-f="swarm" aria-pressed="false">Swarm</button>
+    <button class="chip" data-f="security" aria-pressed="false">Security</button>
+    <button class="chip" data-f="boot" aria-pressed="false">Bootloader &amp; safety</button>
+    <button class="chip" data-f="release" aria-pressed="false">Releases</button>
+    <button class="chip" data-f="heltec" aria-pressed="false">Heltec V4</button>
+  </div>
+  <div id="tl-root"></div>
+</section>
+
+<section id="next">
+  <h2>What is next</h2>
+  <ol class="next">
+    <li>rc26 soak on the canary boards, then the fleet.</li>
+    <li>Bootloader rev 11, one node at a time: two app slots, trial boot, automatic rollback.</li>
+    <li>rc27: the first update installed on trial, then delta updates over LoRa.</li>
+    <li>Delta updates on the Heltec V4.</li>
+  </ol>
+</section>
+
+<footer>
+  <p>Dates come from the project's own dated working notes. "Around" means the exact day is not recorded.</p>
+  <p>LoRa-OTA builds on MeshCore. RAK3401, Heltec V4, nRF52840, ESP32-S3 and SX1262 are product names of their makers.</p>
+</footer>
+</div>
+
+<button class="theme-btn" id="themeBtn" type="button" aria-label="Toggle light or dark theme">Theme</button>
+
+<script>
+(function(){
+  // [date, tag, title, text, big?]
+  var data = {
+    "September 2026": [
+      ["15 Sep","boot","First design","An early two-slot (A/B) draft was set aside. The project starts with one staging slot and a custom bootloader that unpacks a compressed image. Simpler, and it fit the flash at the time.",1],
+      ["16-18 Sep","boot","First custom bootloader","The first attempt left the bench board unbootable; it was recovered with a debug probe and the bug found. On 18 Sep a fixed bootloader installed an image from the slot on hardware."],
+      ["19 Sep","transfer","First complete update over LoRa","One board pulled about 1,400 chunks from another in about 19 minutes with zero retries, installed it, and came back on the new version.",1],
+      ["19 Sep","transfer","Hands-off","Pull and install with nobody touching the node. A pull survives a restart of either side. A node serves only an image it has installed and runs."],
+      ["19 Sep","transfer","Through ordinary repeaters","A pull worked through stock MeshCore repeaters that know nothing about LoRa-OTA."],
+      ["Around 19-20 Sep","transfer","Overhearing and a fleet rehearsal","Chunks go straight into flash; a puller can use chunks sent to someone else. Three boards updated one after another."],
+      ["20 Sep","boot","Bootloader over LoRa - and a name","The bootloader itself can be updated over the air. The project is named LoRa-OTA. Stock boards are brought in over Bluetooth."],
+      ["21 Sep","transfer","Remote control and path discovery","Update commands work from a phone over MeshCore remote admin. A node finds its way to a server through repeaters by itself."],
+      ["24 Sep","boot","Easy way back","A bootloader revision allows a normal factory app to be installed again."],
+      ["26-27 Sep","transfer","Smarter routes","Routes are scored and replaced when they fail. One-way links are handled. First pull through two stock repeaters on 27 Sep."],
+      ["27 Sep","boot","Bluetooth by button","Three quick presses of reset put a node into Bluetooth update mode."],
+      ["27 Sep","heltec","First Heltec V4 work","A Heltec V4 that shut down at every start was diagnosed (battery reading) and turned into a working repeater."],
+      ["28 Sep","transfer","Airtime limits","LoRa-OTA gets its own duty-cycle setting. It counts relays and always yields to mesh traffic."],
+      ["29 Sep","security","Security v2","Circle passphrase, hidden service, a session key per pull, encrypted chunks, no admin password on air.",1],
+      ["29 Sep","transfer","Bluetooth slot fill","A phone or laptop loads an image into a node's slot. The node then serves it over LoRa."],
+      ["29 Sep","release","First release candidate (rc1)",""],
+      ["30 Sep","swarm","Swarm idea","“Pull a version, not a host”: the circle as a swarm of holders, like file sharing.",1],
+      ["30 Sep","boot","Stock-friendly bootloader","Factory firmware installs over the LoRa-OTA bootloader, and back."]
+    ],
+    "October 2026": [
+      ["1 Oct","release","Pre-release soak","A quieter transfer: send only after a short quiet gap. Soak on three boards."],
+      ["3 Oct","release","Ready for review","A clean-up release for community review. First upload of the code to GitHub (private at first)."],
+      ["3 Oct","boot","Hardware watchdog","A hung main loop restarts the node."],
+      ["5 Oct","transfer","Remote watchdog setting, fair sharing","A changed watchdog time applies itself remotely. A slow puller gets a fair share of a holder's airtime."],
+      ["6 Oct","swarm","Swarm v1","Nodes list versions, pull from the best holder and switch holders on failure.",1],
+      ["6 Oct","swarm","Shared stream","Pullers of the same image share one stream; late joiners fill their gaps afterwards. Built and tested first in a new network simulator."],
+      ["6 Oct","boot","Bootloader rev 8","The 1 W booster is held off while the bootloader runs. Battery nodes had browned out during updates."],
+      ["8 Oct","swarm","Fleet fill","Every pull also fills empty slots of nodes that hear it. A fleet pull refreshes slots hop by hop and never installs by itself.",1],
+      ["10-11 Oct","swarm","Fleet cancel, better holder choice","A fleet wave can be cancelled; holder changes are checked against the measured rate."],
+      ["15-16 Oct","release","Whole test fleet updated","rc21 rolled out to all nodes on 16 Oct; a 24-hour soak passed with no watchdog resets."],
+      ["25 Oct","boot","External flash idea","An add-on flash module evaluated as storage for a rollback copy."],
+      ["Around 29 Oct","release","Code public on GitHub",""],
+      ["30 Oct","security","Stricter checks","A slot counts as valid only after both a CRC and a SHA-256 check. A node keeps serving while it pulls."]
+    ],
+    "November 2026": [
+      ["1 Nov","heltec","Heltec V4 port starts","LoRa-OTA on the ESP32-S3 Heltec V4. A 24-hour soak with power saving on passed on 2 Nov.",1],
+      ["4 Nov","swarm","Push design","A campaign that asks a whole circle to fetch a new version over several days."],
+      ["5 Nov","release","Move to MeshCore 1.18.0","Hardware crypto on, app about 70 KB smaller. The canary showed a start-up crash, so it never left the bench."],
+      ["6 Nov","release","Upgrade tests","The simulator also tests an upgrade from the previous release with its saved state."],
+      ["7 Nov","boot","Boot-loop recovery (bootloader rev 9)","The bootloader starts the watchdog before the app. After 3 failed starts in a row it opens Bluetooth recovery by itself. Every normal user install method passed.",1],
+      ["7 Nov","release","Start-up crash fixed (rc24)","Plus a release check so this class of bug cannot ship again."],
+      ["8 Nov","release","rc25","Push campaigns, version names on the MeshCore base, one source for RAK3401 and Heltec V4."],
+      ["10 Nov","boot","Rollback proof of concept","With an add-on flash module, the bootloader kept a backup of the running app and restored it automatically after 3 failed boots."],
+      ["10 Nov","transfer","Delta updates measured","Patches between versions: about 8 KB and 35 KB, against about 233 KB for a whole image."],
+      ["11 Nov","release","rc25 passes its canary - published","On RAK3401 and three Heltec V4s. Published on GitHub as a pre-release with binaries for both boards.",1],
+      ["11 Nov","heltec","Delta first on the Heltec","Delta updates become priority 1 on the Heltec V4."],
+      ["12 Nov","release","Size study","Optimising for size instead of speed, plus dropping unused USB features: about 57 KB (16 %) smaller, measured. Patches stay the same size."],
+      ["12 Nov","boot","Add-on flash parked","Rollback will come from two internal slots instead, with no extra hardware."],
+      ["12 Nov","boot","A/B slots proven on hardware","The bootloader started an app from the second slot on trial. That test app never confirmed itself: after 3 failed trial boots the bootloader went back to the first slot by itself.",1],
+      ["12 Nov","release","rc26 on the canary","The transition build (about 299 KB) runs on the bench board; the next board started fetching it over LoRa."],
+      ["12 Nov","transfer","Delta decoder done","Tested against thousands of damaged patches: none wrote outside its area."]
+    ]
+  };
+  var names = {transfer:"Transfer",swarm:"Swarm",security:"Security",boot:"Bootloader",release:"Release",heltec:"Heltec V4"};
+  var root = document.getElementById("tl-root");
+  function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];});}
+  var html = "";
+  Object.keys(data).forEach(function(m){
+    html += '<div class="month"><div class="month-h"><h3>'+esc(m)+'</h3><span class="n">'+data[m].length+' milestones</span></div><ol class="tl">';
+    data[m].forEach(function(e){
+      html += '<li class="ev t-'+e[1]+(e[4]?' big':'')+'" data-t="'+e[1]+'"><div class="ev-card"><div class="ev-top"><span class="date">'+esc(e[0])+'</span><span class="tag">'+names[e[1]]+'</span></div><h4>'+esc(e[2])+'</h4>'+(e[3]?'<p>'+esc(e[3])+'</p>':'')+'</div></li>';
+    });
+    html += '</ol></div>';
+  });
+  root.innerHTML = html;
+
+  var chips = document.querySelectorAll(".chip");
+  chips.forEach(function(c){
+    c.addEventListener("click",function(){
+      var f = c.getAttribute("data-f");
+      chips.forEach(function(x){x.setAttribute("aria-pressed", x===c ? "true":"false");});
+      document.querySelectorAll(".ev").forEach(function(ev){
+        ev.classList.toggle("hidden", f!=="all" && ev.getAttribute("data-t")!==f);
+      });
+      document.querySelectorAll(".month").forEach(function(mo){
+        var vis = mo.querySelectorAll(".ev:not(.hidden)").length;
+        mo.style.display = vis ? "" : "none";
+        mo.querySelector(".n").textContent = vis + (vis===1?" milestone":" milestones");
+      });
+    });
+  });
+
+  var btn = document.getElementById("themeBtn"), rootEl = document.documentElement;
+  try { var saved = localStorage.getItem("lota-theme"); if (saved) rootEl.setAttribute("data-theme", saved); } catch(e){}
+  btn.addEventListener("click", function(){
+    var cur = rootEl.getAttribute("data-theme");
+    var dark = cur ? cur==="dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var next = dark ? "light" : "dark";
+    rootEl.setAttribute("data-theme", next);
+    try { localStorage.setItem("lota-theme", next); } catch(e){}
+  });
+})();
+</script>
+<noscript><div class="wrap"><p>The timeline needs JavaScript. The same content is in LOG.md.</p></div></noscript>
+</body>
+</html>
