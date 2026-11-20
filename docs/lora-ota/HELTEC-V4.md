@@ -23,6 +23,7 @@ board; a scan may need a second `fw peers` when two holders answer at the same m
 | A new version that misbehaves | stays (fixed by the next version) | **rolls back by itself**: it must run 2 min AND hear a packet within 3 h, otherwise the board returns to the previous version (`fw slot` says "rolled back") |
 | Seeding a new version into the first node | Bluetooth (`fw pull-ble` + nRF DFU app) | **Wi-Fi** (`fw pull-ble`, alias `fw pull-wifi`): an open access point, see below |
 | Bootloader updates (`fw blupdate`, `fw bl`) | yes | not needed (answers "not on this board") |
+| First install | Bluetooth (nRF DFU app) | USB (`esptool`), or **Wi-Fi from stock MeshCore with the migrator** (no USB) |
 | Recovery | Bluetooth / USB drive | USB (`esptool`), always possible: the chip's own ROM loader cannot be overwritten |
 
 ## Release files
@@ -33,8 +34,14 @@ board; a scan may need a second `fw peers` when two holders answer at the same m
 | `LoRa-OTA-HELTECV4-app-<ver>.lota` | the LoRa-OTA image (same bytes as `-slot.lota`) |
 | `...-usb-slot-0x610000.bin` | slot fill by USB: `esptool` at `0x610000` |
 | `...-firmware.bin`, `-seeder.bin`, `-bootloader.bin`, `-partitions.bin`, `-boot_app0.bin` | the parts of the first install (app0 at `0x10000`) |
+| `...-migrator.bin`, `...-migrate.bin` | **first install from stock MeshCore over Wi-Fi, no USB** ([HELTEC-V4-MIGRATOR.md](HELTEC-V4-MIGRATOR.md)). From the next Heltec V4 release; build them meanwhile |
 
 ## Getting started (once per node)
+Two ways to put LoRa-OTA on a node; both keep its identity and settings:
+* **Over Wi-Fi from stock MeshCore, no USB** (a node you can't or won't take down, e.g. on a roof): the **migrator**, about 5 minutes
+  next to the node with a phone. See [HELTEC-V4-MIGRATOR.md](HELTEC-V4-MIGRATOR.md), then continue with step 2 below.
+* **By USB** (a node on your desk, or any firmware other than stock MeshCore with its Wi-Fi updater): step 1 below.
+
 1. **First install by USB** (a laptop with `esptool`): download mode = hold **PRG**, tap **RST**, release PRG; write the release's
    `LoRa-OTA-HELTECV4-app-<ver>-first-install.bin` at `0x0`; tap **RST**. The node keeps the identity and settings it had (they live
    past the end of this image). This also writes the LoRa-OTA partition table, once.
@@ -62,5 +69,6 @@ LoRa (phone app / remote admin). For a USB session: `powersaving off` (over LoRa
 Battery readings on the V4 are approximate; don't base battery-saving settings on them alone.
 
 ## Building
-`pio run -e heltec_v4_lora_ota` (the repeater) and `pio run -e heltec_v4_lora_ota_seeder` (the Wi-Fi seeder); partition table
-`boards/lora_ota_esp32s3_16MB.csv`. See [TESTING.md](TESTING.md) for the reproducible build.
+`pio run -e heltec_v4_lora_ota` (the repeater), `pio run -e heltec_v4_lora_ota_seeder` (the Wi-Fi seeder) and
+`pio run -e heltec_v4_lora_ota_migrator` (the migrator, stock layout); environments in `tools/fwpull_env.ini` (copy them into
+`platformio.local.ini`); partition table `boards/lora_ota_esp32s3_16MB.csv`. See [TESTING.md](TESTING.md) for the reproducible build.

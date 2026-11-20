@@ -1,7 +1,7 @@
 # LoRa-OTA - user guide
 
 Current for **app v1.18.0-rc25** (RAK3401 fw-318, Heltec V4 fw-319) and **bootloader rev 8** (RAK3401). This guide is written for the
-RAK3401; the Heltec V4 differences (USB first install, Wi-Fi seeding, install by the app with probation) are in [HELTEC-V4.md](HELTEC-V4.md). All commands are typed in the repeater's CLI: the serial console,
+RAK3401; the Heltec V4 differences (first install by USB or over Wi-Fi from stock MeshCore with the migrator, Wi-Fi seeding, install by the app with probation) are in [HELTEC-V4.md](HELTEC-V4.md). All commands are typed in the repeater's CLI: the serial console,
 or the MeshCore phone app's remote-admin session after an admin login. Full command list: [COMMANDS.md](COMMANDS.md).
 
 ## 1. What a node needs

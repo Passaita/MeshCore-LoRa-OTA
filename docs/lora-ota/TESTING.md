@@ -16,6 +16,7 @@ functions from `src/helpers/fw_ota/` on every run (not copies), so they test the
 | BLE slot fill | `bash test/fw_ota_slotfill_test.sh <release .lota>` | `fw pull-ble`: good and bad uploads into the slot |
 | Upgrade | `bash test/fw_ota_upgrade_test.sh <previous release tree>` | the previous release's saved state (mid-pull, settings) booted by this one |
 | ESP32 install | `bash test/fw_ota_esp32_install_test.sh` | Heltec V4: slot -> app partition on a mocked 16 MB flash, a power cut at each of 590 flash operations, wrong-board and truncated images |
+| Heltec V4 migrator | `test/migrator_host_test.cpp` ([HELTEC-V4-MIGRATOR.md](HELTEC-V4-MIGRATOR.md), Building) | stock MeshCore -> LoRa-OTA layout on a simulated 16 MB NOR flash + ESP-IDF 4.4 bootloader model: a power cut at every flash operation (337-355 per case, both stock partitions x good/failing app), refusals, 5 mutants; needs USB only for a cut inside the table write (<= 3 operations) |
 | Chunk map | `g++ -std=c++11 -I src/helpers/fw_ota test/fw_ota_chunkmap_test.cpp && ./a.out` | the received-chunk bitmap |
 | Bootloader images | see the header of `test/fw_ota_blimage_test.cpp` | bootloader images served over LoRa (needs real bootloader builds) |
 
@@ -37,6 +38,7 @@ each of which must be caught. `tools/check_vectors.py` checks a bootloader build
 * Heltec V4: `pio run -e heltec_v4_lora_ota` and `-e heltec_v4_lora_ota_seeder` with `SOURCE_DATE_EPOCH=1794165858` give the published
   program bytes; the images match byte for byte when the project folder is named `heltec_build` (the ELF hash in the ESP32 app
   descriptor covers debug info that contains the build path).
+* Heltec V4 migrator: `pio run -e heltec_v4_lora_ota_migrator` (stock layout); the bundle with `tools/make_migrate_bundle.py`.
 * Bootloader: see the LoRa-OTA-bootloader README (rev 8 rebuilds byte for byte as well).
 
 ## Hardware results (summary)

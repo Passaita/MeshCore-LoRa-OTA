@@ -95,7 +95,8 @@ circle); anyone who needs an update within minutes (a transfer takes hours by de
 * A **RAK3401** repeater (WisBlock, nRF52840 + SX1262, with the RAK13302 1 W booster) or a **Heltec V4** (ESP32-S3, 16 MB flash).
   Other boards have not been tested.
 * RAK3401: a phone with the **nRF Device Firmware Update** app (or a laptop with Bluetooth), **once per node**, within Bluetooth range.
-  Heltec V4: a laptop with `esptool` for the first install (USB), then a phone for Wi-Fi seeding.
+  Heltec V4: a phone (first install from stock MeshCore over Wi-Fi with the migrator) or a laptop with `esptool` (USB), then a phone
+  for Wi-Fi seeding.
 * About **15 minutes per node** for that one-time setup.
 
 ## Getting started on a RAK3401 (once per node)
@@ -112,7 +113,9 @@ circle); anyone who needs an update within minutes (a transfer takes hours by de
 4. **Check the settings.** Apply your usual repeater settings and read them back. A fresh install starts with power saving, RX power
    saving and the AGC reset on, and with `fw autoapply off` (downloads are stored and served; `fw apply` installs them).
 
-The Heltec V4 is set up by USB once and seeded by Wi-Fi: see [docs/lora-ota/HELTEC-V4.md](docs/lora-ota/HELTEC-V4.md).
+The Heltec V4 is set up once, **from stock MeshCore over Wi-Fi with the migrator (no USB, the node stays where it is)** or by USB,
+and seeded by Wi-Fi: see [docs/lora-ota/HELTEC-V4.md](docs/lora-ota/HELTEC-V4.md) and
+[docs/lora-ota/HELTEC-V4-MIGRATOR.md](docs/lora-ota/HELTEC-V4-MIGRATOR.md).
 Full walk-through: [USER-GUIDE.md, section 2](docs/lora-ota/USER-GUIDE.md).
 
 ## Rolling out a new version (the safe way)
@@ -164,9 +167,9 @@ V4: flash a stock build by USB. If you come back later, even your passphrase is 
 
 ## Building
 
-* RAK3401: `pio run -e RAK_3401_lora_ota`. Heltec V4: `pio run -e heltec_v4_lora_ota` and the Wi-Fi seeder
-  `pio run -e heltec_v4_lora_ota_seeder`. The environments are in `platformio.local.ini`; `RAK_3401_lora_ota_dev` is the bench build
-  with extra test commands.
+* RAK3401: `pio run -e RAK_3401_lora_ota`. Heltec V4: `pio run -e heltec_v4_lora_ota`, the Wi-Fi seeder
+  `pio run -e heltec_v4_lora_ota_seeder` and the migrator `pio run -e heltec_v4_lora_ota_migrator`. The environments are in
+  `tools/fwpull_env.ini` (copy them into `platformio.local.ini`); `RAK_3401_lora_ota_dev` is the bench build with extra test commands.
 * Reproducible: `SOURCE_DATE_EPOCH=1794132380 pio run -e RAK_3401_lora_ota` rebuilds the published RAK3401 **v1.18.0-rc25** hex byte
   for byte. The Heltec images (`SOURCE_DATE_EPOCH=1794165858`) match byte for byte when built in a project folder named
   `heltec_build`; in any other folder only the embedded ELF hash differs (the ELF's debug info holds the build path), the program bytes

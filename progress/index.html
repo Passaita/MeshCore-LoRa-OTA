@@ -158,7 +158,7 @@ footer{padding:32px 0 48px;color:var(--muted);font-size:14px;border-top:1px soli
   <p class="eyebrow">Project log &middot; public record</p>
   <h1>LoRa<span class="dash">-</span>OTA</h1>
   <p class="lede">Firmware updates over LoRa for MeshCore repeaters. A dated record of what the project designed, built and tested, and where it stands.</p>
-  <p class="updated mono">Last updated 12 Nov 2026 &middot; RAK3401 &middot; Heltec V4</p>
+  <p class="updated mono">Last updated 19 Nov 2026 &middot; RAK3401 &middot; Heltec V4</p>
 </header>
 
 <section id="what">
@@ -376,7 +376,8 @@ footer{padding:32px 0 48px;color:var(--muted);font-size:14px;border-top:1px soli
       ["12 Nov","boot","Add-on flash parked","Rollback will come from two internal slots instead, with no extra hardware."],
       ["12 Nov","boot","A/B slots proven on hardware","The bootloader started an app from the second slot on trial. That test app never confirmed itself: after 3 failed trial boots the bootloader went back to the first slot by itself.",1],
       ["12 Nov","release","rc26 on the canary","The transition build (about 299 KB) runs on the bench board; the next board started fetching it over LoRa."],
-      ["12 Nov","transfer","Delta decoder done","Tested against thousands of damaged patches: none wrote outside its area."]
+      ["12 Nov","transfer","Delta decoder done","Tested against thousands of damaged patches: none wrote outside its area."],
+      ["19 Nov","heltec","Heltec V4 onboarding without USB","A small migrator app moves a Heltec V4 from stock MeshCore to LoRa-OTA over Wi-Fi from a phone, keeping the node's identity and settings. Tested with a power cut at every flash step, then on a bench board, which found and fixed one bug the simulation had missed.",1]
     ]
   };
   var names = {transfer:"Transfer",swarm:"Swarm",security:"Security",boot:"Bootloader",release:"Release",heltec:"Heltec V4"};

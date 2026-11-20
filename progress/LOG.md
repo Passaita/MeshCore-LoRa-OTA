@@ -111,6 +111,7 @@ Hardware: RAK3401 (nRF52840 + SX1262, 1 W booster) and Heltec V4 (ESP32-S3 + SX1
 * **12 Nov - A/B slots proven on hardware.** The bootloader started an app from the second slot on trial. That test app never confirmed itself: after 3 failed trial boots the bootloader went back to the first slot by itself.
 * **12 Nov - rc26 on the canary.** The transition build (about 299 KB) runs on the bench board; the first board started fetching it over LoRa.
 * **12 Nov - Delta decoder done.** Tested against thousands of damaged patches: none wrote outside its area.
+* **19 Nov - Heltec V4 onboarding without USB.** A small "migrator" app moves a Heltec V4 from stock MeshCore to LoRa-OTA over Wi-Fi from a phone, keeping the node's identity and settings. It was tested with a power cut at every flash step, then on a bench board, which found and fixed one bug the simulation had missed.
 
 ---
 
